@@ -1,0 +1,2 @@
+CREATE DATABASE n8n;
+CREATE DATABASE novascout;
