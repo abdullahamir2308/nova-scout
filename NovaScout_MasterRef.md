@@ -221,9 +221,10 @@ blocklist
 ### Workflow 1 — Ingestion
 **Trigger:** Cron, weekly
 **Sources:**
-- ClinicalTrials.gov API v2 (`/api/v2/studies`) — filter by country, recruiting status, sponsor class. Extract lead sponsor and responsible party.
-- ICH GCP directory (`ichgcp.net/cro-list`) — HTTP node + HTML extract node, server-rendered, no JS needed.
-- Manual CSV import path for referrals and conference lists.
+- ICH GCP directory (`ichgcp.net/cro-list`) — per-country pages, HTTP node + HTML extract node, server-rendered. Primary source: gives company name + website in one listing, which is what a domain-keyed schema needs.
+- Manual CSV import path for referrals and conference lists — via psql `COPY`, no workflow needed yet.
+
+**ClinicalTrials.gov is NOT an ingestion source.** Its API returns sponsor/collaborator names, not company websites, so it can't populate a domain-keyed `leads` row without a separate name→domain resolution step. It belongs in Workflow 3 (Scoring) instead, as a per-candidate lookup once a domain already exists — see below.
 
 **Output:** deduped rows in `leads` with `status='ingested'`. Dedupe key is normalised domain.
 
@@ -254,6 +255,8 @@ blocklist
 | Oncology focus (strongest case study) | 15 |
 | Employee count 5–100 | 10 |
 | Site quality suggests budget | 10 |
+
+**ClinicalTrials.gov lookup mechanism (this is where that source lives):** for each candidate that has cleared hard disqualifiers, call `GET https://clinicaltrials.gov/api/v2/studies` with `query.spons=<company_name>` (and `query.locn=<country>` as a fallback if the sponsor-name search misses) and `filter.overallStatus=RECRUITING`. No API key required. A non-zero `totalCount` earns the 20-point weight. This is a per-candidate lookup keyed on a company name/domain we already have — not a bulk discovery source, since the API has no company-website field to key a new lead on.
 
 **Then** Ollama generates a one-paragraph "why this lead" rationale. This rationale is what makes the morning review fast — it must be specific, not generic.
 
