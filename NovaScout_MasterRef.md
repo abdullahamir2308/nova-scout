@@ -95,7 +95,11 @@ OLLAMA_HOST=0.0.0.0:11434   # reachable from Docker containers
 
 **Parallelization principle, confirmed by real testing:** only the GPU call needs to be serial (`OLLAMA_NUM_PARALLEL=1` still holds for inference). Fetching/I/O steps do not — running them serially when they don't need to be caused a real failure (10 dead-domain fetches serially blew a 300s task-runner timeout; fetching 5-at-a-time dropped that batch from 305s to 46s). Apply this shape to Workflow 3 and 4 too: parallelize lookups/fetches, serialize only the model call.
 
-**n8n activation — CLI trap, use the UI.** n8n 2.35.7 replaced the simple active/inactive flag with a draft/published model. Running `publish:workflow` from the CLI leaves a misleading half-state: `workflow_entity.active` flips true and the UI shows "Active," but the actual trigger-registration tables stay empty — no cron is ever registered with the running process. A workflow published this way will silently never fire, with every visible signal saying it's fine. **Always activate via the n8n UI**, never the CLI, for anything that needs to run on a schedule.
+**n8n activation — there is no "Active" toggle, use Publish.** n8n 2.0+ replaced the classic active/inactive flag with a draft/published model, confirmed in official docs — this applies to Community Edition, not just enterprise plans. The UI element is a **Publish** button (near the workflow name, alongside Save), not a switch. Running `publish:workflow` from the CLI leaves a misleading half-state: `workflow_entity.active` flips true and the UI can show it as published, but the actual trigger-registration tables stay empty — no cron is registered with the running process, and it silently never fires. **Always publish via the n8n UI**, never the CLI, for anything that needs to run on a schedule. `active` in the DB does NOT gate a one-off `n8n execute --id=...` run — that works regardless of published state.
+
+**Publishing locks to a specific version.** If the workflow is regenerated and re-imported after being published (which happens routinely here — build_workflow.py has rebuilt this workflow multiple times for fixes), the publish goes stale and must be redone against the new version. Re-publish after every workflow rebuild, not just once.
+
+**n8n execute against an already-running container needs runner env overrides.** A one-off `docker exec ... n8n execute --id=...` against the live container conflicts with the main process's own task-runner broker unless you pass `-e N8N_RUNNERS_BROKER_PORT=5690 -e N8N_RUNNERS_ENABLED=false`. Without these it can hang or fail confusingly.
 
 **Verify before building anything on top:** run `ollama ps` after loading and confirm the model shows 100% GPU, not a CPU/GPU split.
 
@@ -194,6 +198,13 @@ enrichments
   has_chatbot (bool), chatbot_vendor, site_quality_notes,
   raw_extraction jsonb, enriched_at
 
+  **lead_id must be UNIQUE.** Originally missing — the write step did
+  a plain INSERT with no conflict handling, so any re-processing of a
+  lead (which the bounded-retry disqualifier design above requires)
+  created a second row instead of updating in place. Fixed to a
+  unique constraint + upsert; if this schema is ever rebuilt from
+  scratch, don't lose this constraint.
+
 scores
   id, lead_id FK, fit_score (0-100), disqualified (bool),
   disqualify_reason, rationale, scored_at
@@ -272,9 +283,9 @@ Scraper UA: self-identifying (`NovaScoutBot/1.0` + repo link), not a spoofed bro
 **Hard disqualifiers (deterministic Code node, runs first):**
 - Already has a chatbot
 - Employee estimate > 500 (enterprise CRO) — **only on a confirmed number.** Real Sprint 2 data: `employee_estimate` is null on 85% of leads (sites rarely state headcount, and extraction correctly refuses to guess). Null must never trigger this disqualifier — treat it as unknown, not as evidence of scale. Same null-safe handling applies to `founder_name`/`founder_linkedin`, sparse for the same honest-refusal-to-guess reason.
-- No functioning website — **the enrichment "unreachable" marker over-counts, don't trust it as final.** Probing all 26 unreachable-marked leads from the host directly found 7 genuinely alive: 2 serve normal HTTP 200, 5 return 403 to the bot UA (same WAF class as ichgcp.net — up, just bot-blocking). One (`cyntaxhealthprojects.com`) showed the diagnostic clearly: host curl succeeds in 1.9s, the n8n container's fetch fails in 0.3s — too fast to be a real timeout, consistent with a Docker/WSL2 IPv6-routing quirk rather than a dead site. A fix attempt (forcing IPv4 in the fetch step) is pending as of this writing — check whether it landed before assuming the marker is trustworthy.
+- No functioning website — **"unreachable" over-counts; investigation closed, accepted at current scale.** Of 26 originally flagged, 7 were alive. 2 rescued by relaxing TLS cert validation (broken/mismatched certs, not a block — one, `gvkbio.com`, is a 3,412-employee CRDMO that will correctly hard-disqualify on employee count once Sprint 3 runs). The remaining 5 end in HTTP 403 on every retry rung regardless of technique — confirmed WAF blocks, same class as ichgcp.net, genuinely up but hostile to non-browser clients. Not worth extending the GitHub-Actions-IP workaround here — that was justified for ichgcp.net as the sole ingestion source; for ~5% of individual enriched leads it isn't. Accepted as a permanent, expected loss rate.
 
-  **Design implication for this disqualifier specifically:** don't treat "unreachable" as instantly and permanently disqualifying. Give a lead a bounded number of enrichment attempts (e.g. 2) before trusting the marker — a transient network failure shouldn't be indistinguishable from a genuinely dead site. Not yet implemented; decide the exact mechanism when this workflow is actually built, informed by whatever the IPv4 fix does or doesn't resolve.
+  **Design implication for this disqualifier specifically:** don't treat "unreachable" as instantly and permanently disqualifying. Give a lead a bounded number of enrichment attempts (e.g. 2) before trusting the marker, and treat a confirmed WAF-block (got an HTTP 4xx response) as weaker evidence of "no functioning website" than a true connection failure — a 403 proves the site exists. Not yet implemented; decide the exact mechanism when this workflow is actually built.
 - Not actually a CRO (agency, consultancy, vendor)
 - Domain on blocklist
 
