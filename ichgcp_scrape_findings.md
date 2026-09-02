@@ -1,116 +1,416 @@
-# ICH GCP Directory — Verified Scrape Findings
+# Nova Scout — Master Reference Document v1
+## AI-Automated BD Pipeline for Nova Agent Kit
 
-Reference for the Nova Scout ingestion scraper. Everything below was
-verified by direct fetch, not inferred.
-
----
-
-## Access constraint
-
-`ichgcp.net` returns **403 Forbidden** to the dev machine's IP, including
-with a browser User-Agent header. This is an IP-level block, not a
-user-agent block. The site serves normally from other networks.
-
-**Consequence:** the scraper cannot run on the local machine or in the
-local n8n container. It must run from an unblocked IP.
-
-**Chosen fix:** scheduled GitHub Action → scrapes → commits CSV to repo →
-local n8n fetches the raw CSV from `raw.githubusercontent.com` and upserts
-into Postgres. Free, no VPS, version-controlled, and n8n never touches
-the blocked domain.
+> Paste this document into the Claude Project tab before every build session.
+> Single source of truth for architecture, stack, and build decisions.
+> Do not deviate from anything marked **LOCKED**. Ask before changing anything marked **CONFIRMED**.
 
 ---
 
-## Page structure — two stages required
+## 1. Project Overview
 
-### Stage 1 — country page
-`https://ichgcp.net/cro-list/country/{slug}`
+**What we are building:** An agentic outbound pipeline that finds small-to-medium CROs worldwide, enriches and scores them against our ICP, drafts personalised outreach, and delivers a ranked review queue every morning. Human approves; system sends and tracks.
 
-Contains three sections:
-1. **"Featured CROs"** — 2 paid slots. These DO include a direct website link.
-2. **"Local, small- and mid-size Contract Research Organizations in {country}"** — the ICP target section. Name, description, profile URL. **No website link.**
-3. **"Global Contract Research Organizations in {country}"** — IQVIA, ICON, Parexel, PPD, PSI, Fortrea, Syneos, SGS, Celero, Worldwide, ZEINCRO etc.
+**Why:** Nova Agent Kit is built and live at two CROs. The remaining problem is purely distribution. Manual prospecting does not scale; this replaces ~8 hours/day of manual work with a ~20 minute morning review.
 
-**Scrape section 2 only.** Section 3 is entirely enterprise CROs that the
-Section 9 disqualifiers reject on employee count. Skipping it halves fetch
-volume and pre-qualifies leads before any enrichment spend.
+**Secondary goals (equal weight):**
+- Learn n8n, self-hosted agent orchestration, and local LLM inference
+- Produce a portfolio-grade project
+- Run at near-zero cost
 
-Each entry in section 2 links to a profile at:
-`/cro-list/country/{country_slug}/company/{company_slug}`
-
-### Stage 2 — company profile page
-Verified example: `/cro-list/country/turkey/company/klinar_cro`
-
-Fields present, as labelled text:
-- `E-mail:` — mailto link
-- `Web:` — the external company website (this is the domain key)
-- `Phone:` — tel link
-- `Address:` — under an "## Address:" heading
-- About text — under "## About {company}" heading
-
-**Notable:** the E-mail field means many leads arrive with a contact address
-already attached. Check this before spending an Apollo credit in Workflow 3.
+**Endgame:** Nova Scout retargeted (CRO → pharma sponsor) becomes a second sellable product to existing Nova clients. Not before it has produced our own first 10 clients.
 
 ---
 
-## Country slugs — verified, irregular
+## 2. Tech Stack — LOCKED
 
-Do not derive these; several don't match the display name.
-
-```
-Turkey          turkey
-Mexico          mexico
-India           india
-Pakistan        pakistan
-Egypt           egypt
-Poland          poland
-Romania         romania
-Hungary         hungary
-Czech Republic  czech_republic
-UAE             united_arab_emirates
-South Africa    south_africa
-Brazil          brazil
-Argentina       argentina
-```
-
----
-
-## Türkiye — local/mid-size section (verified list)
-
-Seven companies. Profile slug under `/cro-list/country/turkey/company/`:
-
-| Company | Slug | Domain |
+| Layer | Choice | Notes |
 |---|---|---|
-| Klinar CRO | `klinar_cro` | klinar-cro.com ✅ verified |
-| Vital CRO Clinical Research Organization Education and Consultancy Ltd. Co. | `vital_cro_clinical_research_organization_education_and_consultancy_ltd_co` | vital-cro.com ✅ verified (featured slot) |
-| Atlant Clinical | `atlant_clinical` | not yet fetched |
-| Chiron Medical Contract Research Organization | `chiron_medical_contract_research_organization` | not yet fetched |
-| CRM-CRO | `crm_cro` | not yet fetched |
-| Monitor Medical Research and Consulting | `monitor_medical_research_and_consulting` | not yet fetched |
-| Omega CRO | `omega_cro` | not yet fetched |
+| Orchestration | n8n, self-hosted, Docker | Community edition, free |
+| Database | Postgres 16, Docker | Same container stack as n8n |
+| Inference | Ollama, native Windows install | NOT in Docker — needs direct GPU access |
+| Review UI | NocoDB, Docker | Airtable-style layer over Postgres |
+| Email send | SMTP node → Zoho Mail mailbox | Not Resend, not SendGrid |
+| Email receive | n8n IMAP trigger → same mailbox | No webhooks, no public URL needed |
+| CRM | HubSpot (native n8n node) | Existing account |
+| Contact data | Apollo.io API | Free tier, credits conserved by pipeline order |
+| Version control | Git — workflows exported as JSON | Workflows are code |
 
-Also in the featured slot: **PVR** (`pvr`) — pv-r.com ✅ verified. Note PVR
-operates across Georgia, Israel, Türkiye, Ukraine, UK — may not be
-small/mid-size. Let scoring decide.
+**DO NOT USE:** Make.com (per-operation pricing), Resend/SendGrid/Postmark for cold outreach (ToS prohibits it), any paid LLM API as the default path, LinkedIn automation tools of any kind, open/click tracking pixels.
 
-Full verified record for Klinar CRO, as a parser test fixture:
-```
-company_name: Klinar CRO
-email:        info@klinar-cro.com
-website:      https://klinar-cro.com/
-phone:        +(90) (312)-447-0274
-address:      Mustafa Kemal Mah 2127. Sk. 42 /3 Çankaya / ANKARA TURKEY
-country:      Türkiye
-```
+**Host:** Windows, Docker Desktop with WSL2 backend. n8n reaches Ollama at `http://host.docker.internal:11434`.
 
 ---
 
-## Notes for the scraper
+## 3. Hardware & Model Config — LOCKED
 
-- Multi-country CROs appear on every country page they operate in, each
-  with a different profile URL but the same underlying company. Dedup on
-  domain handles this — the same company resolves to one domain.
-- Some entries have a "View locations" sublist. Ignore it for ingestion.
-- Rate-limit politely: sequential requests with a delay, not parallel bursts.
-- Skip any profile with no `Web:` field — a domain-keyed row can't exist
-  without one. Count and report skips.
+**Machine:** RTX 4060 Ti 16 GB VRAM · Ryzen 5 3600 · DDR4-3000
+
+**Binding constraint:** memory bandwidth (~288 GB/s), not compute. Model must fit entirely in 16 GB VRAM — CPU offload onto DDR4-3000 is unacceptably slow.
+
+**Model rule — ONE MODEL FOR THE ENTIRE PIPELINE.**
+Running different models per node causes Ollama to evict and reload weights on every switch. Load time exceeds generation time. One model, always resident.
+
+**LOCKED CHOICE: `qwen3.5:9b` at Q4_K_M (6.6 GB).** Leaves ~9 GB headroom for KV cache.
+
+**What does NOT fit on 16 GB — do not attempt:**
+
+| Model | Q4 footprint | Verdict |
+|---|---|---|
+| Qwen3.5/3.6/3.8 **27B** | ~15–17 GB | Exceeds VRAM before KV cache. Partial CPU offload on DDR4-3000 → unusable batch speed. |
+| Qwen3.5/3.6 **35B-A3B** (MoE) | ~19 GB | All 35B must load even though only 3B activate. Does not fit. |
+| Any 27B at Q3 | ~13 GB | Fits, but quantization damage makes it worse than a comfortable 9B. |
+
+**No 14B exists in the current generation.** Qwen3.5+ sizes are 0.8B / 2B / 4B / 9B / 27B / 35B-A3B / 122B-A10B / 397B-A17B. A 9B from the 3.5 generation outperforms a 14B from the older Qwen3 generation — architecture gains beat parameter count at this scale.
+
+**Quality ladder — climb only on evidence, in this order:**
+1. `qwen3.5:9b` (Q4_K_M, 6.6 GB) — start here
+2. `qwen3.5:9b-q8_0` (11 GB, near-lossless) — if drafting quality disappoints. Still fits with ~5 GB spare.
+3. **Claude Sonnet 5 for the drafting node only** — `claude-sonnet-5`, $2/$10 per MTok
+
+**Note on the API fallback:** Sonnet 5 costs 2× Haiku 4.5 ($1/$5), not less. It is chosen anyway because drafting volume is 10–20/day, which prices out at roughly $3/month versus $1.65 on Haiku. At that volume, capability wins and price is noise. The $2/$10 rate is now permanent — Anthropic cancelled the September 2026 increase to $3/$15.
+
+**Rule for model selection across this project:** pick by capability where volume is low, pick by price only where volume is high. Never route the high-volume enrichment or scoring nodes to a paid API — that is what the local 9B exists for.
+
+Never step up to a larger local parameter count on this card. Higher-quality quant of a smaller model beats a starved larger one.
+
+**Before Sprint 0:** check `ollama.com/library` for whether a 9B has shipped in the Qwen3.6 or 3.8 generation. If it has, use the newest 9B instead. Sizes and footprints in this table stay valid.
+
+**Required Ollama environment variables (set as Windows system env vars):**
+```
+OLLAMA_KEEP_ALIVE=-1        # never unload the model
+OLLAMA_NUM_PARALLEL=1       # serial processing, avoid VRAM contention
+OLLAMA_HOST=0.0.0.0:11434   # reachable from Docker containers
+```
+
+**Structured output:** always use Ollama's `format: json` with an explicit schema for extraction and scoring nodes. Never parse free text.
+
+**Inference tuning — three gotchas that will bite otherwise:**
+
+1. **Override the default `presence_penalty`.** Qwen3.5 ships with `presence_penalty: 1.5`. **Tested correction:** the failure mode is NOT malformed JSON as originally guessed here — Ollama's grammar-constrained `format: json` mode makes syntactically invalid output impossible, which masks the problem. The real failure is silent, field-level data loss on copy-from-source fields: at 1.5, `founder_linkedin` and `therapeutic_areas` entries came back null/truncated even when clearly present in the source text, because the penalty discourages "repeating" tokens the model is meant to be copying, not generating. Output is valid-looking JSON with quietly missing data — more dangerous than a visible parse error, since it can pass silently into scoring. At `presence_penalty: 0`, all fields extracted correctly. For extraction and scoring nodes set `presence_penalty: 0`, `temperature: 0.1`. For drafting, `temperature: 0.7`, `presence_penalty: 0.3` (unverified — test this the same way when Sprint 4 builds it, don't assume the extraction fix transfers).
+
+2. **Cap the context window at 16K–32K.** These models advertise 262K native context. Do not use it — KV cache at full context adds 4–8 GB and will push you off the GPU. Scraped pages are 5–20K tokens; 32K is generous.
+
+3. **Thinking mode — tested WRONG in the original version of this doc.** For this build, thinking is ON by default, not off. Two compounding traps: omitting `think` entirely burns the whole token budget on reasoning traces and returns empty content. Worse — on `/api/chat`, setting `think:false` silently disables `format` schema enforcement, so the model answers in free prose instead of structured JSON, with no error. Keeping thinking on to preserve JSON enforcement works but costs 30–50s/lead. **Use `/api/generate`, not `/api/chat`, for structured extraction** — it honours `think:false` together with the schema correctly, same valid output in ~5s. This is load-bearing for every future Ollama structured-output node (scoring rationale, drafting) — verify it still holds on that model/endpoint before assuming it, don't just copy the setting forward blind.
+
+**Parallelization principle, confirmed by real testing:** only the GPU call needs to be serial (`OLLAMA_NUM_PARALLEL=1` still holds for inference). Fetching/I/O steps do not — running them serially when they don't need to be caused a real failure (10 dead-domain fetches serially blew a 300s task-runner timeout; fetching 5-at-a-time dropped that batch from 305s to 46s). Apply this shape to Workflow 3 and 4 too: parallelize lookups/fetches, serialize only the model call.
+
+**n8n activation — CLI trap, use the UI.** n8n 2.35.7 replaced the simple active/inactive flag with a draft/published model. Running `publish:workflow` from the CLI leaves a misleading half-state: `workflow_entity.active` flips true and the UI shows "Active," but the actual trigger-registration tables stay empty — no cron is ever registered with the running process. A workflow published this way will silently never fire, with every visible signal saying it's fine. **Always activate via the n8n UI**, never the CLI, for anything that needs to run on a schedule. `active` in the DB does NOT gate a one-off `n8n execute --id=...` run, though — that works regardless of published state.
+
+**n8n execute against an already-running container needs runner env overrides.** A one-off `docker exec ... n8n execute --id=...` against the live container conflicts with the main process's own task-runner broker unless you pass `-e N8N_RUNNERS_BROKER_PORT=5690 -e N8N_RUNNERS_ENABLED=false`. Without these it can hang or fail confusingly.
+
+**Verify before building anything on top:** run `ollama ps` after loading and confirm the model shows 100% GPU, not a CPU/GPU split.
+
+**Escape hatch (CONFIRMED, not yet active):** if local drafts consistently require heavy editing after two weeks of real use, swap ONLY the drafting node to Claude Sonnet 5. Volume is 10–20 drafts/day, so cost is ~$3/month. Decide on evidence, not upfront. Enrichment and scoring stay local permanently — those are the high-volume nodes.
+
+---
+
+## 4. Cost Model — LOCKED
+
+| Item | Cost |
+|---|---|
+| Outreach domain | ~$10/year |
+| Zoho Mail Lite mailbox | ~$12/year |
+| n8n, Postgres, NocoDB, Ollama | $0 |
+| ClinicalTrials.gov API | $0 |
+| Apollo | $0 (free tier, protected by pipeline order) |
+| **Total** | **~$22/year + electricity** |
+
+Any proposed change that introduces recurring cost must be justified against this baseline.
+
+---
+
+## 5. Email Infrastructure — LOCKED
+
+**Domain:** dedicated outreach domain, purchased separately. Never `noblepathcro.com` (client's reputation), never a personal Gmail (ToS violation + account risk).
+
+**Mailbox:** a named human address — `fatima@<domain>`, not `hello@` or `info@` or `sales@`.
+
+**DNS (all three required before first send):**
+- SPF record authorising Zoho
+- DKIM signing enabled
+- DMARC policy record
+
+**Warm-up schedule — enforce in the workflow, not by memory:**
+
+| Period | Max sends/day |
+|---|---|
+| Week 1 | 5 |
+| Week 2 | 10 |
+| Week 3 | 15 |
+| Week 4+ | 20 (hard ceiling) |
+
+Start warm-up manually the same day the domain is purchased — send real emails by hand to real contacts while the rest of the system is built. The domain ages in parallel with development.
+
+**Message rules — LOCKED:**
+- Plain text only. No HTML, no images, no logo, no banner.
+- **No open tracking. No link tracking. No pixels.** Reply rate is the only metric.
+- Maximum one plain URL. No buttons.
+- Signature: name, one line of title, phone. Nothing else.
+- No marketing unsubscribe footer. Use a plain sentence: *"If this isn't relevant, reply 'no' and I won't follow up."*
+- Irregular send intervals within the recipient's business hours. Never a synchronised burst.
+- Under 80 words for first touch.
+
+**Compliance:** GDPR and KVKK both apply across target geographies. Basis is B2B legitimate interest, defensible only if opt-out is trivial and honoured instantly. IMAP workflow must detect "no", "unsubscribe", "remove", "stop" and blocklist the domain immediately and permanently.
+
+---
+
+## 6. LinkedIn — LOCKED
+
+**LinkedIn sending is manual. Always. No exceptions.**
+
+LinkedIn actively bans automation. Fatima's account is a business asset that cannot be replaced. The system drafts the DM and provides a copy button plus a deep link to the profile. A human reads it, edits if needed, and sends it by hand.
+
+This rule does not change regardless of tooling.
+
+---
+
+## 7. Pipeline Architecture
+
+Six workflows, each independent, each queue-driven.
+
+```
+Sources → 1 Ingest → 2 Enrich → 3 Score → [Apollo] → 4 Draft → 5 Review (HUMAN) → 6 Send → CRM
+                                                                         ↑                    │
+                                                                         └──── learn ─────────┘
+```
+
+**Critical ordering rule:** Apollo contact lookup happens AFTER scoring, never before. Scrape and score for free with local models first; spend Apollo credits only on leads above threshold. This is what keeps Apollo on the free tier.
+
+**Idempotency rule — LOCKED:** the host machine will be off some of the time. No workflow may assume its schedule fired. Every workflow queries Postgres for "oldest lead in my input status" and processes a bounded batch. A machine off all weekend simply catches up on Monday. No time-critical webhooks anywhere in the system.
+
+---
+
+## 8. Database Schema
+
+**Location:** the single Postgres container hosts two separate databases — `n8n` (n8n's own internal state, owned exclusively by n8n) and `novascout` (everything below). All application tables live in `novascout`. Never point application workflows at the `n8n` database.
+
+```sql
+leads
+  id, domain (UNIQUE), company_name, country, source,
+  status, created_at, updated_at
+
+enrichments
+  id, lead_id FK, therapeutic_areas[], phases[],
+  founder_name, founder_linkedin, employee_estimate,
+  has_chatbot (bool), chatbot_vendor, site_quality_notes,
+  raw_extraction jsonb, enriched_at
+
+  **lead_id must be UNIQUE.** Originally missing — the write step did
+  a plain INSERT with no conflict handling, so any re-processing of a
+  lead (which the bounded-retry disqualifier design above requires)
+  created a second row instead of updating in place. Fixed to a
+  unique constraint + upsert; if this schema is ever rebuilt from
+  scratch, don't lose this constraint.
+
+scores
+  id, lead_id FK, fit_score (0-100), disqualified (bool),
+  disqualify_reason, rationale, scored_at
+
+contacts
+  id, lead_id FK, name, title, email, linkedin_url,
+  apollo_id, verified (bool)
+
+drafts
+  id, lead_id FK, channel (email|linkedin), variant,
+  subject, body, status (pending|approved|rejected|sent),
+  reject_reason, edited_body, created_at
+
+outreach_log
+  id, lead_id FK, channel, sent_at, message_body,
+  replied (bool), replied_at, reply_body, outcome
+
+blocklist
+  domain (UNIQUE), reason, added_at
+```
+
+**Lead status values (LOCKED):**
+`ingested → enriched → scored → disqualified | contact_found → drafted → approved → sent → replied → won | lost`
+
+---
+
+## 9. Workflow Specifications
+
+### Workflow 1 — Ingestion
+**Trigger:** Cron, weekly
+**Sources:**
+- ICH GCP directory (`ichgcp.net/cro-list`) — per-country pages, server-rendered, no JS needed.
+- Manual CSV import path for referrals and conference lists — via psql `COPY`, no workflow needed yet.
+
+**ICH GCP page structure — VERIFIED, two-stage scrape required:**
+
+Country pages (`/cro-list/country/{slug}`) list companies with name, truncated description, and a link to an ichgcp company profile page — but **no external website URL**. The CRO's actual domain appears only on the company profile page (`/cro-list/country/{slug}/company/{company_slug}`) as a `Web:` field. Exception: the two paid "Featured CROs" slots at the top of each country page do carry a direct website link.
+
+So: stage 1 collects profile URLs from the country page, stage 2 fetches each profile to extract the domain. Budget ~15–40 profile fetches per country. Rate-limit politely.
+
+**ICP pre-filter — free, use it:** each country page splits listings under two headings, "Local, small- and mid-size Contract Research Organizations in {country}" and "Global Contract Research Organizations in {country}". The global section is IQVIA, ICON, Parexel, PPD, Syneos, SGS, Fortrea et al — all of which the Section 9 disqualifiers reject on employee count anyway. **Scrape only the local/mid-size section.** Halves fetch volume and pre-qualifies leads before any enrichment spend.
+
+**Access — confirmed IP-level block, not a UA block.** ichgcp.net returns 403 from the dev machine even with a full browser User-Agent spoofed — the block is IP/GeoIP-based, not a `curl` signature match. n8n running locally cannot reach this domain at all, now or on a weekly schedule.
+
+**Shipped architecture:** the scraper runs as a scheduled GitHub Action (`.github/workflows/scrape-ichgcp.yml`, weekly + manual dispatch) from GitHub's runners, and commits `data/ichgcp_leads.csv` to the repo only when it changes. The local n8n workflow (`n8n/workflows/ingestion-ichgcp.json`) never touches ichgcp.net — it fetches the committed CSV from `raw.githubusercontent.com` and upserts into `leads`. This cleanly separates the blocked scrape from the pipeline.
+
+**Known risk, unresolved as of first build:** GitHub Actions runner IPs are datacenter-class and commonly penalized by the same reputation-based WAF systems that block scraping traffic generally — there is a real chance the Action itself also gets 403'd on first run, independent of UA string. If so, the next lever is a small always-on VPS with a residential-leaning IP, or a scraping proxy service — not a scraper redesign, the parsing logic itself is already fixture-tested and sound.
+
+Scraper UA: self-identifying (`NovaScoutBot/1.0` + repo link), not a spoofed browser string — deliberate choice, overridable via `ICHGCP_USER_AGENT` env var if needed.
+
+**Sprint 1 outcome, validated end-to-end and closed:** no 403s across two full Action runs — the IP-reputation WAF risk did not materialize. Only 429 (rate limit) and 404 seen. Retry-with-backoff on 429 confirmed working: every rate-limit hit cleared on the first retry after a 15s wait, none escalated. 13/13 countries succeeded, 123 unique leads in `data/ichgcp_leads.csv`. Remaining profile-fetch failures (4) are genuine dead links on ichgcp.net's side — correctly left non-retryable.
+
+**Correction:** an earlier version of this doc stated 123 leads had landed in `novascout.leads` — that was wrong, conflated with the CSV count. Scrape success and DB ingestion are two separate steps; ingestion must be re-triggered after any manual/out-of-band scrape run, not assumed to follow automatically. As of the first enrichment pass, `leads` held 107 rows — the CSV's 16 additional domains (mostly Poland, some India — the countries that hit 429s in the original scrape) were not yet re-ingested.
+
+**Known, accepted limitation — corrected mechanism.** The shipped upsert is `ON CONFLICT (domain) DO UPDATE`, not `DO NOTHING` as originally assumed here. For a multi-country CRO (same domain on several country pages), this means **the last-processed country in a given ingestion run wins `leads.country`, and it can flip on every re-run** — observed directly: `bitrial.hu` flipped Romania→Poland when the CSV was re-ingested with Poland's leads included. `status` is excluded from the update, so this never regresses pipeline progress (verified in Sprint 1) — only `country` (and other metadata) is unstable.
+
+**Why this doesn't currently hurt scoring:** the scraper only ever touches the 13 target-geography countries, so a flip can only ever land on another already-target country — Section 9's 25-point geography weight is scored identically either way. This would stop being true if the source-country list and target-geography list ever diverge. Not urgent; the fix, if it's ever needed, is the same `lead_countries` join table already noted for the undercounting issue below — one fix resolves both.
+
+**Known, accepted limitation, undercounting:** the same domain-collision dedup means some countries' raw per-scrape totals don't match what lands in the DB (observed: Hungary 8→6, UAE 3→2). Correct behavior for avoiding duplicate lead rows; accepted as-is at current scale (~3% of leads affected).
+
+**ClinicalTrials.gov is NOT an ingestion source.** Its API returns sponsor/collaborator names, not company websites, so it can't populate a domain-keyed `leads` row without a separate name→domain resolution step. It belongs in Workflow 3 (Scoring) instead, as a per-candidate lookup once a domain already exists — see below.
+
+**Output:** deduped rows in `leads` with `status='ingested'`. Dedupe key is normalised domain.
+
+### Workflow 2 — Enrichment
+**Trigger:** Cron, every 30 min. Batch of 10 where `status='ingested'`.
+**Steps:**
+1. Fetch homepage, /about, /services, /team via HTTP node
+2. **Chatbot detection is a Code node with regex — NOT an LLM call.** Match against known widget scripts: Intercom, Drift, Tidio, Tawk, Crisp, HubSpot chat, LiveChat, Zendesk. Never spend tokens on what a string match answers.
+3. Ollama node with `format: json` and explicit schema → therapeutic areas, phases, founder, employee estimate, site notes
+4. Write to `enrichments`, advance status
+
+### Workflow 3 — Scoring
+**Trigger:** Cron. Batch where `status='enriched'`.
+
+**Hard disqualifiers (deterministic Code node, runs first):**
+- Already has a chatbot
+- Employee estimate > 500 (enterprise CRO) — **only on a confirmed number.** Real Sprint 2 data: `employee_estimate` is null on 85% of leads (sites rarely state headcount, and extraction correctly refuses to guess). Null must never trigger this disqualifier — treat it as unknown, not as evidence of scale. Same null-safe handling applies to `founder_name`/`founder_linkedin`, sparse for the same honest-refusal-to-guess reason.
+- No functioning website — **the enrichment "unreachable" marker over-counts, don't trust it as final.** Probing all 26 unreachable-marked leads from the host directly found 7 alive-ish: 2 serve normal HTTP 200, 5 return 403 to the bot UA (same WAF class as ichgcp.net). **The IPv6/container-routing hypothesis originally recorded here was tested and disproven** — 24 of 26 domains have no AAAA record at all (no IPv6 route to misroute in the first place), and for the domains with genuine timeouts, host and container timing matched almost exactly. Forcing IPv4 did not fix the one domain that did show a fast-fail signature.
+
+  **Real cause, evidenced but not yet fixed:** the retry ladder treats any HTTP status ≥400 as a failed rung, conflating a WAF-style 403/406 bot-block (site is up, a human would see it) with a genuine dead domain (DNS failure, true connection timeout). Some of these 403s are inconsistent across repeated requests to the same domain from the same host — a rate-limit-like pattern, not a clean deterministic block. Fix, when it's worth the time: classify "got an HTTP response, even a 4xx" separately from "no response at all" in `raw_extraction`, since they're different evidence for this disqualifier. Low priority at current scale (~6% of leads) — natural to fold into this workflow's actual build rather than patch ahead of it.
+
+  **Design implication for this disqualifier specifically:** don't treat "unreachable" as instantly and permanently disqualifying. Give a lead a bounded number of enrichment attempts (e.g. 2) before trusting the marker — a transient network failure shouldn't be indistinguishable from a genuinely dead site. Not yet implemented; decide the exact mechanism when this workflow is actually built.
+- Not actually a CRO (agency, consultancy, vendor)
+- Domain on blocklist
+
+**Weighted fit score (0–100):**
+| Factor | Weight |
+|---|---|
+| Target geography | 25 |
+| Active trials on ClinicalTrials.gov | 20 |
+| Founder/MD identified with LinkedIn | 20 |
+| Oncology focus (strongest case study) | 15 |
+| Employee count 5–100 | 10 |
+| Site quality suggests budget | 10 |
+
+**Null-handling for weighted factors:** where `employee_estimate` or `founder_name`/`founder_linkedin` is null, that factor contributes a neutral partial score, not zero — a confirmed miss (e.g. a named founder found and clearly not on LinkedIn) should score lower than an honest unknown. Don't let extraction's correct refusal to guess become a scoring penalty.
+
+**Before wiring `is_cro` as an automatic disqualifier:** Sprint 2 found 23/80 successfully-enriched leads judged `is_cro: false`, despite all being sourced from ICH GCP's own "local/mid-size CRO" section. Plausible and not alarming — directory listings drift (rebrands, vendors miscategorized, defunct domains) and this is enrichment correctly catching what the source didn't. But it's a hard, irreversible disqualifier removing ~29% of the enriched pool — spot-check a handful of the actual 23 domains before trusting it fully automated.
+
+**Therapeutic area taxonomy — needs constraining before this factor is reliable.** Real extraction shows free-text drift (`cardiology` vs `cardiovascular`, singular/plural variants) and industry terms leaking in (`medtech`, `pharma` are not disease areas). Oncology stayed consistent, so the 15-point weight is safe today, but exact-string matching elsewhere will break. Fix at the schema level — constrain `therapeutic_areas` to a fixed enum in the Ollama JSON schema rather than free text, not a post-hoc cleanup pass. NoblePath's own 6 published areas (oncology, cardiovascular, CNS, endocrine metabolic disorders, infectious disease, internal medicine & immunology) are a reasonable starting enum, since organic extraction results already cluster around close variants of most of them.
+
+**ClinicalTrials.gov lookup mechanism (this is where that source lives):** for each candidate that has cleared hard disqualifiers, call `GET https://clinicaltrials.gov/api/v2/studies` with `query.spons=<company_name>` (and `query.locn=<country>` as a fallback if the sponsor-name search misses) and `filter.overallStatus=RECRUITING`. No API key required. A non-zero `totalCount` earns the 20-point weight. This is a per-candidate lookup keyed on a company name/domain we already have — not a bulk discovery source, since the API has no company-website field to key a new lead on.
+
+**Then** Ollama generates a one-paragraph "why this lead" rationale. This rationale is what makes the morning review fast — it must be specific, not generic.
+
+**Then** Apollo lookup for leads scoring ≥ 60 only.
+
+### Workflow 4 — Drafting
+**Trigger:** Cron. Batch where `status='contact_found'`.
+
+**Grounding guard — LOCKED.** The drafting prompt may only use facts present in the enrichment record. If the record lacks at least two specific facts (therapeutic area, named trial, city, founder name), the draft is flagged `low-context` and skipped rather than invented.
+
+> This rule exists because of the Nova field-fabrication bug: under forced tool use, Haiku invented a specialty from an email domain. Small models fabricate when under-informed. Design for it.
+
+**Prompt constraints:** under 80 words, minimum two specific facts, mention the live NoblePath demo, no adjectives like "revolutionary" or "cutting-edge", no merge-tag phrasing tells.
+
+**Output:** email variant + LinkedIn variant per lead into `drafts`.
+
+### Workflow 5 — Review Queue (HUMAN)
+**Interface:** NocoDB grid view over `drafts` joined to `leads`, `scores`, `contacts`.
+**Sort:** fit_score descending.
+**Actions:** Approve · Edit · Reject.
+**Rejection requires a reason** (bad fit / bad draft / already contacted / wrong contact) — this is the training data for the learning loop.
+**Target:** 20 minutes daily.
+
+### Workflow 6 — Send & Track
+**Send trigger:** Cron, business hours only, randomised intervals.
+**Guard:** query today's send count; abort if at the warm-up ceiling. Ceiling is enforced in the workflow, not by discipline.
+**Send:** SMTP node → mailbox. Log to `outreach_log`.
+**Reply detection:** IMAP trigger polls the same mailbox. Any reply → kill follow-up sequence, create HubSpot deal, notify.
+**Opt-out detection:** reply matching no/unsubscribe/remove/stop → add domain to `blocklist`, permanent.
+**Follow-up:** if no reply after 6 days, generate follow-up draft back into the review queue. Maximum two follow-ups, then mark lost.
+
+---
+
+## 10. Build Order
+
+Each sprint is one or two Claude Code sessions. New session per sprint. Commit manually.
+
+| Sprint | Deliverable | Exit criteria |
+|---|---|---|
+| **0** | Docker compose (n8n + Postgres + NocoDB), Ollama installed, model pulled, env vars set, hello-world workflow calling Ollama. **Buy the domain today.** | Ollama responds through n8n |
+| **1** | Schema migration + ingestion workflows | 200+ deduped leads in Postgres |
+| **2** | Enrichment workflow + regex chatbot detection | 50 leads enriched, hand-verified |
+| **3** | Scoring rules + rationale + gated Apollo lookup | Ranked queue with contacts |
+| **4** | Drafting workflow + NocoDB review UI. **DNS records live, manual warm-up running.** | Drafts you would actually send |
+| **5** | SMTP send + warm-up cap + IMAP reply trigger + follow-ups + HubSpot sync | First real approved batch sent |
+| **6** | Metrics as Postgres views in NocoDB | Reply rate, approval rate, source quality visible |
+
+**Timeline:** ~2 weeks of evenings to first sent email. Domain warms in parallel so it is never the blocker.
+
+---
+
+## 11. Build Rules
+
+1. **Domain first.** Buy it and start manual warm-up on day one. It is the only thing with an unavoidable calendar delay.
+2. **Export every workflow to git as JSON** after each session. Workflows are code.
+3. **Never spend tokens on deterministic work.** Chatbot detection, disqualifiers, dedupe, date math — all Code nodes.
+4. **Every workflow is queue-driven and idempotent.** No assumptions about uptime.
+5. **Bounded batches.** Never process an unbounded set; the GPU is serial.
+6. **Ground every generation.** No fact in a draft that is not in the enrichment record.
+7. **Human sends LinkedIn. Always.**
+8. **No tracking pixels, ever.**
+9. Ask before assuming. Confirm terminal type before giving shell commands (Windows / PowerShell / Git Bash).
+
+---
+
+## 12. ICP Definition
+
+**Target:** CRO founder, Managing Director, or BD Director.
+**Company:** 5–100 employees, running active trials, has a website, no existing chatbot.
+**Geographies:** Turkey, Mexico, India, Pakistan, Egypt, Poland, Romania, Hungary, Czech Republic, UAE, South Africa, Brazil, Argentina.
+**Strongest signal:** oncology focus (matches the NoblePath case study).
+
+**Commercial offer:** $500–1,000 build + $300/month. Monthly, cancel anytime. 48-hour custom demo on their own knowledge base, no commitment.
+
+---
+
+## 13. Open Items
+
+| Item | Owner | Blocks |
+|---|---|---|
+| Purchase outreach domain | Fatima | Everything downstream of Sprint 4 |
+| Zoho Mail mailbox + DNS | Fatima | First send |
+| Check ollama.com for a 9B in the Qwen3.6/3.8 generation | Fatima | Sprint 0 (defaults to `qwen3.5:9b` if none) |
+| 90-second Nova demo screen recording | Fatima | Referenced in every draft |
+| Decide Sonnet 5 escape hatch for drafting | Both | After 2 weeks of real drafts |
+
+---
+
+## 14. Related: Nova Chatbot Model Migration (separate project)
+
+Not part of Nova Scout, tracked here to keep the decision record in one place.
+
+**Proposal:** migrate Nova Agent Kit from Haiku 4.5 to Sonnet 5.
+
+**Cost reality:** Sonnet 5 is $2/$10 vs Haiku 4.5 at $1/$5 — double, not cheaper. At Nova's volume with a ~17K-token context-stuffed system prompt on every turn, this is a real increase, not noise. Still comfortably absorbed by the $300/month per-tenant fee.
+
+**Do this first, regardless of model choice:** enable prompt caching on the static system prompt. Cache hits bill at 10% of base input. On a 17K-token system prompt sent every turn, this cuts the input bill by roughly 90% — a far larger lever than model selection, and it makes the Sonnet upgrade close to cost-neutral.
+
+**Migration risks — test before deploying:**
+- The reliability scaffolding (forced `tool_choice`, keyword triggers, `request_missing_information` guard) was engineered against Haiku 4.5's specific failure modes. Sonnet 5 fails differently. It may allow removing some scaffolding — verify, don't assume.
+- Re-test the field-fabrication guard specifically. That bug drove real design decisions.
+- Check whether extended thinking is on by default. Thinking tokens hurt time-to-first-token, and the widget UX depends on the response feeling instant.
+
+**Rollout order:** Vertex staging tenant → all six flows end to end → NoblePath production. Never NoblePath first.
+
+---
+
+*Document version 1. Update when any architectural decision changes. Do not let sessions drift from this spec.*

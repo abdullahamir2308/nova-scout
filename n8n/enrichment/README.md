@@ -78,7 +78,12 @@ no-op in production.
 ## Draining the queue by hand
 
 The workflow is queue-driven, so running it repeatedly is safe and idempotent.
-Each execution processes one bounded batch (`Config.batch_size`, default 10):
+Each execution processes one bounded batch (`Config.batch_size`, default 10).
+
+Putting an already-enriched lead back on the queue (`status='ingested'`) is also
+safe on its own: the write step upserts on the `enrichments_lead_id_key` unique
+constraint (migration `002`), so a re-processed lead is re-extracted over its
+existing row instead of gaining a second one. No manual cleanup first.
 
 ```powershell
 docker exec -e N8N_RUNNERS_BROKER_PORT=5690 -e N8N_RUNNERS_ENABLED=false `

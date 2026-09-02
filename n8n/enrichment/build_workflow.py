@@ -69,6 +69,11 @@ assert "{{" not in OLLAMA_BODY[2:], "unexpected `{{` inside the expression body"
 WRITE_SQL = """-- Insert the enrichment and advance the lead in ONE statement, so a crash
 -- between the two cannot leave a lead enriched-but-still-queued (or worse,
 -- advanced with no enrichment row). Re-running the batch is then safe.
+--
+-- The write is an UPSERT keyed on the enrichments_lead_id_key unique
+-- constraint (migration 002). A lead put back on the queue is re-extracted
+-- over its previous row instead of gaining a second one -- re-processing is
+-- safe by construction, not by remembering to clean up first.
 WITH payload AS (
   SELECT $1::jsonb AS p
 ), ins AS (
@@ -88,6 +93,18 @@ WITH payload AS (
     p->>'site_quality_notes',
     p->'raw_extraction'
   FROM payload
+  ON CONFLICT (lead_id) DO UPDATE SET
+    therapeutic_areas  = EXCLUDED.therapeutic_areas,
+    phases             = EXCLUDED.phases,
+    founder_name       = EXCLUDED.founder_name,
+    founder_linkedin   = EXCLUDED.founder_linkedin,
+    employee_estimate  = EXCLUDED.employee_estimate,
+    has_chatbot        = EXCLUDED.has_chatbot,
+    chatbot_vendor     = EXCLUDED.chatbot_vendor,
+    site_quality_notes = EXCLUDED.site_quality_notes,
+    raw_extraction     = EXCLUDED.raw_extraction,
+    -- Refreshed so enriched_at always dates the extraction actually stored.
+    enriched_at        = now()
   RETURNING lead_id
 )
 UPDATE leads
