@@ -15,6 +15,7 @@ can't exist without one) and counted in the report.
 from __future__ import annotations
 
 import csv
+import datetime
 import os
 import re
 import sys
@@ -56,6 +57,14 @@ DEFAULT_USER_AGENT = (
 REQUEST_TIMEOUT = 20
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 3
+
+# 429 gets its own, longer retry budget — it's the site's rate limiter
+# clearing on a cooldown timer, not a transient hiccup that a 3s/9s backoff
+# fixes. Kept separate from MAX_RETRIES so exceptions/5xx behavior is
+# unchanged.
+RATE_LIMIT_MAX_RETRIES = 5
+RATE_LIMIT_BACKOFF_SECONDS = 15
+RATE_LIMIT_BACKOFF_CAP_SECONDS = 60
 
 SOCIAL_OR_MAP_HOSTS = {
     "facebook.com", "www.facebook.com",
@@ -110,11 +119,39 @@ def make_session() -> requests.Session:
     return session
 
 
+def _retry_after_seconds(resp: requests.Response) -> float | None:
+    """Parse a Retry-After header (delta-seconds or HTTP-date form)."""
+    value = resp.headers.get("Retry-After")
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(float(value), 0.0)
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        target = parsedate_to_datetime(value)
+        if target is None:
+            return None
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=datetime.timezone.utc)
+        delta = (target - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+        return max(delta, 0.0)
+    except (TypeError, ValueError):
+        return None
+
+
 def fetch(session: requests.Session, url: str) -> requests.Response | None:
     """Sequential fetch with a small retry budget for transient failures.
-    A 403 is treated as terminal (retrying won't help and would be rude)."""
+    A 403 is treated as terminal (retrying won't help and would be rude).
+    A 429 draws from its own longer, Retry-After-aware budget (see
+    RATE_LIMIT_MAX_RETRIES) instead of the generic one."""
     last_exc = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    rate_limit_attempt = 0
+    attempt = 0
+    while attempt < MAX_RETRIES:
+        attempt += 1
         try:
             resp = session.get(url, timeout=REQUEST_TIMEOUT)
         except requests.RequestException as exc:
@@ -126,6 +163,23 @@ def fetch(session: requests.Session, url: str) -> requests.Response | None:
         if resp.status_code == 403:
             print(f"    [error] 403 Forbidden for {url} — not retrying")
             return None
+        if resp.status_code == 429:
+            attempt -= 1  # doesn't draw from the generic retry budget
+            rate_limit_attempt += 1
+            if rate_limit_attempt > RATE_LIMIT_MAX_RETRIES:
+                print(f"    [error] 429 for {url} — exhausted "
+                      f"{RATE_LIMIT_MAX_RETRIES} rate-limit retries")
+                return None
+            wait = _retry_after_seconds(resp)
+            if wait is None:
+                wait = min(
+                    RATE_LIMIT_BACKOFF_SECONDS * rate_limit_attempt,
+                    RATE_LIMIT_BACKOFF_CAP_SECONDS,
+                )
+            print(f"    [warn] 429 for {url}, waiting {wait:.0f}s "
+                  f"(rate-limit retry {rate_limit_attempt}/{RATE_LIMIT_MAX_RETRIES})")
+            time.sleep(wait)
+            continue
         if resp.status_code >= 500 and attempt < MAX_RETRIES:
             print(f"    [warn] {resp.status_code} on attempt {attempt} for {url}, retrying")
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)

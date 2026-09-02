@@ -232,7 +232,17 @@ So: stage 1 collects profile URLs from the country page, stage 2 fetches each pr
 
 **ICP pre-filter — free, use it:** each country page splits listings under two headings, "Local, small- and mid-size Contract Research Organizations in {country}" and "Global Contract Research Organizations in {country}". The global section is IQVIA, ICON, Parexel, PPD, Syneos, SGS, Fortrea et al — all of which the Section 9 disqualifiers reject on employee count anyway. **Scrape only the local/mid-size section.** Halves fetch volume and pre-qualifies leads before any enrichment spend.
 
-**WAF note:** ichgcp.net returns 403 to requests with a default `curl/*` user-agent. Send a browser User-Agent header on all HTTP nodes hitting this domain.
+**Access — confirmed IP-level block, not a UA block.** ichgcp.net returns 403 from the dev machine even with a full browser User-Agent spoofed — the block is IP/GeoIP-based, not a `curl` signature match. n8n running locally cannot reach this domain at all, now or on a weekly schedule.
+
+**Shipped architecture:** the scraper runs as a scheduled GitHub Action (`.github/workflows/scrape-ichgcp.yml`, weekly + manual dispatch) from GitHub's runners, and commits `data/ichgcp_leads.csv` to the repo only when it changes. The local n8n workflow (`n8n/workflows/ingestion-ichgcp.json`) never touches ichgcp.net — it fetches the committed CSV from `raw.githubusercontent.com` and upserts into `leads`. This cleanly separates the blocked scrape from the pipeline.
+
+**Known risk, unresolved as of first build:** GitHub Actions runner IPs are datacenter-class and commonly penalized by the same reputation-based WAF systems that block scraping traffic generally — there is a real chance the Action itself also gets 403'd on first run, independent of UA string. If so, the next lever is a small always-on VPS with a residential-leaning IP, or a scraping proxy service — not a scraper redesign, the parsing logic itself is already fixture-tested and sound.
+
+Scraper UA: self-identifying (`NovaScoutBot/1.0` + repo link), not a spoofed browser string — deliberate choice, overridable via `ICHGCP_USER_AGENT` env var if needed.
+
+**Sprint 1 outcome, validated end-to-end:** first real Action run — no 403s, the IP-reputation WAF risk did not materialize. Failures were 429 (rate limit) and 404 only. 12 of 13 countries succeeded; Poland's country page got 429'd, producing zero Poland leads (retry-with-backoff fix pending/applied — check scraper for current state). 107 unique leads landed in `novascout.leads`, verified against the live DB.
+
+**Known, accepted limitation:** multi-country CROs (same domain listed on several country pages) collide on `ON CONFLICT (domain) DO NOTHING` — whichever country the scraper processes first for a given domain wins the `leads.country` value; later countries lose that lead to the collision. This undercounts some countries' per-scrape totals versus what lands in the DB (observed: Hungary 8→6, UAE 3→2). Correct behavior for avoiding duplicate lead rows; accepted as-is at current scale (~3% of leads affected). If country-level accuracy becomes material later (e.g. scoring's geography weight, or per-country reporting), the fix is a `lead_countries` join table rather than a single `leads.country` column — not implemented, revisit only if it matters in practice.
 
 **ClinicalTrials.gov is NOT an ingestion source.** Its API returns sponsor/collaborator names, not company websites, so it can't populate a domain-keyed `leads` row without a separate name→domain resolution step. It belongs in Workflow 3 (Scoring) instead, as a per-candidate lookup once a domain already exists — see below.
 
