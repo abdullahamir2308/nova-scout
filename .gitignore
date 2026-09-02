@@ -1,3 +1,6 @@
 .env
 __pycache__/
 *.pyc
+
+# Scratch output of `node n8n/enrichment/harness.js` live smoke runs
+n8n/enrichment/fetch_out.json
