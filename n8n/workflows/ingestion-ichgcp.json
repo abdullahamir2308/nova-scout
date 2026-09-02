@@ -1,0 +1,98 @@
+{
+  "id": "ingestionIchgcp01",
+  "name": "Ingestion - ICH GCP",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "weeksInterval": 1,
+              "triggerAtDay": [1],
+              "triggerAtHour": 12
+            }
+          ]
+        }
+      },
+      "name": "Weekly Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-160, 100],
+      "notes": "Fires Monday 12:00 in the workflow timezone (Asia/Karachi, set via GENERIC_TIMEZONE) -- a few hours after the GitHub Action's Monday 06:00 UTC scrape, so the CSV it fetches is always this week's."
+    },
+    {
+      "parameters": {},
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-160, 260]
+    },
+    {
+      "parameters": {
+        "url": "https://raw.githubusercontent.com/abdullahamir2308/nova-scout/main/data/ichgcp_leads.csv",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "name": "Fetch ICH GCP CSV",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [80, 180]
+    },
+    {
+      "parameters": {
+        "operation": "csv",
+        "binaryPropertyName": "data"
+      },
+      "name": "Parse CSV",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [300, 180]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO leads (domain, company_name, country, source, status)\nVALUES ($1, $2, $3, 'ichgcp', 'ingested')\nON CONFLICT (domain) DO UPDATE SET\n  company_name = EXCLUDED.company_name,\n  country = EXCLUDED.country,\n  updated_at = now()",
+        "options": {
+          "queryReplacement": "={{$json.domain}},{{$json.company_name}},{{$json.country}}"
+        }
+      },
+      "name": "Upsert into leads",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [520, 180],
+      "notes": "Only sets status/source on first INSERT. A lead that has already progressed past 'ingested' (enriched/scored/etc.) is left alone on re-runs -- re-running the weekly scrape must not regress pipeline state for leads it has already seen.",
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Postgres - novascout"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Schedule": {
+      "main": [[{ "node": "Fetch ICH GCP CSV", "type": "main", "index": 0 }]]
+    },
+    "Manual Trigger": {
+      "main": [[{ "node": "Fetch ICH GCP CSV", "type": "main", "index": 0 }]]
+    },
+    "Fetch ICH GCP CSV": {
+      "main": [[{ "node": "Parse CSV", "type": "main", "index": 0 }]]
+    },
+    "Parse CSV": {
+      "main": [[{ "node": "Upsert into leads", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

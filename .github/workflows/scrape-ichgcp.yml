@@ -1,0 +1,48 @@
+name: Scrape ICH GCP Directory
+
+# Runs from GitHub's IP range because ichgcp.net 403s the dev machine and
+# the local n8n container (see ichgcp_scrape_findings.md). n8n picks up the
+# result from raw.githubusercontent.com instead of touching ichgcp.net.
+on:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scrape-ichgcp
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r scraper/requirements.txt
+
+      - name: Run scraper
+        env:
+          OUTPUT_CSV_PATH: data/ichgcp_leads.csv
+        run: python scraper/scrape_ichgcp.py
+
+      - name: Commit CSV if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/ichgcp_leads.csv
+          if git diff --cached --quiet; then
+            echo "No changes to data/ichgcp_leads.csv — nothing to commit."
+          else
+            git commit -m "chore(data): update ICH GCP scrape results"
+            git push
+          fi

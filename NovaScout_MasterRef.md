@@ -221,8 +221,18 @@ blocklist
 ### Workflow 1 — Ingestion
 **Trigger:** Cron, weekly
 **Sources:**
-- ICH GCP directory (`ichgcp.net/cro-list`) — per-country pages, HTTP node + HTML extract node, server-rendered. Primary source: gives company name + website in one listing, which is what a domain-keyed schema needs.
+- ICH GCP directory (`ichgcp.net/cro-list`) — per-country pages, server-rendered, no JS needed.
 - Manual CSV import path for referrals and conference lists — via psql `COPY`, no workflow needed yet.
+
+**ICH GCP page structure — VERIFIED, two-stage scrape required:**
+
+Country pages (`/cro-list/country/{slug}`) list companies with name, truncated description, and a link to an ichgcp company profile page — but **no external website URL**. The CRO's actual domain appears only on the company profile page (`/cro-list/country/{slug}/company/{company_slug}`) as a `Web:` field. Exception: the two paid "Featured CROs" slots at the top of each country page do carry a direct website link.
+
+So: stage 1 collects profile URLs from the country page, stage 2 fetches each profile to extract the domain. Budget ~15–40 profile fetches per country. Rate-limit politely.
+
+**ICP pre-filter — free, use it:** each country page splits listings under two headings, "Local, small- and mid-size Contract Research Organizations in {country}" and "Global Contract Research Organizations in {country}". The global section is IQVIA, ICON, Parexel, PPD, Syneos, SGS, Fortrea et al — all of which the Section 9 disqualifiers reject on employee count anyway. **Scrape only the local/mid-size section.** Halves fetch volume and pre-qualifies leads before any enrichment spend.
+
+**WAF note:** ichgcp.net returns 403 to requests with a default `curl/*` user-agent. Send a browser User-Agent header on all HTTP nodes hitting this domain.
 
 **ClinicalTrials.gov is NOT an ingestion source.** Its API returns sponsor/collaborator names, not company websites, so it can't populate a domain-keyed `leads` row without a separate name→domain resolution step. It belongs in Workflow 3 (Scoring) instead, as a per-candidate lookup once a domain already exists — see below.
 
