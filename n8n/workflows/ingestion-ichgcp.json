@@ -70,7 +70,7 @@
       "notes": "Only sets status/source on first INSERT. A lead that has already progressed past 'ingested' (enriched/scored/etc.) is left alone on re-runs -- re-running the weekly scrape must not regress pipeline state for leads it has already seen.",
       "credentials": {
         "postgres": {
-          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "id": "novascoutPg01",
           "name": "Postgres - novascout"
         }
       }
