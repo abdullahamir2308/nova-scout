@@ -99,6 +99,8 @@ OLLAMA_HOST=0.0.0.0:11434   # reachable from Docker containers
 
 **Publishing locks to a specific version.** If the workflow is regenerated and re-imported after being published (which happens routinely here — build_workflow.py has rebuilt this workflow multiple times for fixes), the publish goes stale and must be redone against the new version. Re-publish after every workflow rebuild, not just once.
 
+**Verification — the publication tables are a dead end on this instance, don't check them.** `workflow_publication_trigger_status`, `workflow_published_version`, and `workflow_publication_outbox` only get written when `useWorkflowPublicationService` is true. It defaults to false and `N8N_USE_WORKFLOW_PUBLICATION_SERVICE` isn't set here, so those tables stay empty regardless of whether activation actually worked — checking them proves nothing on this instance. **The real signals**, confirmed by reading the running source directly: `workflow_entity.active='t'`, `activeVersionId` non-null, `triggerCount=1`, a new row in `workflow_publish_history`, and — the only fully conclusive proof — an execution with `mode='trigger'` (the execution column is `mode`, not `trigger_mode`; the value for a fired schedule is `'trigger'`, not `'cron'`). `triggerCount=0` on its own is not evidence of a broken trigger node — it's set only after successful activation, so it reads zero on any never-activated workflow no matter how correctly built.
+
 **n8n execute against an already-running container needs runner env overrides.** A one-off `docker exec ... n8n execute --id=...` against the live container conflicts with the main process's own task-runner broker unless you pass `-e N8N_RUNNERS_BROKER_PORT=5690 -e N8N_RUNNERS_ENABLED=false`. Without these it can hang or fail confusingly.
 
 **Verify before building anything on top:** run `ollama ps` after loading and confirm the model shows 100% GPU, not a CPU/GPU split.
@@ -301,9 +303,39 @@ Scraper UA: self-identifying (`NovaScoutBot/1.0` + repo link), not a spoofed bro
 
 **Null-handling for weighted factors:** where `employee_estimate` or `founder_name`/`founder_linkedin` is null, that factor contributes a neutral partial score, not zero — a confirmed miss (e.g. a named founder found and clearly not on LinkedIn) should score lower than an honest unknown. Don't let extraction's correct refusal to guess become a scoring penalty.
 
-**Before wiring `is_cro` as an automatic disqualifier:** Sprint 2 found 23/80 successfully-enriched leads judged `is_cro: false`, despite all being sourced from ICH GCP's own "local/mid-size CRO" section. Plausible and not alarming — directory listings drift (rebrands, vendors miscategorized, defunct domains) and this is enrichment correctly catching what the source didn't. But it's a hard, irreversible disqualifier removing ~29% of the enriched pool — spot-check a handful of the actual 23 domains before trusting it fully automated.
+**`is_cro` disqualifications:** Sprint 2 found 23/80 successfully-enriched leads judged `is_cro: false`, despite all being sourced from ICH GCP's own "local/mid-size CRO" section. Plausible and not alarming — directory listings drift (rebrands, vendors miscategorized, defunct domains) and this is enrichment correctly catching what the source didn't (spot-checked `endpointclinical.com` directly: it's an RTSM/IRT technology vendor, not a CRO — correct call). Decided against a one-time manual audit of the full set — see the visibility decision below instead.
 
-**Therapeutic area taxonomy — needs constraining before this factor is reliable.** Real extraction shows free-text drift (`cardiology` vs `cardiovascular`, singular/plural variants) and industry terms leaking in (`medtech`, `pharma` are not disease areas). Oncology stayed consistent, so the 15-point weight is safe today, but exact-string matching elsewhere will break. Fix at the schema level — constrain `therapeutic_areas` to a fixed enum in the Ollama JSON schema rather than free text, not a post-hoc cleanup pass. NoblePath's own 6 published areas (oncology, cardiovascular, CNS, endocrine metabolic disorders, infectious disease, internal medicine & immunology) are a reasonable starting enum, since organic extraction results already cluster around close variants of most of them.
+**Therapeutic area taxonomy — LOCKED, expanded.** `therapeutic_areas` extraction is constrained to this fixed enum in the Ollama JSON schema (array of strings from this list, not free text), enforced at the schema-grammar level and verified with adversarial testing — this fixes both the drift (`cardiology`/`cardiovascular`, singular/plural) and industry-term leakage (`medtech`, `pharma` simply can't be output once excluded from the enum):
+
+```
+Oncology
+Cardiovascular
+Central Nervous System
+Immunology
+Infectious Disease
+Endocrinology
+Metabolic Disorders
+Respiratory
+Rare Diseases
+Internal Medicine
+Anesthesiology
+Dermatology
+Rheumatology
+Ophthalmology
+Gastroenterology
+Nephrology
+Hematology
+Other
+```
+
+Broader than NoblePath's own 6-category list by design — chosen to preserve granularity already showing up organically in real extraction rather than forcing everything into 6 buckets. The last six (Dermatology through Hematology) were added after the initial 12-category build showed `Other` immediately absorbing real volume (dermatology 12, rheumatology 7, ophthalmology 6, gastroenterology 6, nephrology 5, hematology 3, against oncology's 27) — the "recognizable pattern → add a category" signal fired on first contact with real data, not gradually over time. `Other` still exists as a catch-all for genuine long-tail cases.
+
+**Implemented and verified** in the enrichment workflow — grammar-constrained, drift-checked against `code_normalise.js`, adversarial-tested (zero off-enum output). The current 123 leads hold a mixed store: pre-fix rows in lowercase free text, post-fix rows in enum Title Case. **Sprint 3 must match case-insensitively** against this field — a case-sensitive check against old rows will silently miss them. Re-enriching the old rows for taxonomy cleanliness alone is not required (oncology, the only category actually scored, already extracted consistently even before this fix).
+
+**Known, accepted, unrelated:** non-English source text doesn't reliably map into the `phases` field — e.g. Turkish `biyoeşdeğerlik` didn't resolve to `Bioequivalence`. Real gap, low priority, not touched.
+
+**`is_cro` disqualifications — visibility over spot-checking.** Instead of a one-time manual audit, Sprint 3's review queue must surface `scores.disqualify_reason` for disqualified leads, not just hide them — ongoing visibility catches misclassification as it happens, across every batch, not just one.
+
 
 **ClinicalTrials.gov lookup mechanism (this is where that source lives):** for each candidate that has cleared hard disqualifiers, call `GET https://clinicaltrials.gov/api/v2/studies` with `query.spons=<company_name>` (and `query.locn=<country>` as a fallback if the sponsor-name search misses) and `filter.overallStatus=RECRUITING`. No API key required. A non-zero `totalCount` earns the 20-point weight. This is a per-candidate lookup keyed on a company name/domain we already have — not a bulk discovery source, since the API has no company-website field to key a new lead on.
 

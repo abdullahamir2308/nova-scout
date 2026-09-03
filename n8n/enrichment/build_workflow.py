@@ -6,6 +6,7 @@ standalone byte-identical to the JS that ships inside the workflow.
 import io
 import json
 import os
+import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "..", "workflows", "enrichment.json")
@@ -19,6 +20,54 @@ def js(name):
 
 PG_CRED = {"postgres": {"id": "novascoutPg01", "name": "Postgres - novascout"}}
 
+# The LOCKED therapeutic-area taxonomy (Master Ref Section 9, Workflow 3).
+#
+# NovaScout_MasterRef.md is the single source of truth: the list is PARSED out
+# of the spec at build time rather than copied here, so expanding the taxonomy
+# is a one-place edit to the doc and this generator just follows. There is no
+# second copy to forget.
+#
+# It ships below as a JSON-schema `enum`, which is what actually constrains the
+# model: grammar-constrained generation cannot emit a value outside this list,
+# so the drift (cardiology/cardiovascular, singular/plural) and the industry-term
+# leakage (medtech, pharma) are impossible by construction rather than by prompt
+# discipline. code_normalise.js needs its own copy (an n8n Code node cannot
+# import) and is checked against this one -- see _assert_areas_match_normaliser.
+MASTER_REF = os.environ.get(
+    "NOVASCOUT_MASTER_REF", os.path.join(HERE, "..", "..", "NovaScout_MasterRef.md")
+)
+
+
+def load_therapeutic_areas(path=None):
+    """Parse the locked enum out of the Master Ref's taxonomy section.
+
+    Anchored on the section heading rather than on "the first fenced block", so
+    an unrelated code block added elsewhere in the doc cannot silently become
+    the taxonomy. A formatting change that breaks this parse fails the build,
+    which is the intended behaviour: a loud failure beats a silently stale enum.
+    """
+    path = path or MASTER_REF
+    with io.open(path, encoding="utf-8") as fh:
+        doc = fh.read()
+    anchor = re.search(r"\*\*Therapeutic area taxonomy[^\n]*\*\*", doc)
+    if not anchor:
+        raise AssertionError(
+            "taxonomy section not found in %s -- expected a line containing "
+            "'**Therapeutic area taxonomy ...**'" % path
+        )
+    block = re.search(r"\n```\n(.*?)\n```", doc[anchor.end():], re.S)
+    if not block:
+        raise AssertionError("no fenced list follows the taxonomy heading in %s" % path)
+    areas = [ln.strip() for ln in block.group(1).splitlines() if ln.strip()]
+    if len(areas) < 2:
+        raise AssertionError("taxonomy in %s looks empty: %r" % (path, areas))
+    if len(set(areas)) != len(areas):
+        raise AssertionError("taxonomy in %s contains duplicates: %r" % (path, areas))
+    return areas
+
+
+THERAPEUTIC_AREAS = load_therapeutic_areas()
+
 # The extraction schema. Passed to Ollama as `format`, which constrains
 # generation with a grammar -- this is what makes the output parseable, not
 # prompt discipline. Section 3: "always use Ollama's format: json with an
@@ -28,7 +77,10 @@ SCHEMA = {
     "properties": {
         "is_cro": {"type": "boolean"},
         "company_type": {"type": "string"},
-        "therapeutic_areas": {"type": "array", "items": {"type": "string"}},
+        "therapeutic_areas": {
+            "type": "array",
+            "items": {"type": "string", "enum": THERAPEUTIC_AREAS},
+        },
         "phases": {"type": "array", "items": {"type": "string"}},
         "founder_name": {"type": ["string", "null"]},
         "founder_title": {"type": ["string", "null"]},
@@ -42,6 +94,26 @@ SCHEMA = {
         "site_quality_notes",
     ],
 }
+
+def _assert_areas_match_normaliser():
+    """code_normalise.js must carry the same taxonomy the Master Ref locks.
+
+    An n8n Code node cannot import a shared module, so that one duplicate copy
+    is unavoidable -- silent divergence from the spec is not. Fail the build
+    rather than ship a normaliser that drops values the schema still allows (or
+    vice versa). When this fires, the fix is to update the JS to match the doc,
+    never to edit the doc to match the JS."""
+    m = re.search(r"const THERAPEUTIC_AREAS = \[(.*?)\];", js("code_normalise.js"), re.S)
+    assert m, "THERAPEUTIC_AREAS array not found in code_normalise.js"
+    found = re.findall(r"'([^']*)'", m.group(1))
+    assert found == THERAPEUTIC_AREAS, (
+        "therapeutic-area taxonomy drifted between the Master Ref and "
+        "code_normalise.js:\n  doc (%s): %r\n  js:  %r"
+        % (os.path.basename(MASTER_REF), THERAPEUTIC_AREAS, found)
+    )
+
+
+_assert_areas_match_normaliser()
 
 # The schema is pretty-printed on purpose. A compact json.dumps emits runs like
 # `{"type": "string"}}`, and the `}}` inside closes the surrounding n8n {{ }}

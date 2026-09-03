@@ -48,6 +48,66 @@ function cleanStr(v, max) {
   return s.slice(0, max || 500);
 }
 
+// The LOCKED therapeutic-area taxonomy (Master Ref Section 9, Workflow 3).
+// NovaScout_MasterRef.md is the source of truth; build_workflow.py parses the
+// list out of the spec, ships it as an `enum` in the Ollama JSON schema, and
+// asserts this copy matches -- refusing to generate the workflow if it drifts.
+// An n8n Code node cannot import a shared module, which is the only reason this
+// copy exists. When the doc changes, update this list to match it.
+//
+// The schema enum is the real constraint -- grammar-constrained generation
+// cannot emit a value outside this list. This function is the second line of
+// defence, covering the one path that bypasses the grammar: the fenced-block
+// JSON rescue below, which parses whatever text came back.
+const THERAPEUTIC_AREAS = [
+  'Oncology',
+  'Cardiovascular',
+  'Central Nervous System',
+  'Immunology',
+  'Infectious Disease',
+  'Endocrinology',
+  'Metabolic Disorders',
+  'Respiratory',
+  'Rare Diseases',
+  'Internal Medicine',
+  'Anesthesiology',
+  'Dermatology',
+  'Rheumatology',
+  'Ophthalmology',
+  'Gastroenterology',
+  'Nephrology',
+  'Hematology',
+  'Other',
+];
+
+const AREA_BY_KEY = {};
+for (const a of THERAPEUTIC_AREAS) AREA_BY_KEY[a.toLowerCase()] = a;
+
+// Case-insensitive exact match only. Deliberately no alias table: a value that
+// is not on the list is dropped and recorded, never guessed into a neighbour.
+// Dropped values are surfaced in raw_extraction so off-enum leakage shows up in
+// the data instead of being silently swallowed.
+function canonicalAreas(raw) {
+  const kept = [];
+  const dropped = [];
+  const seen = {};
+  const list = Array.isArray(raw) ? raw : [];
+  for (const v of list) {
+    const s = cleanStr(v, 80);
+    if (!s) continue;
+    const canon = AREA_BY_KEY[s.toLowerCase()];
+    if (!canon) {
+      if (dropped.indexOf(s) === -1) dropped.push(s);
+      continue;
+    }
+    if (!seen[canon]) {
+      seen[canon] = true;
+      kept.push(canon);
+    }
+  }
+  return { kept: kept, dropped: dropped };
+}
+
 // The HTTP node is set to continue on error, so a failed call arrives without
 // a `response` field. Treat that as an extraction failure, not a silent null row.
 let llm = null;
@@ -128,10 +188,8 @@ if (parseError) {
   };
 }
 
-const areas = Array.isArray(llm.therapeutic_areas) ? llm.therapeutic_areas : [];
-const therapeutic_areas = Array.from(
-  new Set(areas.map((a) => cleanStr(a, 80)).filter(Boolean).map((a) => a.toLowerCase()))
-).slice(0, 25);
+const areaResult = canonicalAreas(llm.therapeutic_areas);
+const therapeutic_areas = areaResult.kept;
 
 const rawPhases = Array.isArray(llm.phases) ? llm.phases : [];
 const phases = Array.from(
@@ -175,6 +233,10 @@ return {
         company_type: cleanStr(llm.company_type, 120),
         founder_title: cleanStr(llm.founder_title, 200),
         city: cleanStr(llm.city, 120),
+        // Non-empty means something got past the schema enum -- expected to be
+        // empty on every grammar-constrained call, so a value here is a signal
+        // worth chasing, not noise.
+        therapeutic_areas_dropped: areaResult.dropped,
         founder_linkedin_candidates: src.linkedin_candidates,
         founder_linkedin_matched: founder_linkedin !== null,
         llm_raw: llm,

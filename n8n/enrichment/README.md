@@ -29,7 +29,34 @@ docker exec nova-scout-n8n-1 n8n import:workflow --input=/tmp/enrichment.json
 
 The CLI writes straight to n8n's own database. A running n8n does not notice —
 reopen the workflow in the UI (or restart the container) before relying on the
-new version.
+new version. `import:workflow` also **deactivates** the workflow, and activation
+is a UI action — re-activate it in the editor after importing.
+
+## The therapeutic-area taxonomy comes from the spec
+
+`NovaScout_MasterRef.md` (Section 9, "Therapeutic area taxonomy") is the single
+source of truth. `build_workflow.py` **parses the fenced list out of that
+document** at build time and ships it as a JSON-schema `enum` — that enum is the
+real constraint, since Ollama's grammar cannot generate a value outside it.
+
+So expanding the taxonomy is a one-place edit: add the category to the Master
+Ref. There is no list to update in `build_workflow.py`.
+
+Two things still need a manual follow-up when the doc changes:
+
+1. `code_normalise.js` holds its own copy of the list, because an n8n Code node
+   cannot import a shared module and the fenced-block JSON rescue path bypasses
+   the grammar. `build_workflow.py` asserts it matches the doc and refuses to
+   generate the workflow if it has drifted — when that fires, update the JS to
+   match the doc, never the other way round.
+2. The `therapeutic_areas` rules in `code_fetch.js`'s system prompt name the
+   categories and the mapping hints. The grammar stops off-enum output on its
+   own, but the prompt is what makes the model pick the *right* value, so a new
+   category with no prompt guidance will be under-used.
+
+The parse is anchored on the section heading, not on "the first fenced block".
+Renaming that heading or removing the fence fails the build loudly rather than
+silently shipping a stale enum.
 
 ## Files
 
@@ -47,9 +74,10 @@ new version.
 Offline unit tests, no network and no Ollama. All three exit non-zero on failure:
 
 ```powershell
-node n8n/enrichment/test_url_resolver.js     # 14 cases
-node n8n/enrichment/test_founder_match.js    #  9 cases
-node n8n/enrichment/test_chatbot_detect.js   # 13 cases
+node n8n/enrichment/test_url_resolver.js       # 14 cases
+node n8n/enrichment/test_founder_match.js      #  9 cases
+node n8n/enrichment/test_chatbot_detect.js     # 13 cases
+node n8n/enrichment/test_therapeutic_areas.js  # 19 cases
 ```
 
 - **`test_url_resolver.js`** checks the hand-rolled URL resolver against Node's
@@ -62,6 +90,11 @@ node n8n/enrichment/test_chatbot_detect.js   # 13 cases
 - **`test_chatbot_detect.js`** checks each vendor's real embed snippet is
   detected and that ordinary analytics/marketing markup is not. False positives
   matter: this feeds Workflow 3's "already has a chatbot" hard disqualifier.
+- **`test_therapeutic_areas.js`** checks the locked-taxonomy canonicaliser:
+  casing is normalised, off-enum values (`cardiology`, `medtech`, plurals) are
+  dropped and recorded rather than guessed into a neighbour, and the list in
+  `code_normalise.js` still matches the Master Ref — which it reads from the doc
+  rather than pinning a third copy of.
 
 A live smoke run against the fixture leads (network, no Ollama) — writes
 `fetch_out.json` next to the script, which is gitignored:
