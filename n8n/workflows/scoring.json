@@ -1,0 +1,510 @@
+{
+  "id": "scoring0001",
+  "name": "Scoring",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "name": "Every 30 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -760,
+        40
+      ],
+      "notes": "Section 9 Workflow 3: cron, batch where status='enriched'. Queue-driven, so a missed run just means the next one catches up (build rule 4)."
+    },
+    {
+      "parameters": {},
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -760,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "batchsize",
+              "name": "batch_size",
+              "value": 25,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -540,
+        130
+      ],
+      "notes": "Bounded batch (build rule 5). Larger than Workflow 2's 10 because the expensive call here is a fast ClinicalTrials.gov lookup, and only leads that survive the disqualifiers reach the GPU at all."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One query, one row per lead. enrichments.lead_id is UNIQUE (migration 002),\n-- so this join cannot fan out; blocklist membership is resolved here rather\n-- than by a second node, because Postgres already has the index for it.\nSELECT l.id AS lead_id,\n       l.domain,\n       l.company_name,\n       l.country,\n       e.therapeutic_areas,\n       e.phases,\n       e.founder_name,\n       e.founder_linkedin,\n       e.employee_estimate,\n       e.has_chatbot,\n       e.chatbot_vendor,\n       e.site_quality_notes,\n       e.raw_extraction,\n       (b.domain IS NOT NULL) AS blocklisted,\n       b.reason              AS blocklist_reason\n  FROM leads l\n  JOIN enrichments e ON e.lead_id = l.id\n  LEFT JOIN blocklist b ON b.domain = l.domain\n WHERE l.status = 'enriched'\n ORDER BY l.id\n LIMIT $1;",
+        "options": {
+          "queryReplacement": "={{ [$json.batch_size] }}"
+        }
+      },
+      "name": "Get Enriched Batch",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -320,
+        130
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Oldest-first queue read (Section 7 idempotency rule). Query parameters are passed as an array so a value containing a comma is never split.",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Evaluate Lead — n8n Code node (Run Once for Each Item).\n//\n// Everything in Workflow 3 that a deterministic rule can answer: the hard\n// disqualifiers, and every weighted factor except the ClinicalTrials.gov\n// lookup (which needs a network call, so it is an HTTP node downstream).\n//\n// Master Ref build rule 3 — never spend tokens on what a string match answers.\n// The model is used for exactly one thing in this workflow: the prose rationale\n// on leads that survived and that have real extraction data to ground it.\n\n// ---------------------------------------------------------------------------\n// Locked constants. build_workflow.py parses each of these out of\n// NovaScout_MasterRef.md and refuses to generate the workflow if this file has\n// drifted from the spec, so the doc stays the single source of truth. An n8n\n// Code node cannot import a shared module, which is the only reason these\n// copies exist. When the doc changes, update these lists — never the reverse.\n// ---------------------------------------------------------------------------\n\n// Section 12, \"Geographies\".\nconst TARGET_GEOGRAPHIES = [\n  'Turkey',\n  'Mexico',\n  'India',\n  'Pakistan',\n  'Egypt',\n  'Poland',\n  'Romania',\n  'Hungary',\n  'Czech Republic',\n  'UAE',\n  'South Africa',\n  'Brazil',\n  'Argentina',\n];\n\n// Section 9, Workflow 3, \"Weighted fit score (0-100)\".\nconst WEIGHTS = {\n  geography: 25,\n  trials: 20,\n  founder: 20,\n  oncology: 15,\n  employees: 10,\n  site: 10,\n};\n\n// Section 9, Workflow 3, \"Therapeutic area taxonomy\". Only 'Oncology' is\n// actually scored, but canonicalising against the whole locked list is what\n// makes the match reliable: the live store holds pre-enum rows in lowercase\n// free text and post-enum rows in Title Case, so a case-sensitive check would\n// silently miss every old row.\nconst THERAPEUTIC_AREAS = [\n  'Oncology',\n  'Cardiovascular',\n  'Central Nervous System',\n  'Immunology',\n  'Infectious Disease',\n  'Endocrinology',\n  'Metabolic Disorders',\n  'Respiratory',\n  'Rare Diseases',\n  'Internal Medicine',\n  'Anesthesiology',\n  'Dermatology',\n  'Rheumatology',\n  'Ophthalmology',\n  'Gastroenterology',\n  'Nephrology',\n  'Hematology',\n  'Other',\n];\n\n// Employee band that earns the `employees` weight in full (Section 12: \"5-100\n// employees\"), and the enterprise cutoff that hard-disqualifies (Section 9).\nconst EMPLOYEE_BAND = { min: 5, max: 100 };\nconst ENTERPRISE_OVER = 500;\n\n// ---------------------------------------------------------------------------\n// Helpers\n// ---------------------------------------------------------------------------\n\nconst GEO_BY_KEY = {};\nfor (const g of TARGET_GEOGRAPHIES) GEO_BY_KEY[g.toLowerCase()] = g;\n\nconst AREA_BY_KEY = {};\nfor (const a of THERAPEUTIC_AREAS) AREA_BY_KEY[a.toLowerCase()] = a;\n\n// Case-insensitive exact match, no alias table — the same rule code_normalise.js\n// applies. A value that is not on the list is not guessed into a neighbour.\nfunction canonicalAreas(raw) {\n  const kept = [];\n  const list = Array.isArray(raw) ? raw : [];\n  for (const v of list) {\n    if (v === null || v === undefined) continue;\n    const canon = AREA_BY_KEY[String(v).trim().toLowerCase()];\n    if (canon && kept.indexOf(canon) === -1) kept.push(canon);\n  }\n  return kept;\n}\n\nfunction inTargetGeography(country) {\n  if (country === null || country === undefined) return false;\n  return Object.prototype.hasOwnProperty.call(GEO_BY_KEY, String(country).trim().toLowerCase());\n}\n\n// Did any fetch rung get an HTTP status line back?\n//\n// This is the WAF-vs-dead distinction Section 9 calls for. code_fetch.js records\n// each failed rung as \"<label> / -> <reason>\", where the reason is either a\n// transport error (ENOTFOUND, timeout, TLS) or \"HTTP <code>\". A status code at\n// all means a server answered — the host is up and serving, it just refused us.\n// A 403 from a WAF is the documented case; any status is the same evidence.\n//\n// Returns 'http_block' (site demonstrably exists), 'no_response' (nothing ever\n// answered), or 'unknown' (no error record to judge from).\nfunction siteEvidence(fetchInfo) {\n  if (!fetchInfo) return 'unknown';\n  if (fetchInfo.ok === true) return 'http_block'; // reached, but unreadable\n  const errors = Array.isArray(fetchInfo.errors) ? fetchInfo.errors : [];\n  if (!errors.length) return 'unknown';\n  for (const e of errors) {\n    if (/->\\s*HTTP\\s+\\d{3}/i.test(String(e))) return 'http_block';\n  }\n  return 'no_response';\n}\n\n// ---------------------------------------------------------------------------\n// Hard disqualifiers (Section 9, Workflow 3)\n// ---------------------------------------------------------------------------\n//\n// Every matching rule is recorded, not just the first: Section 9's \"visibility\n// over spot-checking\" decision means the review queue should show the whole\n// picture, and a lead cut for two reasons is a different judgement call from\n// one cut on a single borderline rule. The first entry is the primary reason,\n// ordered most-decisive first.\n//\n// Null is never evidence. Section 9 is explicit: employee_estimate is null on\n// 85% of leads because extraction correctly refuses to guess, and the same\n// applies to is_cro on leads whose site never yielded text. `> 500` fires only\n// on a confirmed number; `not a CRO` fires only on an explicit false.\nfunction hardDisqualifiers(lead) {\n  const raw = lead.raw_extraction || {};\n  const reasons = [];\n\n  if (lead.blocklisted === true) {\n    reasons.push({\n      code: 'blocklist',\n      text:\n        'Domain is on the blocklist' +\n        (lead.blocklist_reason ? ' (' + lead.blocklist_reason + ')' : '') + '.',\n    });\n  }\n\n  if (raw.is_cro === false) {\n    reasons.push({\n      code: 'not_a_cro',\n      text:\n        'Not a CRO — enrichment read the site as ' +\n        (raw.company_type ? '\"' + raw.company_type + '\"' : 'a different kind of company') +\n        '. Sourced from the ICH GCP CRO directory, so this is a directory listing that has ' +\n        'drifted (rebrand, vendor miscategorised, or defunct) rather than a scraping error.',\n    });\n  }\n\n  if (typeof lead.employee_estimate === 'number' && lead.employee_estimate > ENTERPRISE_OVER) {\n    reasons.push({\n      code: 'enterprise_scale',\n      text:\n        'Enterprise CRO — roughly ' + lead.employee_estimate + ' employees, above the ' +\n        ENTERPRISE_OVER + '-employee cutoff. Confirmed figure stated on the site, not an estimate.',\n    });\n  }\n\n  if (lead.has_chatbot === true) {\n    reasons.push({\n      code: 'has_chatbot',\n      text:\n        'Already runs a chat widget' +\n        (lead.chatbot_vendor ? ' (' + lead.chatbot_vendor + ')' : '') +\n        ' — detected by matching the vendor embed script, not inferred.',\n    });\n  }\n\n  // \"No functioning website\" — and only when nothing ever answered.\n  //\n  // Section 9's design implication, applied: a confirmed HTTP response is\n  // WEAKER evidence than a connection failure, because a 403 proves the site\n  // exists. Those leads are not cut here; they fall through to scoring with\n  // whatever is known (geography, trials) and carry a needs_recheck flag, so a\n  // hostile WAF costs a lead points rather than killing it permanently.\n  //\n  // The bounded-retry-with-attempt-counter mechanism Section 9 sketches is\n  // deliberately NOT built here — it needs an attempt counter written by\n  // Workflow 2 and read by Workflow 3, i.e. new schema coordination between the\n  // two. Worth building once there is real scoring output to learn from.\n  const evidence = siteEvidence(raw.fetch);\n  const status = raw.enrichment_status;\n  if ((status === 'unreachable' || status === 'no_readable_text') && evidence === 'no_response') {\n    const errs = (raw.fetch && Array.isArray(raw.fetch.errors) ? raw.fetch.errors : []).slice(0, 2);\n    reasons.push({\n      code: 'no_website',\n      text:\n        'No functioning website — every connection attempt failed outright (no HTTP response ' +\n        'on any of the four retry rungs: direct HTTPS, www, TLS-relaxed, plain HTTP).' +\n        (errs.length ? ' First failures: ' + errs.join('; ') + '.' : ''),\n    });\n  }\n\n  return reasons;\n}\n\n// ---------------------------------------------------------------------------\n// Weighted factors (Section 9, Workflow 3)\n// ---------------------------------------------------------------------------\n//\n// Null-handling, per Section 9: \"where employee_estimate or founder_name /\n// founder_linkedin is null, that factor contributes a neutral partial score,\n// not zero — a confirmed miss should score lower than an honest unknown. Don't\n// let extraction's correct refusal to guess become a scoring penalty.\"\n//\n// So each of those two factors has three levels, not two: full credit, a\n// half-weight neutral for an honest unknown, and a below-neutral score for a\n// confirmed miss.\n\nfunction scoreGeography(lead) {\n  const hit = inTargetGeography(lead.country);\n  return {\n    points: hit ? WEIGHTS.geography : 0,\n    max: WEIGHTS.geography,\n    basis: hit ? 'confirmed' : 'miss',\n    detail: hit\n      ? lead.country + ' is a target geography'\n      : (lead.country ? lead.country + ' is outside the target geographies' : 'no country recorded'),\n  };\n}\n\n// Three levels, because \"we found the founder and they are demonstrably not on\n// LinkedIn\" is worse news than \"the site never named a founder\":\n//   full     — named founder AND a LinkedIn URL resolved for them\n//   unknown  — no founder named, OR no LinkedIn URLs on the site to match\n//              against (the matcher never had a chance, so this is not a miss)\n//   miss     — founder named, candidate URLs were harvested, none matched them\nfunction scoreFounder(lead) {\n  const raw = lead.raw_extraction || {};\n  const candidates = Array.isArray(raw.founder_linkedin_candidates)\n    ? raw.founder_linkedin_candidates\n    : [];\n  const half = WEIGHTS.founder / 2;\n  const missPoints = Math.round(WEIGHTS.founder * 0.3);\n\n  if (lead.founder_name && lead.founder_linkedin) {\n    return {\n      points: WEIGHTS.founder,\n      max: WEIGHTS.founder,\n      basis: 'confirmed',\n      detail: lead.founder_name + ' identified with a LinkedIn profile',\n    };\n  }\n  if (lead.founder_name && candidates.length > 0) {\n    return {\n      points: missPoints,\n      max: WEIGHTS.founder,\n      basis: 'miss',\n      detail:\n        lead.founder_name +\n        ' identified, but none of the ' + candidates.length +\n        ' LinkedIn profiles on the site matched them',\n    };\n  }\n  if (lead.founder_name) {\n    return {\n      points: half,\n      max: WEIGHTS.founder,\n      basis: 'unknown',\n      detail: lead.founder_name + ' identified; site carried no LinkedIn profiles to match against',\n    };\n  }\n  return {\n    points: half,\n    max: WEIGHTS.founder,\n    basis: 'unknown',\n    detail: 'no founder or MD named on the site',\n  };\n}\n\nfunction scoreOncology(lead) {\n  const areas = canonicalAreas(lead.therapeutic_areas);\n  const hit = areas.indexOf('Oncology') !== -1;\n  return {\n    points: hit ? WEIGHTS.oncology : 0,\n    max: WEIGHTS.oncology,\n    basis: hit ? 'confirmed' : (areas.length ? 'miss' : 'unknown'),\n    detail: hit\n      ? 'oncology among the stated therapeutic areas'\n      : (areas.length\n          ? 'therapeutic areas stated (' + areas.slice(0, 4).join(', ') + ') but no oncology'\n          : 'no therapeutic areas extracted'),\n    areas: areas,\n  };\n}\n\nfunction scoreEmployees(lead) {\n  const n = lead.employee_estimate;\n  const half = WEIGHTS.employees / 2;\n  if (typeof n !== 'number' || !isFinite(n)) {\n    return {\n      points: half,\n      max: WEIGHTS.employees,\n      basis: 'unknown',\n      detail: 'headcount not stated on the site',\n    };\n  }\n  const hit = n >= EMPLOYEE_BAND.min && n <= EMPLOYEE_BAND.max;\n  return {\n    points: hit ? WEIGHTS.employees : 0,\n    max: WEIGHTS.employees,\n    basis: hit ? 'confirmed' : 'miss',\n    detail: hit\n      ? 'roughly ' + n + ' employees, inside the ' + EMPLOYEE_BAND.min + '-' + EMPLOYEE_BAND.max + ' band'\n      : 'roughly ' + n + ' employees, outside the ' + EMPLOYEE_BAND.min + '-' + EMPLOYEE_BAND.max + ' band',\n  };\n}\n\n// \"Site quality suggests budget\", scored off what the fetch actually measured\n// rather than off the model's prose notes: how much real text the site carries,\n// whether it has the standard about/services/team structure, and whether it is\n// served over a working certificate. A maintained, invested-in site scores high\n// on all three; a one-page brochure behind an expired cert does not.\n//\n// Deliberately deterministic. The model's site_quality_notes go into the\n// rationale prompt as colour, but they do not move the number.\nfunction scoreSite(lead) {\n  const raw = lead.raw_extraction || {};\n  const f = raw.fetch;\n  const half = WEIGHTS.site / 2;\n\n  if (!f || typeof f.prompt_chars !== 'number') {\n    return {\n      points: half,\n      max: WEIGHTS.site,\n      basis: 'unknown',\n      detail: 'site could not be read, so quality is unassessed',\n    };\n  }\n\n  let points = 0;\n  const notes = [];\n\n  // Content depth. Thresholds sit on the measured spread of the live corpus\n  // (p25 ~6k chars, p50 ~13k, capped at 24k by the fetcher).\n  const chars = f.prompt_chars;\n  if (chars >= 12000) {\n    points += 6;\n    notes.push('substantial content (' + chars + ' chars)');\n  } else if (chars >= 6000) {\n    points += 4;\n    notes.push('moderate content (' + chars + ' chars)');\n  } else if (chars >= 2500) {\n    points += 2;\n    notes.push('thin content (' + chars + ' chars)');\n  } else {\n    notes.push('very little readable content (' + chars + ' chars)');\n  }\n\n  // Structural depth — did the site have the standard about/services/team pages?\n  const discovered = Array.isArray(f.discovered) ? f.discovered.length : 0;\n  if (discovered >= 3) {\n    points += 4;\n    notes.push(discovered + ' standard subpages');\n  } else if (discovered >= 1) {\n    points += 2;\n    notes.push(discovered + ' subpage' + (discovered === 1 ? '' : 's'));\n  } else {\n    notes.push('no about/services/team pages found');\n  }\n\n  // A site only reachable with certificate validation relaxed, or only over\n  // plain HTTP, is not one anyone is maintaining. Only applied when the fetcher\n  // actually recorded which rung won — null means the row predates that field,\n  // which is an unknown, not a penalty.\n  if (f.reached_via === 'https+insecure' || f.reached_via === 'http') {\n    points = Math.max(0, points - 2);\n    notes.push('reachable only via ' + f.reached_via + ' (broken or missing TLS)');\n  }\n\n  return {\n    points: points,\n    max: WEIGHTS.site,\n    basis: 'confirmed',\n    detail: notes.join('; '),\n  };\n}\n\n// ---------------------------------------------------------------------------\n// Node body\n// ---------------------------------------------------------------------------\n\nconst lead = $input.item.json;\nconst rawEx = lead.raw_extraction || {};\nconst reasons = hardDisqualifiers(lead);\nconst evidence = siteEvidence(rawEx.fetch);\n\n// Grounding guard, the same rule Section 9 Workflow 4 locks: a small model\n// fabricates when under-informed. A lead whose site never yielded text has no\n// facts to write a rationale from, so it never reaches the model — it gets a\n// deterministic rationale describing exactly what is and is not known.\nconst hasExtraction = rawEx.enrichment_status === 'ok';\n\nif (reasons.length) {\n  return {\n    json: {\n      lead_id: lead.lead_id,\n      domain: lead.domain,\n      company_name: lead.company_name,\n      country: lead.country,\n      disqualified: true,\n      disqualify_codes: reasons.map(function (r) { return r.code; }),\n      disqualify_reason: reasons.map(function (r) { return r.text; }).join(' '),\n      site_evidence: evidence,\n      needs_recheck: false,\n      has_extraction: hasExtraction,\n    },\n  };\n}\n\nconst factors = {\n  geography: scoreGeography(lead),\n  founder: scoreFounder(lead),\n  oncology: scoreOncology(lead),\n  employees: scoreEmployees(lead),\n  site: scoreSite(lead),\n};\n\n// A lead that survived the disqualifiers but whose site we could not read: the\n// host answered (or served an empty shell), so \"no functioning website\" does\n// not apply, but there is nothing to ground a rationale in. Flagged for the\n// review queue rather than quietly scored as if the data were real.\nconst needsRecheck = !hasExtraction;\n\nreturn {\n  json: {\n    lead_id: lead.lead_id,\n    domain: lead.domain,\n    company_name: lead.company_name,\n    country: lead.country,\n    disqualified: false,\n    factors: factors,\n    // Everything the rationale prompt needs, so the downstream node does not\n    // have to reach back across the workflow for the enrichment row.\n    facts: {\n      founder_name: lead.founder_name || null,\n      founder_title: rawEx.founder_title || null,\n      founder_linkedin: lead.founder_linkedin || null,\n      city: rawEx.city || null,\n      company_type: rawEx.company_type || null,\n      phases: Array.isArray(lead.phases) ? lead.phases : [],\n      areas: factors.oncology.areas,\n      employee_estimate: typeof lead.employee_estimate === 'number' ? lead.employee_estimate : null,\n      site_quality_notes: lead.site_quality_notes || null,\n    },\n    site_evidence: evidence,\n    needs_recheck: needsRecheck,\n    has_extraction: hasExtraction,\n    enrichment_status: rawEx.enrichment_status || null,\n    // ClinicalTrials.gov is a per-candidate lookup keyed on a name we already\n    // have (Section 9), so it runs only for leads that got this far.\n    ctgov_sponsor: lead.company_name || lead.domain,\n  },\n};\n"
+      },
+      "name": "Evaluate Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -100,
+        130
+      ],
+      "notes": "Hard disqualifiers and every weighted factor except the trials lookup, all deterministic (build rule 3). Null is never treated as evidence: the >500-employee and not-a-CRO rules fire only on a confirmed value, and null employee_estimate / founder fields take a half-weight neutral rather than a zero.\n\nThe 'no functioning website' disqualifier fires only when NO rung got an HTTP response. A 403 proves the site exists, so a WAF-blocked lead is scored low and flagged needs_recheck instead of being killed permanently (Section 9)."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "dq",
+              "leftValue": "={{ $json.disqualified }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Disqualified?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        120,
+        130
+      ],
+      "notes": "Section 9: hard disqualifiers run FIRST. A disqualified lead never reaches the ClinicalTrials.gov API or the GPU."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Build Disqualified Payload — n8n Code node (Run Once for Each Item).\n//\n// Disqualified leads never reach the model. Every hard disqualifier is a\n// deterministic rule, so the reason it fired is a fact, not a judgement --\n// spending tokens restating it would be the exact thing build rule 3 forbids,\n// and a generated paragraph would be less precise than the rule's own text.\n//\n// The reason string is written for a human reading a review queue, per\n// Section 9's \"visibility over spot-checking\" decision: disqualified leads must\n// be inspectable, not merely hidden, so misclassification surfaces across every\n// batch instead of in a one-off audit.\n\nconst ev = $input.item.json;\n\n// fit_score 0 is unambiguous here: no lead can reach 0 on merit (the two\n// null-neutral factors alone floor a scored lead at 15), so 0 in this column\n// always and only means \"disqualified, never scored\". That keeps the review\n// queue sortable on one column without a NULL special case.\nconst DISQUALIFIED_SCORE = 0;\n\nconst codes = Array.isArray(ev.disqualify_codes) ? ev.disqualify_codes : [];\n\nconst rationale =\n  (ev.company_name || ev.domain) +\n  (ev.country ? ' (' + ev.country + ')' : '') +\n  ' was disqualified before scoring, on ' +\n  (codes.length === 1 ? 'one hard disqualifier' : codes.length + ' hard disqualifiers') +\n  ': ' + codes.join(', ') + '. ' +\n  ev.disqualify_reason +\n  ' No fit score was computed and no ClinicalTrials.gov lookup was made — hard ' +\n  'disqualifiers run first, so a disqualified lead costs neither an API call nor a token.';\n\nreturn {\n  json: {\n    write: true,\n    lead_id: ev.lead_id,\n    domain: ev.domain,\n    fit_score: DISQUALIFIED_SCORE,\n    payload: {\n      lead_id: ev.lead_id,\n      fit_score: DISQUALIFIED_SCORE,\n      disqualified: true,\n      disqualify_reason: ev.disqualify_reason,\n      rationale: rationale,\n      rationale_source: 'deterministic',\n    },\n  },\n};\n"
+      },
+      "name": "Build Disqualified Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        340,
+        20
+      ],
+      "notes": "Writes the disqualify reason as human-readable prose for the review queue (Section 9's 'visibility over spot-checking'), deterministically -- the reason a rule fired is a fact, not something worth a token."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://clinicaltrials.gov/api/v2/studies",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "query.spons",
+              "value": "={{ $json.ctgov_sponsor }}"
+            },
+            {
+              "name": "filter.overallStatus",
+              "value": "RECRUITING"
+            },
+            {
+              "name": "countTotal",
+              "value": "true"
+            },
+            {
+              "name": "pageSize",
+              "value": "1"
+            },
+            {
+              "name": "fields",
+              "value": "NCTId"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 250
+            }
+          }
+        }
+      },
+      "name": "ClinicalTrials.gov Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        340,
+        240
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "notes": "Section 9: per-candidate lookup on a company name we already have, NOT a bulk discovery source. No API key. countTotal=true is what makes totalCount appear at all; pageSize=1 keeps the response small because only the count is scored.\n\ncompany_name is sent verbatim. Stripping legal suffixes was tried and measured against 30 real leads: it changed one result, and that one was a false positive ('A-Pharma s.r.o.' -> 'A-Pharma' matched 20 unrelated trials). See README.\n\nThe query.locn fallback the spec mentions is NOT implemented -- measured, it returns 254-2470 recruiting trials for every target country, which would award the full 20 points to every lead. See README."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Compute Fit Score — n8n Code node (Run Once for Each Item).\n//\n// Folds the ClinicalTrials.gov result into the factors Evaluate Lead already\n// computed, sums the weighted score, and builds both:\n//   - `payload`, ready to write, carrying a deterministic rationale; and\n//   - `prompt` / `system_prompt`, for the model to write a better one.\n//\n// The deterministic rationale is not a placeholder — it is what ships for any\n// lead the model must not be asked about (Section 9 Workflow 4's grounding\n// guard: a small model fabricates when under-informed).\n\nconst ev = $('Evaluate Lead').item.json;\nconst resp = $input.item.json;\n\nconst WEIGHT_TRIALS = 20;\n\n// ---------------------------------------------------------------------------\n// ClinicalTrials.gov result\n// ---------------------------------------------------------------------------\n//\n// The HTTP node continues on error, so a failed call arrives without\n// `totalCount`. That is NOT scored as \"no trials\": it would silently mark every\n// lead 20 points low for the length of an API outage, and those scores would\n// look perfectly valid in the table afterwards. The lead is dropped instead and\n// stays 'enriched' for the next cron run — the same self-healing shape\n// Workflow 2 uses for an Ollama outage.\nconst totalCount =\n  resp && typeof resp.totalCount === 'number' && isFinite(resp.totalCount)\n    ? resp.totalCount\n    : null;\n\nif (totalCount === null) {\n  return {\n    json: {\n      write: false,\n      lead_id: ev.lead_id,\n      domain: ev.domain,\n      skip_reason:\n        'ClinicalTrials.gov lookup failed: ' +\n        JSON.stringify(resp && resp.error ? resp.error : resp).slice(0, 300),\n    },\n  };\n}\n\nconst trials = {\n  points: totalCount > 0 ? WEIGHT_TRIALS : 0,\n  max: WEIGHT_TRIALS,\n  basis: totalCount > 0 ? 'confirmed' : 'miss',\n  detail:\n    totalCount > 0\n      ? totalCount + ' recruiting trial' + (totalCount === 1 ? '' : 's') +\n        ' registered with them as sponsor'\n      : 'no recruiting trials registered under this company as sponsor',\n  total_count: totalCount,\n};\n\nconst factors = Object.assign({}, ev.factors, { trials: trials });\n\n// ---------------------------------------------------------------------------\n// Weighted sum\n// ---------------------------------------------------------------------------\n\nconst ORDER = ['geography', 'trials', 'founder', 'oncology', 'employees', 'site'];\nlet fitScore = 0;\nfor (const k of ORDER) fitScore += factors[k] ? factors[k].points : 0;\nfitScore = Math.max(0, Math.min(100, Math.round(fitScore)));\n\n// The score breakdown, as one compact line per factor, appended to the stored\n// rationale. This is what makes a score auditable in the review queue without\n// re-running anything -- and it goes in the rationale text rather than a new\n// column because Section 8 locks the `scores` columns and a breakdown is\n// review copy, not new state.\nconst breakdown = ORDER.map(function (k) {\n  const f = factors[k];\n  return k + ' ' + f.points + '/' + f.max + ' (' + f.basis + ': ' + f.detail + ')';\n});\nconst breakdownLine = 'Score ' + fitScore + '/100 — ' + breakdown.join('; ');\n\n// ---------------------------------------------------------------------------\n// Deterministic rationale\n// ---------------------------------------------------------------------------\n//\n// Ships as-is for leads with no readable extraction, and is the fallback if the\n// model call fails. States only what the factors actually measured.\nfunction deterministicRationale() {\n  const f = ev.facts || {};\n  const parts = [];\n  parts.push(\n    (ev.company_name || ev.domain) +\n      (ev.country ? ' (' + ev.country + ')' : '') +\n      ' scores ' + fitScore + '/100.'\n  );\n\n  const wins = ORDER.filter(function (k) { return factors[k].basis === 'confirmed' && factors[k].points > 0; });\n  const gaps = ORDER.filter(function (k) { return factors[k].basis === 'miss'; });\n  const unknowns = ORDER.filter(function (k) { return factors[k].basis === 'unknown'; });\n\n  if (wins.length) {\n    parts.push('In its favour: ' + wins.map(function (k) { return factors[k].detail; }).join('; ') + '.');\n  }\n  if (gaps.length) {\n    parts.push('Against: ' + gaps.map(function (k) { return factors[k].detail; }).join('; ') + '.');\n  }\n  if (unknowns.length) {\n    parts.push(\n      'Unknown (scored at half weight rather than penalised): ' +\n        unknowns.map(function (k) { return factors[k].detail; }).join('; ') + '.'\n    );\n  }\n  if (ev.needs_recheck) {\n    parts.push(\n      'Note: enrichment could not read this site (' + (ev.enrichment_status || 'unknown') +\n        ', ' + ev.site_evidence + '), so everything except geography and trial registration is ' +\n        'unmeasured. The host did answer, so this is a re-fetch candidate, not a dead domain.'\n    );\n  }\n  return parts.join(' ');\n}\n\n// ---------------------------------------------------------------------------\n// Rationale prompt\n// ---------------------------------------------------------------------------\n//\n// Section 9: \"This rationale is what makes the morning review fast — it must be\n// specific, not generic.\" The prompt therefore hands the model only concrete\n// extracted facts and forbids it from adding any, which is the same grounding\n// discipline Workflow 4 locks. Nothing here asks the model for a judgement the\n// score already encodes; it is writing up a decision, not making one.\nconst f = ev.facts || {};\nconst factLines = [];\nfactLines.push('Company: ' + (ev.company_name || ev.domain));\nfactLines.push('Domain: ' + ev.domain);\nfactLines.push('Country: ' + (ev.country || 'unknown'));\nif (f.city) factLines.push('City: ' + f.city);\nif (f.company_type) factLines.push('Described on its site as: ' + f.company_type);\nfactLines.push('Therapeutic areas: ' + (f.areas && f.areas.length ? f.areas.join(', ') : 'none stated'));\nfactLines.push('Trial phases: ' + (f.phases && f.phases.length ? f.phases.join(', ') : 'none stated'));\nfactLines.push(\n  'Founder/MD: ' +\n    (f.founder_name\n      ? f.founder_name + (f.founder_title ? ', ' + f.founder_title : '') +\n        (f.founder_linkedin ? ' (LinkedIn profile found)' : ' (no LinkedIn profile found)')\n      : 'not named on the site')\n);\nfactLines.push(\n  'Headcount: ' + (f.employee_estimate !== null && f.employee_estimate !== undefined\n    ? 'about ' + f.employee_estimate\n    : 'not stated')\n);\nfactLines.push('Recruiting trials on ClinicalTrials.gov as sponsor: ' + totalCount);\nif (f.site_quality_notes) factLines.push('Site notes from extraction: ' + f.site_quality_notes);\nfactLines.push('Fit score: ' + fitScore + '/100');\nfactLines.push('Score breakdown: ' + breakdown.join(' | '));\n\nconst system_prompt = [\n  'You write one-paragraph briefing notes for a B2B sales review queue.',\n  'The product being sold is a custom AI chatbot for clinical research organisations:',\n  'a $500-1,000 build plus $300/month, with a 48-hour custom demo on the prospect\\'s own',\n  'knowledge base.',\n  '',\n  'Write ONE paragraph, 40-70 words, explaining why this specific lead is or is not worth',\n  'contacting. Rules:',\n  '- Use ONLY the facts given. Never add a fact that is not listed, including trial names,',\n  '  client names, headcounts, or specialisms.',\n  '- Name at least two specific facts from the list. A paragraph that would read the same',\n  '  for any CRO is a failure.',\n  '- If something is unknown, you may say so plainly. Do not guess it.',\n  '- State the main reservation as well as the case in favour.',\n  '- No greeting, no sign-off, no bullet points, no markdown.',\n].join('\\n');\n\nconst prompt =\n  'Facts about this lead:\\n\\n' + factLines.join('\\n') +\n  '\\n\\nWrite the one-paragraph briefing note.';\n\nreturn {\n  json: {\n    write: true,\n    groundable: ev.has_extraction === true,\n    lead_id: ev.lead_id,\n    domain: ev.domain,\n    fit_score: fitScore,\n    system_prompt: system_prompt,\n    prompt: prompt,\n    // Carried separately so the LLM branch can swap the paragraph and keep the\n    // breakdown, without either node holding a second copy of the join.\n    breakdown_line: breakdownLine,\n    payload: {\n      lead_id: ev.lead_id,\n      fit_score: fitScore,\n      disqualified: false,\n      disqualify_reason: null,\n      rationale: deterministicRationale() + '\\n\\n' + breakdownLine,\n      rationale_source: 'deterministic',\n    },\n  },\n};\n"
+      },
+      "name": "Compute Fit Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        240
+      ],
+      "notes": "Sums the weighted factors and builds the rationale prompt. The score is final before the model is called, so a bad rationale can never move a lead in the ranking."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "writable",
+              "leftValue": "={{ $json.write }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Drop Failed Lookups",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [
+        780,
+        240
+      ],
+      "notes": "If ClinicalTrials.gov did not answer, the lead is dropped and stays 'enriched' so the next run retries it. Without this, an API outage would write a whole batch of scores that are silently 20 points low and look perfectly valid afterwards. Same self-healing shape as Workflow 2's 'Drop Failed Calls'."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "groundable",
+              "leftValue": "={{ $json.groundable }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Groundable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1000,
+        240
+      ],
+      "notes": "Section 9 Workflow 4's grounding guard, applied here: a small model fabricates when under-informed. A lead whose site never yielded readable text has no facts to write a rationale from, so it keeps the deterministic one rather than being handed to the model to invent something plausible."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/generate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'qwen3.5:9b',\n  system: $json.system_prompt,\n  prompt: $json.prompt,\n  stream: false,\n  think: false,\n  format: {\n    \"type\": \"object\",\n    \"properties\": {\n      \"rationale\": {\n        \"type\": \"string\"\n      }\n    },\n    \"required\": [\n      \"rationale\"\n    ]\n  },\n  options: { temperature: 0.2, presence_penalty: 0, num_ctx: 16384, num_predict: 400 }\n}) }}",
+        "options": {
+          "timeout": 300000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 0
+            }
+          }
+        }
+      },
+      "name": "Ollama Rationale",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1220,
+        160
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "notes": "/api/generate, NOT /api/chat -- on /api/chat, think:false silently disables `format` grammar enforcement and the model answers in prose (measured on Ollama 0.30.10 + qwen3.5:9b during Workflow 2).\n\npresence_penalty 0 (the model ships with 1.5, which drops copied values), num_ctx 16384, think:false. temperature 0.2 rather than Workflow 2's 0.1: this is the one node writing prose for a human, and 0.1 made every paragraph open the same way.\n\nbatchSize 1 keeps calls serial to match OLLAMA_NUM_PARALLEL=1."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Attach Rationale — n8n Code node (Run Once for Each Item).\n//\n// Swaps the model's paragraph in for the deterministic one, keeping the score\n// breakdown that Compute Fit Score already assembled. Nothing here changes the\n// number: the score is decided before the model is ever called, so a bad or\n// missing rationale can never move a lead up or down the queue.\n\nconst scored = $('Compute Fit Score').item.json;\nconst resp = $input.item.json;\n\n// The HTTP node continues on error, so a failed call arrives without a\n// `response` field. Unlike the ClinicalTrials.gov lookup, that is NOT a reason\n// to drop the lead: the score is already complete and correct, and the\n// deterministic rationale is a genuine fallback rather than a placeholder. An\n// Ollama outage costs prose quality, not a scoring run.\nconst rawText = resp && typeof resp.response === 'string' ? resp.response : null;\n\nlet paragraph = null;\nlet source = 'deterministic';\nlet note = null;\n\nif (rawText === null) {\n  note = 'ollama call failed: ' + JSON.stringify(resp && resp.error ? resp.error : resp).slice(0, 200);\n} else {\n  let parsed = null;\n  try {\n    parsed = JSON.parse(rawText);\n  } catch (e) {\n    // Grammar-constrained output should always parse; fall back to a fenced\n    // block rather than losing the paragraph.\n    const m = rawText.match(/\\{[\\s\\S]*\\}/);\n    if (m) {\n      try {\n        parsed = JSON.parse(m[0]);\n      } catch (e2) {\n        note = 'unparseable rationale JSON: ' + e2.message;\n      }\n    } else {\n      note = 'no JSON object in rationale response';\n    }\n  }\n  if (parsed && typeof parsed.rationale === 'string') {\n    const t = parsed.rationale.replace(/\\s+/g, ' ').trim();\n    // A one-word or empty answer is a failed generation, not a rationale.\n    // Falling back beats storing something that makes review slower.\n    if (t.length >= 40) {\n      paragraph = t;\n      source = 'model';\n    } else {\n      note = 'rationale too short (' + t.length + ' chars), kept the deterministic one';\n    }\n  } else if (!note) {\n    note = 'rationale field missing from model response';\n  }\n}\n\nconst payload = Object.assign({}, scored.payload);\nif (paragraph) {\n  payload.rationale = paragraph + '\\n\\n' + scored.breakdown_line;\n}\npayload.rationale_source = source;\nif (note) payload.rationale_note = note;\n\nreturn {\n  json: {\n    write: true,\n    lead_id: scored.lead_id,\n    domain: scored.domain,\n    fit_score: scored.fit_score,\n    payload: payload,\n  },\n};\n"
+      },
+      "name": "Attach Rationale",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        160
+      ],
+      "notes": "Swaps the model's paragraph in and keeps the score breakdown. A failed or too-short generation falls back to the deterministic rationale -- an Ollama outage costs prose quality here, not a scoring run."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Write the score and advance the lead in ONE statement, so a crash between\n-- the two cannot leave a lead scored-but-still-queued (or advanced with no\n-- score row). Re-running the batch is then safe.\n--\n-- The write is an UPSERT keyed on scores_lead_id_key (migration 003). Re-scoring\n-- a lead -- after a reweighted formula, a re-queue, or a ClinicalTrials.gov\n-- outage -- updates its row in place instead of adding a second one. That is the\n-- lesson migration 002 learned on enrichments, applied here before it could bite.\nWITH payload AS (\n  SELECT $1::jsonb AS p\n), ins AS (\n  INSERT INTO scores (lead_id, fit_score, disqualified, disqualify_reason, rationale)\n  SELECT\n    (p->>'lead_id')::bigint,\n    (p->>'fit_score')::int,\n    COALESCE((p->>'disqualified')::boolean, false),\n    p->>'disqualify_reason',\n    p->>'rationale'\n  FROM payload\n  ON CONFLICT (lead_id) DO UPDATE SET\n    fit_score         = EXCLUDED.fit_score,\n    disqualified      = EXCLUDED.disqualified,\n    disqualify_reason = EXCLUDED.disqualify_reason,\n    rationale         = EXCLUDED.rationale,\n    -- Refreshed so scored_at always dates the score actually stored.\n    scored_at         = now()\n  RETURNING lead_id, disqualified\n)\n-- Section 8's status flow: enriched -> scored | disqualified.\nUPDATE leads\n   SET status = CASE WHEN (SELECT disqualified FROM ins) THEN 'disqualified' ELSE 'scored' END,\n       updated_at = now()\n WHERE id = (SELECT lead_id FROM ins)\n   AND status = 'enriched'\nRETURNING id AS lead_id, domain, status;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.payload)] }}"
+        }
+      },
+      "name": "Write Score & Advance",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1660,
+        130
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "The whole payload goes in as one jsonb parameter, so unicode and embedded commas are handled by Postgres rather than by string splicing. The AND status='enriched' guard makes a concurrent or repeated run a no-op instead of a double write."
+    }
+  ],
+  "connections": {
+    "Every 30 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Get Enriched Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Enriched Batch": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Lead": {
+      "main": [
+        [
+          {
+            "node": "Disqualified?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Disqualified?": {
+      "main": [
+        [
+          {
+            "node": "Build Disqualified Payload",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "ClinicalTrials.gov Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Disqualified Payload": {
+      "main": [
+        [
+          {
+            "node": "Write Score & Advance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ClinicalTrials.gov Lookup": {
+      "main": [
+        [
+          {
+            "node": "Compute Fit Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Fit Score": {
+      "main": [
+        [
+          {
+            "node": "Drop Failed Lookups",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drop Failed Lookups": {
+      "main": [
+        [
+          {
+            "node": "Groundable?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groundable?": {
+      "main": [
+        [
+          {
+            "node": "Ollama Rationale",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Write Score & Advance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Rationale": {
+      "main": [
+        [
+          {
+            "node": "Attach Rationale",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Rationale": {
+      "main": [
+        [
+          {
+            "node": "Write Score & Advance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
