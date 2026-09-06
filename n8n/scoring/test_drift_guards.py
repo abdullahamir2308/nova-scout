@@ -124,13 +124,13 @@ case(
 # --- weights ---------------------------------------------------------------
 case(
     "doc reweights a factor -> build refuses",
-    mutate_doc=lambda d: d.replace("| Target geography | 25 |", "| Target geography | 30 |", 1),
+    mutate_doc=lambda d: d.replace("| Target geography | 10 |", "| Target geography | 15 |", 1),
     expect_in="sum to 105",
 )
 case(
     "doc reweights two factors so they still sum to 100 -> build STILL refuses",
     mutate_doc=lambda d: d.replace(
-        "| Target geography | 25 |", "| Target geography | 30 |", 1
+        "| Target geography | 10 |", "| Target geography | 15 |", 1
     ).replace("| Oncology focus (strongest case study) | 15 |",
               "| Oncology focus (strongest case study) | 10 |", 1),
     expect_in="weights drifted",

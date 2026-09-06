@@ -35,11 +35,11 @@ const TARGET_GEOGRAPHIES = [
 
 // Section 9, Workflow 3, "Weighted fit score (0-100)".
 const WEIGHTS = {
-  geography: 25,
+  geography: 10,
   trials: 20,
   founder: 20,
   oncology: 15,
-  employees: 10,
+  employees: 25,
   site: 10,
 };
 
