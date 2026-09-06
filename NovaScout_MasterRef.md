@@ -33,7 +33,7 @@
 | Email send | SMTP node → Zoho Mail mailbox | Not Resend, not SendGrid |
 | Email receive | n8n IMAP trigger → same mailbox | No webhooks, no public URL needed |
 | CRM | HubSpot (native n8n node) | Existing account |
-| Contact data | Apollo.io API | Free tier, credits conserved by pipeline order |
+| Contact data | Apollo.io API — health-check only, contact endpoints gated | Free plan does NOT include people/contact search regardless of credit balance, see §4 |
 | Version control | Git — workflows exported as JSON | Workflows are code |
 
 **DO NOT USE:** Make.com (per-operation pricing), Resend/SendGrid/Postmark for cold outreach (ToS prohibits it), any paid LLM API as the default path, LinkedIn automation tools of any kind, open/click tracking pixels.
@@ -117,7 +117,7 @@ OLLAMA_HOST=0.0.0.0:11434   # reachable from Docker containers
 | Zoho Mail Lite mailbox | ~$12/year |
 | n8n, Postgres, NocoDB, Ollama | $0 |
 | ClinicalTrials.gov API | $0 |
-| Apollo | $0 (free tier, protected by pipeline order) |
+| Apollo | $0 — but see correction below |
 | **Total** | **~$22/year + electricity** |
 
 Any proposed change that introduces recurring cost must be justified against this baseline.
@@ -179,7 +179,11 @@ Sources → 1 Ingest → 2 Enrich → 3 Score → [Apollo] → 4 Draft → 5 Rev
                                                                          └──── learn ─────────┘
 ```
 
-**Critical ordering rule:** Apollo contact lookup happens AFTER scoring, never before. Scrape and score for free with local models first; spend Apollo credits only on leads above threshold. This is what keeps Apollo on the free tier.
+**Correction — the original assumption here was wrong.** "Conserve Apollo credits by scoring first" assumed the constraint was volume/rate. Measured directly: Apollo's Free plan returns 403 API_INACCESSIBLE on `mixed_people/search`, `people/match`, and `mixed_companies/search` regardless of credit balance — the account showed 125 unused credits throughout and consumed zero. Credits shown in Apollo's dashboard are a UI allowance, not an API entitlement; the gate is the plan tier, not usage. Pipeline order still controls volume, but volume was never the actual constraint.
+
+**Decision: don't upgrade Apollo.** 5 of the first 9 qualifying leads were satisfiable for free from data already scraped (ICH GCP profile pages carry an email field the original `leads` table schema had no column for — recovered and used directly, no API call). The remaining gap is genuinely small — a few leads at a time with no scraped email — and fits the existing human-review design better than a paid integration would: when a qualifying lead has no contact, that's a two-minute manual look-up in the review queue, not something worth paying to automate at this volume. Revisit only if that gap grows large enough to actually be a burden.
+
+**Critical ordering rule (still correct, for a different reason):** Apollo contact lookup happens AFTER scoring, never before — this controls volume and avoids wasted lookups on leads that get disqualified, even though it turned out not to be what "kept" Apollo free.
 
 **Idempotency rule — LOCKED:** the host machine will be off some of the time. No workflow may assume its schedule fired. Every workflow queries Postgres for "oldest lead in my input status" and processes a bounded batch. A machine off all weekend simply catches up on Monday. No time-critical webhooks anywhere in the system.
 
@@ -301,6 +305,25 @@ Scraper UA: self-identifying (`NovaScoutBot/1.0` + repo link), not a spoofed bro
 | Employee count 5–100 | 25 |
 | Site quality suggests budget | 10 |
 
+**Rebalanced from the original 25/20/20/15/10/10, based on real Sprint 3 measurement, not upfront guessing.** Geography scored 25/25 for all 79 scored leads with zero variance — the only ingestion source (ICH GCP) is already filtered to the 13 target countries, so this factor measures "did our scraper touch this lead," not fit. Kept nonzero rather than dropped to zero, as cheap insurance against a future non-pre-filtered source. The freed 15 points went to employee count: real data showed a company far outside the 5–100 band (~300 employees) ranking #1 overall despite the scoring rationale itself flagging the mismatch as disqualifying in substance — the old 10-point weight didn't cost enough to matter against strong scores elsewhere. This does not change the separate >500 hard disqualifier, which stays as-is.
+
+**ClinicalTrials.gov — measured, not assumed.** The originally-specified `query.locn` country-only fallback was never implemented: measured directly, a bare country search returns 600+ recruiting trials for India alone, which would have awarded the full 20 points to nearly every lead — the same non-discrimination problem geography had, just undetected before shipping. Only the primary `query.spons` sponsor-name lookup shipped (real ~8% hit rate — CROs are usually a trial's collaborator, not its registered sponsor).
+
+**Concrete evidence the `query.term` fallback is worth building now, not deferring further:** all 18 leads in the 50–59 fit_score band are held back by this single factor — zero have a sponsor match, while every other factor (geography, site quality, oncology for 15/18) is confirmed strong. Flip trials alone and all 18 cross 60, landing 71–78. **Do not fix this by lowering the ≥60 threshold** — that declares the factor doesn't matter without checking whether a fairer query would have credited these leads honestly. Test `query.term` against exactly this 18-lead set first, with the same false-positive scrutiny that killed the sponsor-name-cleaning idea, before shipping or discarding it.
+
+**Measured 2026-09-06 — tested against exactly those 18 leads, and rejected.** Same call shape as the sponsor lookup (`filter.overallStatus=RECRUITING`, `countTotal=true`), `query.term=<company_name>` in place of `query.spons`, verbatim company name. 12 of 18 return `totalCount=0` — no different from the sponsor search, no gain. The other 6 return non-trivial counts, but every sampled hit is a false positive — `leadSponsor`, `collaborators`, and `locationFacility` were pulled for each and checked against the company name; none named the company:
+
+| Company | totalCount | What actually matched (sampled) |
+|---|---|---|
+| Metrics Research | 694 | Generic trial vocabulary — no sponsor/collaborator/facility named "Metrics" |
+| MTZ Clinical Research | 82 | Same — nothing named "MTZ" |
+| Monitor Medical Research and Consulting | 42 | Same — nothing named "Monitor" |
+| LAT Research | 39 | Same — the one substring hit was "lat" inside an unrelated Portuguese-language facility name |
+| A-Pharma s.r.o. | 14 | All sponsored by unrelated companies whose names merely contain "Pharma" (Sumitomo Pharma, etc.) — the identical substring collision that already killed sponsor-name-cleaning |
+| FARMOVS | 1 | Sponsored by Merck Sharp & Dohme — no reference to FARMOVS anywhere in the record |
+
+`query.term` is a full-text search across the whole study record, not a company-identity match — a CRO's own descriptive name (built from ordinary industry words) is exactly the kind of string that collides with unrelated trials at this vocabulary. Same failure shape as `query.locn` (600+ trials per country, above) and sponsor-name-cleaning (README: stripping "s.r.o." matched 20 unrelated trials). **Not wired in.** The 18 leads are not re-scored and the ≥60 threshold is unchanged — this measurement confirms that decision, it doesn't reopen it.
+
 **Null-handling for weighted factors:** where `employee_estimate` or `founder_name`/`founder_linkedin` is null, that factor contributes a neutral partial score, not zero — a confirmed miss (e.g. a named founder found and clearly not on LinkedIn) should score lower than an honest unknown. Don't let extraction's correct refusal to guess become a scoring penalty.
 
 **`is_cro` disqualifications:** Sprint 2 found 23/80 successfully-enriched leads judged `is_cro: false`, despite all being sourced from ICH GCP's own "local/mid-size CRO" section. Plausible and not alarming — directory listings drift (rebrands, vendors miscategorized, defunct domains) and this is enrichment correctly catching what the source didn't (spot-checked `endpointclinical.com` directly: it's an RTSM/IRT technology vendor, not a CRO — correct call). Decided against a one-time manual audit of the full set — see the visibility decision below instead.
@@ -345,7 +368,7 @@ Broader than NoblePath's own 6-category list by design — chosen to preserve gr
 
 **Shipped as Workflow 3b, a separate queue — deliberate deviation from "inside Workflow 3".** Build rule 4 requires every workflow to be queue-driven and idempotent, and an inline Apollo step is neither: a lead's only chance at a contact would be the same execution that scored it. Nine leads were already sitting at `status='scored'` when this stage was built, scored before it existed; reaching them inline would have meant re-queueing to `enriched` and re-paying for a full re-score (a GPU rationale call and a ClinicalTrials.gov lookup each) to get at a step that costs neither. Every future outage, plan change, or threshold change has that same shape. As its own queue — `status='scored' AND fit_score >= 60 AND no contacts row` — it drains whatever is waiting, whenever it runs. `n8n/contacts/`, workflow id `contacts0001`.
 
-**BLOCKED — Apollo's Free plan does not include the contact endpoints. Measured 2026-09-06, on both the API-key path and the OAuth/MCP path, on an account showing 125 unused lead credits:**
+**Endpoint-level detail behind the §7 correction** — measured 2026-09-06, on both the API-key path and the OAuth/MCP path, on an account showing 125 unused lead credits:
 
 | Endpoint | Result |
 |---|---|
@@ -354,11 +377,9 @@ Broader than NoblePath's own 6-category list by design — chosen to preserve gr
 | `POST /api/v1/mixed_companies/search` | 403 `API_INACCESSIBLE` — "not included in your Free plan" |
 | `GET /api/v1/auth/health` | 200 `{"healthy":true,"is_logged_in":true}` |
 
-The key is valid and the account is live; the gate is the plan, not the key or its scope. **The 125 lead credits are usable inside app.apollo.io, not through the API** — a UI allowance and an API entitlement are separate things on Apollo's free tier, and the credit balance is not evidence that a call will be served. This invalidates the Section 4 assumption that pipeline order is what keeps Apollo free: pipeline order controls *volume*, and volume was never the binding constraint. `organizations/enrich` returns a key-scope error rather than a plan error, so it may be reachable if the key's scope is widened — not pursued, since it returns firmographics, not people.
+The key is valid and the account is live; the gate is the plan, not the key or its scope. `organizations/enrich` returns a key-scope error rather than a plan error, so it may be reachable if the key's scope is widened — not pursued, since it returns firmographics, not people. Nothing in the stage needs to change if the plan ever allows it: a plan-gated 403 takes the same path as a timeout — nothing written, lead stays `scored`, next run retries.
 
-Nothing in the stage needs to change when the plan allows it. A plan-gated 403 takes the same path as a timeout: nothing written, lead stays `scored`, next run retries.
-
-**The scraped email nobody read — 56% of the first qualifying batch needed no Apollo call at all.** Every ICH GCP company profile carries an `E-mail:` field, and `scrape_ichgcp.py` has always captured it into `data/ichgcp_leads.csv` (92 of 123 rows). Section 8 gives `leads` no email column, so ingestion discarded it at the `INSERT INTO leads` boundary — written, committed, fetched, then dropped. It was never lost, only unread. Five of the nine leads qualifying at ≥ 60 already had an address there.
+**The scraped email nobody read — 56% of the first qualifying batch needed no Apollo call at all.** Every ICH GCP company profile carries an `E-mail:` field, and `scrape_ichgcp.py` has always captured it into `data/ichgcp_leads.csv` (92 of 123 rows). Section 8 gives `leads` no email column, so ingestion discarded it at the `INSERT INTO leads` boundary — written, committed, fetched, then dropped. It was never lost, only unread. Five of the nine leads qualifying at ≥ 60 already had an address there — this is the free-data gap the §7 decision leans on.
 
 Workflow 3b therefore re-fetches the CSV (the same `raw.githubusercontent.com` artefact ingestion reads, with the URL parsed out of `ingestion-ichgcp.json` at build time so the two cannot drift) and checks it before any paid call. The two alternatives were both worse: a `leads.email` column changes a schema section this doc locks, and writing the address into `contacts` at ingestion time would attach a contact to an unscored lead — the exact ordering Section 7 forbids.
 
@@ -472,4 +493,4 @@ Not part of Nova Scout, tracked here to keep the decision record in one place.
 
 ---
 
-*Document version 1. Update when any architectural decision changes. Do not let sessions drift from this spec.*when any architectural decision changes. Do not let sessions drift from this spec.*
+*Document version 1. Update when any architectural decision changes. Do not let sessions drift from this spec.*
