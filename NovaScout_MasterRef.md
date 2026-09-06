@@ -294,11 +294,11 @@ Scraper UA: self-identifying (`NovaScoutBot/1.0` + repo link), not a spoofed bro
 **Weighted fit score (0–100):**
 | Factor | Weight |
 |---|---|
-| Target geography | 25 |
+| Target geography | 10 |
 | Active trials on ClinicalTrials.gov | 20 |
 | Founder/MD identified with LinkedIn | 20 |
 | Oncology focus (strongest case study) | 15 |
-| Employee count 5–100 | 10 |
+| Employee count 5–100 | 25 |
 | Site quality suggests budget | 10 |
 
 **Null-handling for weighted factors:** where `employee_estimate` or `founder_name`/`founder_linkedin` is null, that factor contributes a neutral partial score, not zero — a confirmed miss (e.g. a named founder found and clearly not on LinkedIn) should score lower than an honest unknown. Don't let extraction's correct refusal to guess become a scoring penalty.
@@ -342,6 +342,33 @@ Broader than NoblePath's own 6-category list by design — chosen to preserve gr
 **Then** Ollama generates a one-paragraph "why this lead" rationale. This rationale is what makes the morning review fast — it must be specific, not generic.
 
 **Then** Apollo lookup for leads scoring ≥ 60 only.
+
+**Shipped as Workflow 3b, a separate queue — deliberate deviation from "inside Workflow 3".** Build rule 4 requires every workflow to be queue-driven and idempotent, and an inline Apollo step is neither: a lead's only chance at a contact would be the same execution that scored it. Nine leads were already sitting at `status='scored'` when this stage was built, scored before it existed; reaching them inline would have meant re-queueing to `enriched` and re-paying for a full re-score (a GPU rationale call and a ClinicalTrials.gov lookup each) to get at a step that costs neither. Every future outage, plan change, or threshold change has that same shape. As its own queue — `status='scored' AND fit_score >= 60 AND no contacts row` — it drains whatever is waiting, whenever it runs. `n8n/contacts/`, workflow id `contacts0001`.
+
+**BLOCKED — Apollo's Free plan does not include the contact endpoints. Measured 2026-09-06, on both the API-key path and the OAuth/MCP path, on an account showing 125 unused lead credits:**
+
+| Endpoint | Result |
+|---|---|
+| `POST /api/v1/mixed_people/search` | 403 `API_INACCESSIBLE` — "not included in your Free plan" |
+| `POST /api/v1/people/match` | 403 `API_INACCESSIBLE` — "not included in your Free plan" |
+| `POST /api/v1/mixed_companies/search` | 403 `API_INACCESSIBLE` — "not included in your Free plan" |
+| `GET /api/v1/auth/health` | 200 `{"healthy":true,"is_logged_in":true}` |
+
+The key is valid and the account is live; the gate is the plan, not the key or its scope. **The 125 lead credits are usable inside app.apollo.io, not through the API** — a UI allowance and an API entitlement are separate things on Apollo's free tier, and the credit balance is not evidence that a call will be served. This invalidates the Section 4 assumption that pipeline order is what keeps Apollo free: pipeline order controls *volume*, and volume was never the binding constraint. `organizations/enrich` returns a key-scope error rather than a plan error, so it may be reachable if the key's scope is widened — not pursued, since it returns firmographics, not people.
+
+Nothing in the stage needs to change when the plan allows it. A plan-gated 403 takes the same path as a timeout: nothing written, lead stays `scored`, next run retries.
+
+**The scraped email nobody read — 56% of the first qualifying batch needed no Apollo call at all.** Every ICH GCP company profile carries an `E-mail:` field, and `scrape_ichgcp.py` has always captured it into `data/ichgcp_leads.csv` (92 of 123 rows). Section 8 gives `leads` no email column, so ingestion discarded it at the `INSERT INTO leads` boundary — written, committed, fetched, then dropped. It was never lost, only unread. Five of the nine leads qualifying at ≥ 60 already had an address there.
+
+Workflow 3b therefore re-fetches the CSV (the same `raw.githubusercontent.com` artefact ingestion reads, with the URL parsed out of `ingestion-ichgcp.json` at build time so the two cannot drift) and checks it before any paid call. The two alternatives were both worse: a `leads.email` column changes a schema section this doc locks, and writing the address into `contacts` at ingestion time would attach a contact to an unscored lead — the exact ordering Section 7 forbids.
+
+**A role inbox is not a person.** Four of those five addresses are `info@`/`contact@`-class. Where enrichment also named a founder the name, title and LinkedIn URL are written alongside — but the name is never presented as the owner of that inbox, because no source says it is. Workflow 4 drafts the email and LinkedIn variants separately, so the address and the person feed different channels regardless.
+
+**`contacts.verified` means one thing: the address is confirmed, not inferred.** True for a first-party address the company published about itself, and for Apollo `email_status: verified`. False for Apollo's `guessed` (pattern-derived — real enough to keep, not to send to unchallenged), for a masked `email_not_unlocked@…` placeholder, and for a tombstone. Workflow 6 is the consumer; this is the flag a send gates on.
+
+**Three outcomes, not two, and the third is why re-running is free.** "Apollo refused the call" and "Apollo answered, nobody there" look nearly identical at the node boundary and mean opposite things. A refusal is retried and writes nothing. An answered-but-empty lookup writes a **tombstone** — a `contacts` row with every field null and `verified=false` — because the batch query has no other way to tell "not looked up yet" from "looked up, nothing there", and without it every cron tick re-pays for the same dead domains. The tombstone does not advance the lead: there is no status for "asked and found nothing", and `contact_found` would put a contactless lead in front of Workflow 4's grounding guard. It stays `scored`.
+
+**`contacts.lead_id` is now UNIQUE** (migration `004`), for the third time this lesson has been paid for after `enrichments` (002) and `scores` (003). This locks in one contact per lead rather than a roster per company — which matches `drafts` being per-lead and Section 12's single named buyer, but is a real constraint, not just a de-dupe.
 
 ### Workflow 4 — Drafting
 **Trigger:** Cron. Batch where `status='contact_found'`.
@@ -445,4 +472,4 @@ Not part of Nova Scout, tracked here to keep the decision record in one place.
 
 ---
 
-*Document version 1. Update when any architectural decision changes. Do not let sessions drift from this spec.*
+*Document version 1. Update when any architectural decision changes. Do not let sessions drift from this spec.*when any architectural decision changes. Do not let sessions drift from this spec.*
