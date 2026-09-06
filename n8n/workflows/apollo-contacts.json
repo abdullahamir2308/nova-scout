@@ -1,0 +1,639 @@
+{
+  "id": "contacts0001",
+  "name": "Contact Lookup",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "name": "Every Hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1100,
+        40
+      ],
+      "notes": "Queue-driven, so a missed run just means the next one catches up (build rule 4). Hourly rather than Workflow 3's half-hourly because this stage's input is the output of a stage that only produces a handful of qualifying leads per pass."
+    },
+    {
+      "parameters": {},
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1100,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "batchsize",
+              "name": "batch_size",
+              "value": 10,
+              "type": "number"
+            },
+            {
+              "id": "minfit",
+              "name": "min_fit_score",
+              "value": 60,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -880,
+        130
+      ],
+      "notes": "Bounded batch (build rule 5), and smaller than Workflow 3's 25: every lead that gets past Resolve Contact costs money, so the ceiling is a spend ceiling, not a throughput one.\n\nmin_fit_score is generated from Section 9's '>= 60' rule by build_workflow.py and guarded against drift there. Editing it in the n8n UI will be overwritten on the next build -- change the spec instead."
+    },
+    {
+      "parameters": {
+        "url": "https://raw.githubusercontent.com/abdullahamir2308/nova-scout/main/data/ichgcp_leads.csv",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "name": "Fetch ICH GCP CSV",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -660,
+        130
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "notes": "The same artefact Workflow 1 ingests from, fetched once per batch. Its `email` column is the field ingestion drops: Section 8 gives `leads` no email column, so the address the scraper captured from each ichgcp profile page never reached the database. It was not lost, only unread -- 92 of 123 rows carry one.\n\nThe URL is read out of ingestion-ichgcp.json at build time rather than restated, so the two stages cannot drift onto different artefacts.\n\nNote this fetch is deliberately not a Postgres read. Storing the address in `leads` would mean a new column in a locked schema section; storing it in `contacts` before a lead qualifies would put a contact on a lead that has not been scored, which is the exact ordering Section 7 forbids."
+    },
+    {
+      "parameters": {
+        "operation": "csv",
+        "binaryPropertyName": "data"
+      },
+      "name": "Parse CSV",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        -440,
+        130
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Index Scraped Emails — n8n Code node (Run Once for All Items).\n//\n// Builds a domain -> email map from the committed ICH GCP CSV, so the Apollo\n// stage can answer \"do we already have an address for this lead?\" without a\n// per-lead fetch and without a credit.\n//\n// Why this node exists at all: the scrape captured a `Web:`-adjacent `E-mail:`\n// field on every ichgcp company profile, but `leads` has no email column\n// (Section 8, locked), so ingestion dropped it on the floor. The address was\n// never lost -- it is still in data/ichgcp_leads.csv, which the ingestion\n// workflow already publishes to raw.githubusercontent.com. 92 of the 123 rows\n// carry one. Reading it back here is free; asking Apollo for it is not.\n//\n// The map is built once per batch rather than per lead: one fetch, one parse,\n// then an O(1) lookup per lead in Resolve Contact.\n\nconst rows = $input.all();\n\n// Matches the scraper's own normalisation (scrape_ichgcp.py) and the ingestion\n// upsert, which writes leads.domain verbatim from this same column. Lowercase +\n// trim + strip a leading www. is defensive, not corrective: an exact match is\n// the contract, and a mismatch would silently cost a credit rather than fail.\nfunction normDomain(d) {\n  if (typeof d !== 'string') return '';\n  return d.trim().toLowerCase().replace(/^www\\./, '').replace(/[./]+$/, '');\n}\n\n// Deliberately permissive. The goal is to reject junk that would be written\n// into contacts.email as if it were reachable -- not to adjudicate deliverability,\n// which is the sending workflow's job and the mailbox's after that.\nfunction looksLikeEmail(e) {\n  if (typeof e !== 'string') return false;\n  const s = e.trim();\n  if (!s || s.length > 254) return false;\n  if (/\\s/.test(s)) return false;\n  const at = s.indexOf('@');\n  if (at < 1 || at !== s.lastIndexOf('@')) return false;\n  const host = s.slice(at + 1);\n  return host.indexOf('.') > 0 && !host.startsWith('.') && !host.endsWith('.');\n}\n\nconst byDomain = {};\nlet withEmail = 0;\nlet malformed = 0;\n\nfor (const r of rows) {\n  const j = r.json || {};\n  const domain = normDomain(j.domain);\n  if (!domain) continue;\n  const raw = typeof j.email === 'string' ? j.email.trim() : '';\n  if (!raw) continue;\n  if (!looksLikeEmail(raw)) {\n    malformed++;\n    continue;\n  }\n  // First row wins. A domain appearing on several country pages carries the\n  // same profile-page email each time; this only decides ties, it does not\n  // merge anything.\n  if (!byDomain[domain]) {\n    byDomain[domain] = raw;\n    withEmail++;\n  }\n}\n\nreturn [\n  {\n    json: {\n      by_domain: byDomain,\n      csv_rows: rows.length,\n      domains_with_email: withEmail,\n      malformed_emails: malformed,\n    },\n  },\n];\n"
+      },
+      "name": "Index Scraped Emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        130
+      ],
+      "notes": "Run Once for All Items: one domain -> email map per batch, then an O(1) lookup per lead. Malformed values are counted and dropped rather than written, so a junk cell never lands in contacts.email looking like a real address."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The queue for this stage: scored, qualifying, and not yet looked up.\n--\n-- Section 7's ordering rule is enforced structurally here rather than by\n-- discipline -- the WHERE clause cannot see a lead that has not been scored, so\n-- no amount of re-running can spend a credit before scoring has had its say.\n--\n-- `c.lead_id IS NULL` is what makes re-running free. A lead keeps its contacts\n-- row whether the lookup found somebody or not, so a domain Apollo has already\n-- answered \"nobody\" for is never paid for twice.\nSELECT l.id           AS lead_id,\n       l.domain,\n       l.company_name,\n       l.country,\n       s.fit_score,\n       e.founder_name,\n       e.founder_linkedin,\n       e.raw_extraction->>'founder_title' AS founder_title\n  FROM leads l\n  JOIN scores s        ON s.lead_id = l.id\n  LEFT JOIN enrichments e ON e.lead_id = l.id\n  LEFT JOIN contacts c ON c.lead_id = l.id\n WHERE l.status = 'scored'\n   AND s.disqualified = false\n   AND s.fit_score >= $1\n   AND c.lead_id IS NULL\n -- Best-first, not oldest-first. Every other workflow drains its queue in id\n -- order because the work is free; this one spends money, so a bounded batch\n -- should buy the highest-scoring contacts available rather than the oldest.\n ORDER BY s.fit_score DESC, l.id\n LIMIT $2;",
+        "options": {
+          "queryReplacement": "={{ [$('Config').first().json.min_fit_score, $('Config').first().json.batch_size] }}"
+        }
+      },
+      "name": "Get Qualified Batch",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        0,
+        130
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Section 9's gate, as a WHERE clause: status='scored' AND fit_score >= min_fit_score AND no contacts row yet. Reads Config through $('Config') because $json here is the CSV index, not the trigger.\n\nQuery parameters are passed as an array so a value containing a comma is never split.",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Resolve Contact — n8n Code node (Run Once for Each Item).\n//\n// Decides, per qualified lead, whether Apollo needs to be called at all.\n//\n// Section 7's ordering rule keeps Apollo on the free tier by spending only on\n// leads that already scored >= 60. This node applies the same principle one\n// level further in: of those, spend only on the ones we do not already have an\n// address for. Two free sources are checked first, both already on disk:\n//\n//   1. contacts.email  <- the ichgcp profile-page email, via the CSV index\n//   2. name/title/linkedin <- enrichments, harvested in Workflow 2\n//\n// A lead with a scraped email skips the Apollo call entirely.\n//\n// Note what is NOT inferred here. A role inbox (info@, contact@) is a company\n// address, not a person's, and pairing it with the founder's name would assert\n// something no source states. Both facts are still carried -- Workflow 4 drafts\n// an email variant and a LinkedIn variant separately, so the address and the\n// person feed different channels -- but the row records only what a source\n// actually said, per build rule 6.\n\nconst lead = $input.item.json;\nconst index = $('Index Scraped Emails').first().json;\nconst byDomain = (index && index.by_domain) || {};\n\nfunction normDomain(d) {\n  if (typeof d !== 'string') return '';\n  return d.trim().toLowerCase().replace(/^www\\./, '').replace(/[./]+$/, '');\n}\n\nfunction clean(v) {\n  if (typeof v !== 'string') return null;\n  const s = v.trim();\n  return s ? s : null;\n}\n\nconst domain = normDomain(lead.domain);\nconst scrapedEmail = clean(byDomain[domain]);\n\n// A role inbox is still a real, published, first-party address -- it is how the\n// company asked to be contacted. It is flagged rather than rejected so the\n// distinction survives into the report and the review queue.\nconst ROLE_LOCALPARTS = [\n  'info', 'contact', 'hello', 'connect', 'office', 'admin', 'enquiry',\n  'enquiries', 'inquiry', 'inquiries', 'mail', 'sales', 'support', 'general',\n];\nconst localpart = scrapedEmail ? scrapedEmail.split('@')[0].toLowerCase() : '';\nconst isRoleInbox = ROLE_LOCALPARTS.indexOf(localpart) >= 0;\n\n// Enrichment already found these on the company's own site in Workflow 2. They\n// cost nothing to reuse and are the only person-level facts available before a\n// credit is spent.\nconst founderName = clean(lead.founder_name);\nconst founderLinkedin = clean(lead.founder_linkedin);\nconst founderTitle = clean(lead.founder_title);\n\nif (scrapedEmail) {\n  return {\n    json: {\n      needs_apollo: false,\n      source: 'ichgcp_scrape',\n      lead_id: lead.lead_id,\n      domain: lead.domain,\n      company_name: lead.company_name,\n      country: lead.country,\n      fit_score: lead.fit_score,\n      contact: {\n        // Null unless the site itself named someone. A role inbox gets no name.\n        name: founderName,\n        title: founderTitle,\n        email: scrapedEmail,\n        linkedin_url: founderLinkedin,\n        apollo_id: null,\n        // A first-party address the company published about itself. Not a guess\n        // and not an inference, so it is written verified. See README for how\n        // this flag is defined across both sources.\n        verified: true,\n      },\n      evidence:\n        'email from the company profile page on ichgcp.net (' +\n        (isRoleInbox ? 'role inbox' : 'named mailbox') + '), captured at ingestion' +\n        (founderName\n          ? '; name/title/LinkedIn from the Workflow 2 site extraction'\n          : '; no person named on the site'),\n      role_inbox: isRoleInbox,\n      credits_saved: 1,\n    },\n  };\n}\n\n// No free address. This is the only path that reaches Apollo.\nreturn {\n  json: {\n    needs_apollo: true,\n    source: 'apollo',\n    lead_id: lead.lead_id,\n    domain: domain,\n    company_name: lead.company_name,\n    country: lead.country,\n    fit_score: lead.fit_score,\n    // Passed through so Pick Best Contact can prefer the person the site itself\n    // named, when Apollo returns several plausible people.\n    known_founder_name: founderName,\n    known_founder_linkedin: founderLinkedin,\n    known_founder_title: founderTitle,\n    credits_saved: 0,\n  },\n};\n"
+      },
+      "name": "Resolve Contact",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        130
+      ],
+      "notes": "The credit gate. A lead whose address is already in the CSV index never reaches Apollo at all; the person fields, where the site named one, come from the Workflow 2 extraction.\n\nA role inbox (info@, contact@) is flagged rather than paired with the founder's name: it is a company address, and asserting it belongs to a named person is exactly the kind of fact no source states (build rule 6). Both facts still travel together, because Workflow 4 drafts the email and LinkedIn variants separately."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "needsapollo",
+              "leftValue": "={{ $json.needs_apollo }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Needs Apollo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        130
+      ],
+      "notes": "Section 7's ordering rule, one level finer: of the leads that scored high enough to be worth paying for, pay only for the ones we do not already have an address for."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.apollo.io/api/v1/mixed_people/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  q_organization_domains_list: [$json.domain],\n  person_titles: [\n    \"founder\",\n    \"co-founder\",\n    \"cofounder\",\n    \"owner\",\n    \"proprietor\",\n    \"managing director\",\n    \"general manager\",\n    \"director general\",\n    \"managing partner\",\n    \"ceo\",\n    \"chief executive\",\n    \"business development\",\n    \"bd director\",\n    \"bd manager\",\n    \"commercial director\"\n  ],\n  include_similar_titles: true,\n  page: 1,\n  per_page: 25\n}) }}",
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 2,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "name": "Apollo People Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        240
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "novascoutApollo01",
+          "name": "Apollo - x-api-key"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "notes": "People Search returns no email addresses at all, by design on Apollo's side -- it identifies who is there. The address costs a separate enrichment call, which is why this stage is two nodes and not one: the search narrows to a single person before anything is spent.\n\nperson_titles is generated from code_pick_contact.js's TITLE_TIERS at build time, so the endpoint is never asked for a set of titles the ranker would discard.\n\nKNOWN BLOCKER as of this build: this endpoint is not included in Apollo's Free plan and returns error_code API_INACCESSIBLE on both the API-key and OAuth paths. Pick Best Contact treats that as 'did not answer' and retries, so the stage self-heals the moment the plan allows it -- see README."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Pick Best Contact — n8n Code node (Run Once for Each Item).\n//\n// Ranks an Apollo people-search response and decides whether any result is\n// worth spending an enrichment credit on.\n//\n// Section 12's ICP names the buyer: \"CRO founder, Managing Director, or BD\n// Director\". This node encodes that as an ordered preference rather than a\n// filter, so a company whose only senior person is titled something unexpected\n// still surfaces -- but never outranks an actual founder.\n//\n// Three outcomes, and the difference between the last two is the whole point of\n// the node:\n//\n//   retry     the call itself failed (plan gate, rate limit, timeout). Nothing\n//             is written; the lead stays 'scored' and the next run tries again.\n//             Recording \"no match\" here would be a lie about what Apollo said.\n//   no match  Apollo answered, and nothing at this domain clears the bar. A\n//             tombstone row is written so the lead is not re-queried every run.\n//   match     one person clears the bar; the enrichment call is worth a credit.\n\nconst src = $('Resolve Contact').item.json;\nconst resp = $input.item.json;\n\n// Ordered best-first. Matched as substrings against a lowercased title, so\n// \"Founder & CEO\" and \"Co-Founder\" both land in tier 0.\nconst TITLE_TIERS = [\n  ['founder', 'co-founder', 'cofounder', 'owner', 'proprietor'],\n  ['managing director', 'general manager', 'director general', 'managing partner'],\n  ['ceo', 'chief executive'],\n  ['business development', 'bd director', 'bd manager', 'commercial director'],\n];\n\n// Not a tier -- a tiebreak within one. Keeps a \"Business Development Director\"\n// ahead of a \"Business Development Representative\" without inventing a fifth\n// preference level the spec does not have.\nconst SENIORITY = ['chief', 'president', 'partner', 'head of', 'vp', 'vice president', 'director', 'manager'];\n\nfunction tierOf(title) {\n  const t = (title || '').toLowerCase();\n  if (!t) return -1;\n  for (let i = 0; i < TITLE_TIERS.length; i++) {\n    for (const kw of TITLE_TIERS[i]) {\n      if (t.indexOf(kw) >= 0) return i;\n    }\n  }\n  return -1;\n}\n\nfunction seniorityOf(title) {\n  const t = (title || '').toLowerCase();\n  for (let i = 0; i < SENIORITY.length; i++) {\n    if (t.indexOf(SENIORITY[i]) >= 0) return i;\n  }\n  return SENIORITY.length;\n}\n\nfunction normDomain(d) {\n  if (typeof d !== 'string') return '';\n  return d.trim().toLowerCase().replace(/^https?:\\/\\//, '').replace(/^www\\./, '')\n    .replace(/[/].*$/, '').replace(/[./]+$/, '');\n}\n\nconst base = {\n  lead_id: src.lead_id,\n  domain: src.domain,\n  company_name: src.company_name,\n  country: src.country,\n  fit_score: src.fit_score,\n  source: 'apollo',\n};\n\n// ---------------------------------------------------------------------------\n// Did Apollo actually answer?\n// ---------------------------------------------------------------------------\n//\n// The HTTP node continues on error, so a refusal arrives as a normal item\n// carrying an `error` key. API_INACCESSIBLE (the endpoint is not on the account's\n// plan) and a 429 are both this shape. Neither is evidence about the company.\nif (!resp || typeof resp !== 'object' || resp.error || resp.error_code || !Array.isArray(resp.people)) {\n  // JSON.stringify, not String(): n8n wraps an HTTP failure as an object, and\n  // String() renders that '[object Object]' -- which turns the one field an\n  // operator needs (why did Apollo refuse?) into nothing at all. Same shape\n  // code_score.js uses for the ClinicalTrials.gov failure path.\n  const err = resp && (resp.error || resp.message);\n  const detail = err\n    ? (typeof err === 'string' ? err : JSON.stringify(err)).slice(0, 300)\n    : 'no people[] array in the response';\n  return {\n    json: Object.assign({}, base, {\n      write: false,\n      matched: false,\n      retry: true,\n      skip_reason: 'Apollo people-search did not answer: ' + detail,\n    }),\n  };\n}\n\n// ---------------------------------------------------------------------------\n// Rank what came back\n// ---------------------------------------------------------------------------\n\nconst leadDomain = normDomain(src.domain);\nconst knownFounder = (src.known_founder_name || '').trim().toLowerCase();\n\nconst ranked = resp.people\n  .map(function (p) {\n    const org = p.organization || {};\n    const orgDomain = normDomain(org.primary_domain || org.website_url || p.organization_domain);\n    return {\n      person: p,\n      tier: tierOf(p.title),\n      seniority: seniorityOf(p.title),\n      // Apollo can attach a person to an organisation whose domain is not the\n      // one searched (former employer, parent company, a same-name business in\n      // another country). Spending a credit on that person buys the wrong\n      // company's contact, so it is a hard gate, not a ranking penalty.\n      domain_ok: !orgDomain || orgDomain === leadDomain,\n      // The site named this person as founder. Independent corroboration from a\n      // second source outranks a title string alone.\n      corroborated:\n        !!knownFounder &&\n        typeof p.name === 'string' &&\n        p.name.trim().toLowerCase() === knownFounder,\n    };\n  })\n  .filter(function (c) { return c.tier >= 0 && c.domain_ok; })\n  .sort(function (a, b) {\n    if (a.corroborated !== b.corroborated) return a.corroborated ? -1 : 1;\n    if (a.tier !== b.tier) return a.tier - b.tier;\n    return a.seniority - b.seniority;\n  });\n\nif (!ranked.length) {\n  const seen = resp.people.length;\n  const reason =\n    seen === 0\n      ? 'Apollo has no people indexed at this domain'\n      : 'Apollo returned ' + seen + ' ' + (seen === 1 ? 'person' : 'people') +\n        ' at this domain, none in a founder / managing director / CEO / business ' +\n        'development role at the searched domain';\n  return {\n    json: Object.assign({}, base, {\n      write: true,\n      matched: false,\n      retry: false,\n      no_match_reason: reason,\n      // A tombstone: the lead gets a contacts row carrying no contact. It is\n      // written for one reason -- without it the batch query has no way to tell\n      // \"not looked up yet\" from \"looked up, nothing there\", and every cron run\n      // would re-spend a search on the same dead domains forever.\n      //\n      // It deliberately does NOT advance the lead. Section 8's status flow has\n      // no state for \"asked and found nothing\", and `contact_found` would put a\n      // contactless lead in front of Workflow 4, which is exactly what the\n      // grounding guard exists to prevent. The lead stays 'scored'.\n      payload: {\n        lead_id: src.lead_id,\n        name: null,\n        title: null,\n        email: null,\n        linkedin_url: null,\n        apollo_id: null,\n        // Nothing was found, so there is nothing to have verified.\n        verified: false,\n        advance: false,\n        note: reason,\n      },\n    }),\n  };\n}\n\nconst best = ranked[0];\nconst p = best.person;\n\nreturn {\n  json: Object.assign({}, base, {\n    write: true,\n    matched: true,\n    retry: false,\n    apollo_id: p.id || null,\n    candidate: {\n      name: p.name || [p.first_name, p.last_name].filter(Boolean).join(' ') || null,\n      first_name: p.first_name || null,\n      last_name: p.last_name || null,\n      title: p.title || null,\n      linkedin_url: p.linkedin_url || null,\n    },\n    match_tier: best.tier,\n    corroborated: best.corroborated,\n    candidates_considered: resp.people.length,\n    candidates_in_role: ranked.length,\n  }),\n};\n"
+      },
+      "name": "Pick Best Contact",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        240
+      ],
+      "notes": "Ranks by Section 12's buyer order -- founder, managing director, CEO, business development -- with a person the site independently named as founder outranking a better title on a stranger.\n\nApollo attaching a person to a different organisation's domain is a hard gate, not a ranking penalty: that person is the wrong company's contact however senior the title reads.\n\nSplits three ways, and the last two are the point. A refused or failed call is retried and writes nothing. An answered call with nobody usable writes a tombstone so the domain is never paid for twice."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "searchok",
+              "leftValue": "={{ $json.write }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Drop Failed Searches",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
+        240
+      ],
+      "notes": "If Apollo did not answer, the lead is dropped and stays 'scored' so the next run retries it. Same self-healing shape as Workflow 3's 'Drop Failed Lookups' and Workflow 2's 'Drop Failed Calls'. Writing a no-contact row here instead would record an outage as a fact about the company, permanently."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "matched",
+              "leftValue": "={{ $json.matched }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Matched?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1320,
+        240
+      ],
+      "notes": "Only a candidate that cleared both the title and the domain gate is worth an enrichment credit. Everything else takes the tombstone path Pick Best Contact already built a payload for."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.apollo.io/api/v1/people/match",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ id: $json.apollo_id }) }}",
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 2,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "name": "Apollo People Match",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        320
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "novascoutApollo01",
+          "name": "Apollo - x-api-key"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "notes": "The metered call: one credit per successful match, at most one per lead, and only for a lead that scored >= 60, had no scraped address, and produced a ranked candidate at its own domain.\n\nIdentified by Apollo id rather than name+domain. The search already returned it, and it removes the chance of the enrichment resolving to a different person than the one the ranker chose.\n\nreveal_personal_emails is deliberately not set: a work address is what Section 5's outreach mailbox sends to, and a personal address is neither needed nor appropriate for a cold B2B first touch."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Build Contact Payload (Apollo) — n8n Code node (Run Once for Each Item).\n//\n// Folds the People Enrichment response into the candidate Pick Best Contact\n// already chose. The search that produced the candidate returns no addresses at\n// all, by design on Apollo's side; this is the call that costs the credit, so it\n// runs exactly once per lead and only for a candidate that already cleared the\n// title and domain gates.\n\nconst pick = $('Pick Best Contact').item.json;\nconst resp = $input.item.json;\nconst cand = pick.candidate || {};\n\n// Same rule as Pick Best Contact and as Workflow 3's ClinicalTrials.gov step: a\n// call that did not answer is not evidence. The lead is dropped with no row\n// written and stays 'scored' for the next run, rather than being tombstoned as\n// though Apollo had looked and found nothing.\nif (!resp || typeof resp !== 'object' || resp.error || resp.error_code || !resp.person) {\n  // JSON.stringify, not String(): n8n wraps an HTTP failure as an object, and\n  // String() renders that '[object Object]' -- which turns the one field an\n  // operator needs (why did Apollo refuse?) into nothing at all. Same shape\n  // code_score.js uses for the ClinicalTrials.gov failure path.\n  const err = resp && (resp.error || resp.message);\n  const detail = err\n    ? (typeof err === 'string' ? err : JSON.stringify(err)).slice(0, 300)\n    : 'no person object in the response';\n  return {\n    json: {\n      write: false,\n      lead_id: pick.lead_id,\n      domain: pick.domain,\n      source: 'apollo',\n      credits_spent: 0,\n      skip_reason: 'Apollo people-match did not answer: ' + detail,\n    },\n  };\n}\n\nconst p = resp.person;\n\n// Apollo returns this literal placeholder when the account cannot see the\n// address. Writing it would put an undeliverable string in contacts.email that\n// looks exactly like a real one three workflows downstream.\nfunction usableEmail(e) {\n  if (typeof e !== 'string') return null;\n  const s = e.trim();\n  if (!s || s.indexOf('@') < 1) return null;\n  if (/^email_not_unlocked@/i.test(s)) return null;\n  if (/^(unavailable|not_unlocked|locked)$/i.test(s)) return null;\n  return s;\n}\n\nconst email = usableEmail(p.email);\nconst status = typeof p.email_status === 'string' ? p.email_status.toLowerCase() : null;\n\n// The one flag Workflow 6 will gate a send on, so it means one thing: the\n// address is confirmed, not inferred. Apollo's own 'guessed' status is a\n// pattern-derived address -- real enough to keep, not enough to call verified.\nconst verified = !!email && status === 'verified';\n\nconst name = p.name || [p.first_name, p.last_name].filter(Boolean).join(' ') || cand.name || null;\nconst title = p.title || cand.title || null;\nconst linkedin = p.linkedin_url || cand.linkedin_url || null;\n\nreturn {\n  json: {\n    write: true,\n    lead_id: pick.lead_id,\n    domain: pick.domain,\n    source: 'apollo',\n    credits_spent: 1,\n    email_status: status,\n    payload: {\n      lead_id: pick.lead_id,\n      name: name,\n      title: title,\n      email: email,\n      linkedin_url: linkedin,\n      apollo_id: p.id || pick.apollo_id || null,\n      verified: verified,\n      // A person with a LinkedIn URL and no email is still contactable -- Section\n      // 6 sends LinkedIn by hand, and Workflow 4 drafts that variant separately.\n      advance: !!(email || linkedin),\n      note:\n        'Apollo people-match on a ' +\n        (pick.corroborated ? 'site-corroborated ' : '') +\n        'tier-' + pick.match_tier + ' title; email_status=' + (status || 'none') +\n        '; ' + pick.candidates_in_role + ' of ' + pick.candidates_considered +\n        ' indexed people were in an ICP role at this domain',\n    },\n  },\n};\n"
+      },
+      "name": "Build Contact Payload (Apollo)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        320
+      ],
+      "notes": "Maps Apollo's email_status onto contacts.verified: only 'verified' earns the flag. A 'guessed' address is pattern-derived -- real enough to keep, not enough to let Workflow 6 send to unchallenged.\n\nApollo's 'email_not_unlocked@domain.com' placeholder is dropped rather than stored: it would sit in contacts.email looking exactly like a real address three workflows downstream."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "matchok",
+              "leftValue": "={{ $json.write }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Drop Failed Matches",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [
+        1980,
+        320
+      ],
+      "notes": "An enrichment call that did not answer is not evidence either. The lead stays 'scored' and is retried, rather than being recorded as a company with no contact."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Build Contact Payload (Scraped) — n8n Code node (Run Once for Each Item).\n//\n// The zero-credit branch. Everything written here came from a source already on\n// disk: the address from the company's own ichgcp profile page, the person from\n// the Workflow 2 site extraction. No API was called and no field is inferred.\n\nconst r = $input.item.json;\nconst c = r.contact || {};\n\n// Section 8 gives `contacts` no column for provenance, and this branch needs the\n// distinction to survive: a NULL apollo_id is what marks a row as scrape-sourced.\n// It is not a placeholder for a lookup that failed -- those rows are written by\n// Pick Best Contact and carry a NULL email too.\nconst hasChannel = !!(c.email || c.linkedin_url);\n\nreturn {\n  json: {\n    write: true,\n    lead_id: r.lead_id,\n    domain: r.domain,\n    source: 'ichgcp_scrape',\n    credits_spent: 0,\n    payload: {\n      lead_id: r.lead_id,\n      name: c.name || null,\n      title: c.title || null,\n      email: c.email || null,\n      linkedin_url: c.linkedin_url || null,\n      apollo_id: null,\n      // First-party published address: the company stated it about itself.\n      verified: c.verified === true,\n      // At least one reachable channel, so Workflow 4 has something to draft to.\n      advance: hasChannel,\n      note: r.evidence || null,\n    },\n  },\n};\n"
+      },
+      "name": "Build Contact Payload (Scraped)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        20
+      ],
+      "notes": "The zero-credit branch. Every field written here came from a source already on disk -- the address from the company's own ichgcp profile page, the person from the Workflow 2 site extraction. A NULL apollo_id is what marks the row as scrape-sourced; Section 8 gives contacts no provenance column."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Write the contact and advance the lead in ONE statement, so a crash between\n-- the two cannot leave a contact stored against a lead still sitting in the\n-- lookup queue (or a lead advanced with no contact behind it).\n--\n-- UPSERT on contacts_lead_id_key (migration 004). Re-running after an Apollo\n-- outage, a plan change, or a threshold change updates the row in place instead\n-- of adding a second one -- migration 002's lesson, applied here by construction.\n--\n-- `advance` is carried in the payload rather than derived here because only the\n-- payload builders know whether a reachable channel was actually found. A\n-- tombstone row (looked up, nobody there) writes with advance=false: it records\n-- the answer so the lead is never re-queried, and leaves it 'scored' so\n-- Workflow 4 never drafts to an empty contact.\nWITH payload AS (\n  SELECT $1::jsonb AS p\n), ins AS (\n  INSERT INTO contacts (lead_id, name, title, email, linkedin_url, apollo_id, verified)\n  SELECT\n    (p->>'lead_id')::bigint,\n    p->>'name',\n    p->>'title',\n    p->>'email',\n    p->>'linkedin_url',\n    p->>'apollo_id',\n    COALESCE((p->>'verified')::boolean, false)\n  FROM payload\n  ON CONFLICT (lead_id) DO UPDATE SET\n    name         = EXCLUDED.name,\n    title        = EXCLUDED.title,\n    email        = EXCLUDED.email,\n    linkedin_url = EXCLUDED.linkedin_url,\n    apollo_id    = EXCLUDED.apollo_id,\n    verified     = EXCLUDED.verified\n  RETURNING lead_id, email, verified\n), adv AS (\n  -- Section 8's status flow: scored -> contact_found. The status guard makes a\n  -- concurrent or repeated run a no-op rather than a double write.\n  UPDATE leads\n     SET status = 'contact_found',\n         updated_at = now()\n   WHERE id = (SELECT lead_id FROM ins)\n     AND status = 'scored'\n     AND (SELECT COALESCE((p->>'advance')::boolean, false) FROM payload)\n  RETURNING id\n)\nSELECT i.lead_id,\n       i.email,\n       i.verified,\n       (SELECT count(*) FROM adv) > 0 AS advanced\n  FROM ins i;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.payload)] }}"
+        }
+      },
+      "name": "Write Contact & Advance",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2200,
+        130
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "The whole payload goes in as one jsonb parameter, so unicode and embedded commas are handled by Postgres rather than by string splicing.\n\nUPSERT on contacts_lead_id_key (migration 004), and the status update is guarded on status='scored', so a repeated run is a no-op rather than a double write. Only a payload carrying a reachable channel advances the lead to 'contact_found'."
+    }
+  ],
+  "connections": {
+    "Every Hour": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Fetch ICH GCP CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch ICH GCP CSV": {
+      "main": [
+        [
+          {
+            "node": "Parse CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse CSV": {
+      "main": [
+        [
+          {
+            "node": "Index Scraped Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Index Scraped Emails": {
+      "main": [
+        [
+          {
+            "node": "Get Qualified Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Qualified Batch": {
+      "main": [
+        [
+          {
+            "node": "Resolve Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Contact": {
+      "main": [
+        [
+          {
+            "node": "Needs Apollo?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Apollo?": {
+      "main": [
+        [
+          {
+            "node": "Apollo People Search",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Contact Payload (Scraped)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Contact Payload (Scraped)": {
+      "main": [
+        [
+          {
+            "node": "Write Contact & Advance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apollo People Search": {
+      "main": [
+        [
+          {
+            "node": "Pick Best Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Best Contact": {
+      "main": [
+        [
+          {
+            "node": "Drop Failed Searches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drop Failed Searches": {
+      "main": [
+        [
+          {
+            "node": "Matched?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Matched?": {
+      "main": [
+        [
+          {
+            "node": "Apollo People Match",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Write Contact & Advance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apollo People Match": {
+      "main": [
+        [
+          {
+            "node": "Build Contact Payload (Apollo)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Contact Payload (Apollo)": {
+      "main": [
+        [
+          {
+            "node": "Drop Failed Matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drop Failed Matches": {
+      "main": [
+        [
+          {
+            "node": "Write Contact & Advance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
