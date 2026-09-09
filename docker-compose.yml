@@ -46,6 +46,22 @@ services:
   nocodb:
     image: nocodb/nocodb:latest
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Required for the Workflow 5 review queue. NocoDB refuses to connect a
+      # data source to an RFC1918 address by default (SSRF protection) and
+      # answers "Connection to internal hosts is not allowed" — which is exactly
+      # what `postgres:5432` on the compose network is. Every service here is on
+      # that private network by design, so the protection has nothing to protect:
+      # NocoDB reaching Postgres is the intended architecture, not an attacker
+      # pivoting through it.
+      #
+      # This does NOT expose anything new. NocoDB is bound to localhost:8080 and
+      # the Postgres credentials still gate the connection. Do not carry this
+      # setting to an internet-facing NocoDB.
+      NC_ALLOW_LOCAL_EXTERNAL_DBS: "true"
     volumes:
       - nocodb_data:/usr/app/data
     ports:
