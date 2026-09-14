@@ -1,0 +1,199 @@
+{
+  "id": "followup0001",
+  "name": "Send & Track - Follow-Ups",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "name": "Every 6 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -880,
+        40
+      ],
+      "notes": "Queue-driven: a missed run just means the next one finds more due (Section 7)."
+    },
+    {
+      "parameters": {},
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -880,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "nowoverride",
+              "name": "now_override",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "days",
+              "name": "follow_up_days",
+              "value": 6,
+              "type": "number"
+            },
+            {
+              "id": "max",
+              "name": "max_follow_ups",
+              "value": 2,
+              "type": "number"
+            },
+            {
+              "id": "batch",
+              "name": "batch_size",
+              "value": 25,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -660,
+        130
+      ],
+      "notes": "follow_up_days=6 and max_follow_ups=2 are parsed out of Section 9 at build time. now_override must stay empty (dry-run only)."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Find Due Follow-Ups -- Section 9: \"if no reply after N days, generate\n-- follow-up draft back into the review queue. Maximum M follow-ups, then mark\n-- lost.\" Queue-driven like every stage (Section 7): whatever is due, whenever\n-- this runs.\n--\n-- $1 now_override ('' in the shipped workflow), $2 days, $3 maximum, $4 batch.\n--\n-- The clock restarts at the later of the last send and the last follow-up\n-- drafted, so a follow-up the reviewer rejected does not spawn the next one the\n-- same afternoon. A rejected follow-up still uses its slot: the reviewer\n-- decided against it, and regenerating the same template would ask again.\nWITH clk AS (\n  SELECT coalesce(nullif($1, '')::timestamptz, now()) AS now\n),\nsends AS (\n  SELECT o.lead_id, o.sent_at, o.message_body, o.draft_id\n    FROM outreach_log o\n   WHERE o.channel = 'email' AND o.message_id IS NOT NULL\n),\nfirst_touch AS (\n  SELECT DISTINCT ON (s.lead_id) s.lead_id, s.sent_at, s.message_body, d.subject\n    FROM sends s\n    JOIN drafts d ON d.id = s.draft_id\n   WHERE coalesce(d.variant, '') NOT LIKE 'follow-up-%'\n   ORDER BY s.lead_id, s.sent_at\n),\nlast_send AS (\n  SELECT lead_id, max(sent_at) AS sent_at FROM sends GROUP BY lead_id\n),\nfu AS (\n  SELECT d.lead_id,\n         count(*)::int                                                  AS created,\n         count(*) FILTER (WHERE d.status IN ('pending', 'approved'))::int AS open,\n         max(d.created_at)                                              AS last_created\n    FROM drafts d\n   WHERE d.channel = 'email' AND d.variant LIKE 'follow-up-%'\n   GROUP BY d.lead_id\n)\nSELECT l.id                                                             AS lead_id,\n       CASE WHEN coalesce(fu.created, 0) >= $3::int THEN 'mark-lost' ELSE 'draft-follow-up' END AS action,\n       coalesce(fu.created, 0) + 1                                      AS next_follow_up,\n       ft.subject                                                       AS first_subject,\n       ft.message_body                                                  AS first_body,\n       to_char((ft.sent_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')                                                    AS first_sent_at,\n       to_char((ls.sent_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')                                                     AS last_sent_at\n  FROM leads l\n  JOIN first_touch ft ON ft.lead_id = l.id\n  JOIN last_send ls   ON ls.lead_id = l.id\n  LEFT JOIN fu        ON fu.lead_id = l.id\n  CROSS JOIN clk\n WHERE l.status = 'sent'\n   AND greatest(ls.sent_at, coalesce(fu.last_created, ls.sent_at)) <= clk.now - make_interval(days => $2::int)\n   AND coalesce(fu.open, 0) = 0\n   AND NOT EXISTS (SELECT 1 FROM outreach_log o WHERE o.lead_id = l.id AND (o.replied OR o.outcome = 'bounced'))\n   AND NOT EXISTS (SELECT 1 FROM inbound_messages i\n                    WHERE i.lead_id = l.id AND i.classification IN ('reply', 'opt-out', 'bounce'))\n   AND NOT EXISTS (SELECT 1 FROM blocklist b WHERE lower(l.domain) = b.domain OR lower(l.domain) LIKE '%.' || b.domain)\n ORDER BY l.id\n LIMIT $4::int;",
+        "options": {
+          "queryReplacement": "={{ [$json.now_override, $json.follow_up_days, $json.max_follow_ups, $json.batch_size] }}"
+        }
+      },
+      "name": "Find Due Follow-Ups",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -440,
+        130
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Leads at 'sent', no reply, no bounce, not blocklisted, quiet for 6 days: the next follow-up, or 'lost' once 2 have been used."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Build Follow-Up -- n8n Code node (Run Once for Each Item).\n//\n// Section 9, Workflow 6: \"if no reply after 6 days, generate follow-up draft\n// back into the review queue. Maximum two follow-ups, then mark lost.\"\n//\n// A template, not a model call. A follow-up adds no new fact about the lead --\n// its whole job is \"the note below, again\" -- so build rule 3 applies, and\n// build rule 6 is satisfied by construction: there is nothing to ground. It\n// lands in the review queue as 'pending'. A human approves it or it never goes.\n//\n// The body carries the same compliance footer the first touch did -- opt-out\n// line, blank line, signature -- because the send path refuses any body that\n// does not.\n\n// Section 5 (verbatim) and Section 9, parsed from the doc at build time.\nconst OPT_OUT = \"If this isn't relevant, reply 'no' and I won't follow up.\";\nconst MAX_FOLLOW_UPS = 2;\n\nconst SIGNATURE = \"Abdullah Amir\\nFounder, Amitrix Labs\\n+923178485713\";\nconst SENDER_NAME = \"Abdullah Amir\";\n\n// One line per follow-up, and exactly MAX_FOLLOW_UPS of them (checked at build\n// time). Neither states a fact about the lead; the first touch is quoted below.\nconst LINES = {\n  1: 'Following up on my note below in case it got buried. Would the 90-second recording of Nova running at NoblePath be useful?',\n  2: 'One last note on this, then I will leave it. If a demo built on your own material in 48 hours would help, I can set it up, no commitment.',\n};\n\nfunction str(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\nfunction greetingOf(firstBody) {\n  const first = str(String(firstBody || '').replace(/\\r\\n?/g, '\\n').split('\\n')[0]);\n  return /^(hi|hello|dear)\\b[^\\n]{0,40},$/i.test(first) ? first : 'Hello,';\n}\n\nfunction followUpDraft(r) {\n  const n = Number(r.next_follow_up);\n  if (!LINES[n]) throw new Error('no follow-up template for #' + r.next_follow_up + ' (max ' + MAX_FOLLOW_UPS + ')');\n  const firstBody = String(r.first_body || '').replace(/\\r\\n?/g, '\\n').trim();\n  const sent = new Date(r.first_sent_at);\n  const when = isNaN(sent.getTime()) ? 'earlier' : sent.toUTCString().slice(0, 16);\n  const quoted = firstBody.split('\\n').map(function (ln) { return ln ? '> ' + ln : '>'; }).join('\\n');\n  const body = [\n    greetingOf(firstBody),\n    '',\n    LINES[n],\n    '',\n    OPT_OUT,\n    '',\n    SIGNATURE,\n    '',\n    'On ' + when + ', ' + SENDER_NAME + ' wrote:',\n    quoted,\n  ].join('\\n');\n  return {\n    channel: 'email',\n    variant: 'follow-up-' + n,\n    subject: 'Re: ' + str(r.first_subject).replace(/^(?:re:\\s*)+/i, ''),\n    body: body,\n  };\n}\n\nfunction followUpAction(r) {\n  if (r.action === 'mark-lost') {\n    return { payload: { lead_id: r.lead_id, action: 'mark-lost', draft: null } };\n  }\n  return { payload: { lead_id: r.lead_id, action: 'draft-follow-up', draft: followUpDraft(r) } };\n}\n\n// ---------------------------------------------------------------------------\n// Node body (Run Once for All Items)\n// ---------------------------------------------------------------------------\n\n// An empty queue can arrive here as one { success: true } item: the Postgres\n// node emits that placeholder when it does not classify a statement as a\n// SELECT, and a WITH ... SELECT is exactly the case its parser has to guess at.\n// Keeping only rows that carry a lead_id turns that into zero items, so Write\n// Follow-Up simply does not run -- instead of this node throwing on a row that\n// was never a lead.\nreturn $input.all()\n  .filter(function (it) { return it.json && it.json.lead_id !== undefined && it.json.lead_id !== null; })\n  .map(function (it) { return { json: followUpAction(it.json) }; });\n"
+      },
+      "name": "Build Follow-Up",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        130
+      ],
+      "notes": "A template, not a model call: a follow-up adds no fact about the lead. It carries the Section 5 footer, so the send path accepts it once a human approves it."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Write Follow-Up: insert the follow-up draft as 'pending' (the reviewer's\n-- queue), or mark the lead lost. Both guarded so a repeated run is a no-op: a\n-- lead gets each follow-up variant at most once, and only a lead still at\n-- 'sent' moves.\nWITH p AS (\n  SELECT $1::jsonb AS p\n),\nins AS (\n  INSERT INTO drafts (lead_id, channel, variant, subject, body, status)\n  SELECT (p.p->>'lead_id')::bigint, 'email', p.p->'draft'->>'variant', p.p->'draft'->>'subject',\n         p.p->'draft'->>'body', 'pending'\n    FROM p\n   WHERE p.p->>'action' = 'draft-follow-up'\n     AND p.p->'draft'->>'channel' = 'email'\n     AND NOT EXISTS (SELECT 1 FROM drafts d\n                      WHERE d.lead_id = (p.p->>'lead_id')::bigint\n                        AND d.variant = p.p->'draft'->>'variant')\n     AND EXISTS (SELECT 1 FROM leads l WHERE l.id = (p.p->>'lead_id')::bigint AND l.status = 'sent')\n  RETURNING id, variant\n),\nlost AS (\n  UPDATE leads l\n     SET status = 'lost', updated_at = now()\n    FROM p\n   WHERE p.p->>'action' = 'mark-lost'\n     AND l.id = (p.p->>'lead_id')::bigint\n     AND l.status = 'sent'\n  RETURNING l.id\n)\nSELECT (p.p->>'lead_id')::bigint   AS lead_id,\n       p.p->>'action'              AS action,\n       (SELECT id FROM ins)        AS draft_id,\n       (SELECT variant FROM ins)   AS variant,\n       (SELECT count(*) FROM lost)::int AS marked_lost\n  FROM p;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.payload)] }}"
+        }
+      },
+      "name": "Write Follow-Up",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        0,
+        130
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Into drafts as 'pending' -- the review queue. Nothing follows up without a human."
+    }
+  ],
+  "connections": {
+    "Every 6 Hours": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Find Due Follow-Ups",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Due Follow-Ups": {
+      "main": [
+        [
+          {
+            "node": "Build Follow-Up",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Follow-Up": {
+      "main": [
+        [
+          {
+            "node": "Write Follow-Up",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

@@ -16,6 +16,7 @@ it and the grounding guard passes everything while still looking correct).
 Exits non-zero on the first guard that failed to fire.
 """
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -40,11 +41,27 @@ def write(p, s):
         fh.write(s)
 
 
-def run_build(workdir, doc_path):
+# Every case builds as this sender, never the real one. The cases must not
+# depend on a gitignored .env existing, so NOVASCOUT_ENV_FILE points at a path
+# that is never created -- the real .env is out of every case unless a case
+# opts in with a file of its own.
+FIXTURE_SENDER = "Drift Test Sender"
+
+
+def run_build(workdir, doc_path, env_overrides=None):
     env = dict(os.environ)
     env["NOVASCOUT_MASTER_REF"] = doc_path
     env["DRAFTING_OUT"] = os.path.join(workdir, "out", "drafting.json")
+    env["NOVASCOUT_ENV_FILE"] = os.path.join(workdir, "no-such.env")
+    env["NOVASCOUT_SENDER_NAME"] = FIXTURE_SENDER
+    for k in ("NOVASCOUT_SENDER_TITLE", "NOVASCOUT_SENDER_PHONE", "NOVASCOUT_DEMO_URL"):
+        env.pop(k, None)
     env["PYTHONIOENCODING"] = "utf-8"
+    for k, v in (env_overrides or {}).items():
+        if v is None:
+            env.pop(k, None)
+        else:
+            env[k] = v
     proc = subprocess.Popen(
         [sys.executable, os.path.join(workdir, "drafting", "build_workflow.py")],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
@@ -53,7 +70,8 @@ def run_build(workdir, doc_path):
     return proc.returncode, err.decode("utf-8", "replace")
 
 
-def case(label, mutate_doc=None, mutate_js=None, js_file="code_assess.js", expect_in=""):
+def case(label, mutate_doc=None, mutate_js=None, js_file="code_assess.js", expect_in="",
+         env_overrides=None):
     tmp = tempfile.mkdtemp(prefix="novascout-drift-")
     try:
         shutil.copytree(HERE, os.path.join(tmp, "drafting"))
@@ -72,7 +90,7 @@ def case(label, mutate_doc=None, mutate_js=None, js_file="code_assess.js", expec
             assert new_src != src, "mutation %r did not change %s" % (label, js_file)
             write(p, new_src)
 
-        rc, err = run_build(tmp, doc_path)
+        rc, err = run_build(tmp, doc_path, env_overrides)
         if rc == 0:
             FAILED.append((label, "build SUCCEEDED but should have refused"))
         elif expect_in and expect_in.lower() not in err.lower():
@@ -99,6 +117,35 @@ def baseline():
 
 
 baseline()
+
+
+def env_file_supplies_sender():
+    """The positive half of the sender guard: with the variable absent from the
+    environment, the name in .env is what lands in the shipped Code node."""
+    label = ".env supplies the sender name when the environment does not"
+    tmp = tempfile.mkdtemp(prefix="novascout-drift-")
+    try:
+        shutil.copytree(HERE, os.path.join(tmp, "drafting"))
+        doc_path = os.path.join(tmp, "MasterRef.md")
+        write(doc_path, read(MASTER_REF))
+        env_file = os.path.join(tmp, "test.env")
+        write(env_file, '# other keys are ignored\nOTHER=1\nNOVASCOUT_SENDER_NAME="Env File Sender"\n')
+        rc, err = run_build(tmp, doc_path, {"NOVASCOUT_SENDER_NAME": None,
+                                            "NOVASCOUT_ENV_FILE": env_file})
+        if rc != 0:
+            FAILED.append((label, "build refused:\n" + err[-400:]))
+            return
+        wf = json.loads(read(os.path.join(tmp, "out", "drafting.json")))
+        code = [n for n in wf["nodes"] if n["name"] == "Assemble Drafts"][0]["parameters"]["jsCode"]
+        if 'const SIGNATURE = "Env File Sender";' in code:
+            PASSED.append(label)
+        else:
+            FAILED.append((label, "Assemble Drafts does not carry the name from .env"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+env_file_supplies_sender()
 
 # --- the grounding threshold ------------------------------------------------
 case(
@@ -290,6 +337,18 @@ case(
         "  id, lead_id FK, channel (email|linkedin), variant,",
         "  id, lead_id FK, channel (email|linkedin),", 1),
     expect_in="section 8",
+)
+
+# --- the sender identity ----------------------------------------------------
+#
+# The signature is baked into the Code node at build time. The build used to
+# default the name to "Fatima", so a rebuild from any shell without the
+# variable set silently signed every future draft as the wrong person. There is
+# no default now; this is the case that proves a missing name refuses.
+case(
+    "no sender name in the environment or .env -> build refuses, no default",
+    env_overrides={"NOVASCOUT_SENDER_NAME": None},
+    expect_in="NOVASCOUT_SENDER_NAME is not set",
 )
 
 print("drift guards for Workflow 4\n")

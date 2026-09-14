@@ -1,0 +1,294 @@
+{
+  "id": "mailwatch0001",
+  "name": "Send & Track - Mailbox Watch",
+  "nodes": [
+    {
+      "parameters": {
+        "mailbox": "Sent",
+        "postProcessAction": "nothing",
+        "format": "simple",
+        "downloadAttachments": false,
+        "options": {
+          "customEmailConfig": "[\"ALL\"]",
+          "forceReconnect": 30,
+          "trackLastMessageId": false
+        }
+      },
+      "name": "Sent Folder",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2.2,
+      "position": [
+        -880,
+        -100
+      ],
+      "credentials": {
+        "imap": {
+          "id": "novascoutImap01",
+          "name": "IMAP - outreach mailbox"
+        }
+      },
+      "notes": "The warm-up ceiling's input. Reads the WHOLE Sent folder on every activation (Fetch Only New Emails off), so manual sends made while n8n was down are counted; then each new message as it is filed. Keyed on Message-ID, so re-reads are no-ops."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Normalise Sent -- n8n Code node (Run Once for All Items).\n//\n// Turns a batch of Sent-folder messages from the IMAP trigger into rows for\n// mailbox_sent. It is the IMAP pre-flight's reading, kept current: when each\n// message went, and whether any recipient was outside the mailbox's own domain.\n// Only \"external\" messages count toward Section 5's warm-up ceiling -- a note\n// to yourself or to a colleague on the same domain warms nothing.\n//\n// The trigger delivers the Sent folder in batches of up to 20, and re-reads the\n// whole folder on every activation (so manual sends made while n8n was down are\n// picked up). Every row is keyed on Message-ID, so re-delivery is a no-op.\n\nconst OWN_DOMAIN = \"amitrixlabs.com\";\n\nfunction str(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\nfunction domainOf(addr) {\n  const s = str(addr).toLowerCase();\n  const i = s.lastIndexOf('@');\n  return i === -1 ? '' : s.slice(i + 1);\n}\n\n// Every address in a raw header value: \"A <a@x.com>, b@y.com\" -> [a@x.com, b@y.com].\nfunction addresses(v) {\n  const found = String(v === null || v === undefined ? '' : v).match(/[^\\s<>,;:\"'()\\[\\]]+@[^\\s<>,;:\"'()\\[\\]]+/g) || [];\n  const out = [];\n  for (let i = 0; i < found.length; i++) {\n    const a = found[i].toLowerCase().replace(/\\.+$/, '');\n    if (out.indexOf(a) === -1) out.push(a);\n  }\n  return out;\n}\n\n// Message-IDs are stored with their angle brackets, exactly as nodemailer\n// returns them and as In-Reply-To carries them, so every table compares like\n// with like.\nfunction messageId(v) {\n  const m = str(v).match(/<[^<>\\s]+>/);\n  if (m) return m[0];\n  const s = str(v).split(/\\s+/)[0].replace(/[<>]/g, '');\n  return s ? '<' + s + '>' : '';\n}\n\n// A message with no Message-ID still went out and still counts. Key it on what\n// it is, so the next re-read maps it to the same row instead of adding one.\nfunction fallbackId(j) {\n  const s = [str(j.date), str(j.to), str(j.cc), str(j.subject)].join('|');\n  let h = 5381;\n  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;\n  return '<no-message-id.' + h.toString(16) + '@mirror.invalid>';\n}\n\nfunction sentRows(messages) {\n  const rows = [];\n  let undated = 0;\n  for (let i = 0; i < messages.length; i++) {\n    const j = messages[i] || {};\n    const meta = j.metadata || {};\n    const t = new Date(str(j.date)).getTime();\n    if (!str(j.date) || isNaN(t)) {\n      // The pre-flight fell back to INTERNALDATE here; the trigger does not\n      // expose it. Counted and reported rather than guessed.\n      undated++;\n      continue;\n    }\n    const recipients = addresses(j.to).concat(addresses(j.cc), addresses(meta.bcc)).filter(function (a, k, all) {\n      return all.indexOf(a) === k;\n    });\n    rows.push({\n      message_id: messageId(meta['message-id']) || fallbackId(j),\n      sent_at: new Date(t).toISOString(),\n      recipients: recipients,\n      external: recipients.some(function (a) { return domainOf(a) !== OWN_DOMAIN; }),\n    });\n  }\n  return { rows: rows, seen: messages.length, undated: undated };\n}\n\n// ---------------------------------------------------------------------------\n// Node body\n// ---------------------------------------------------------------------------\n\nconst messages = $input.all().map(function (it) { return it.json; });\nreturn [{ json: { payload: sentRows(messages) } }];\n"
+      },
+      "name": "Normalise Sent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -660,
+        -100
+      ],
+      "notes": "The IMAP pre-flight's reading: when each message went, and whether it went outside amitrixlabs.com. Only external sends warm the domain, so only they count."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Mirror Sent: one trigger batch of the Sent folder into mailbox_sent, and the\n-- time of this read into mailbox_sync. Keyed on Message-ID, so the full re-read\n-- on every activation is a no-op for anything already known; a message the\n-- workflow sent itself only gets seen_in_sent_folder = true -- the mirror's\n-- proof of life the send path checks.\nWITH p AS (\n  SELECT $1::jsonb AS p\n),\nr AS (\n  SELECT x->>'message_id'                                  AS message_id,\n         (x->>'sent_at')::timestamptz                      AS sent_at,\n         ARRAY(SELECT jsonb_array_elements_text(x->'recipients')) AS recipients,\n         (x->>'external')::boolean                         AS external\n    FROM p, jsonb_array_elements(p.p->'rows') AS x\n),\nup AS (\n  INSERT INTO mailbox_sent (message_id, sent_at, recipients, external, lead_id, source, seen_in_sent_folder)\n  SELECT r.message_id, r.sent_at, r.recipients, r.external,\n         -- A manual send to a prospect links to the lead, so the send path will\n         -- not follow it with a duplicate first touch.\n         coalesce(\n           (SELECT c.lead_id FROM contacts c WHERE lower(c.email) = ANY (r.recipients) ORDER BY c.lead_id LIMIT 1),\n           (SELECT l.id FROM leads l\n             WHERE lower(l.domain) = ANY (SELECT split_part(x, '@', 2) FROM unnest(r.recipients) AS x)\n             ORDER BY l.id LIMIT 1)),\n         'sent-folder', true\n    FROM r\n  ON CONFLICT (message_id) DO UPDATE SET seen_in_sent_folder = true\n  RETURNING (xmax = 0) AS inserted\n),\ns AS (\n  INSERT INTO mailbox_sync (folder, last_synced_at, messages_seen, undated)\n  SELECT 'Sent', now(), (p.p->>'seen')::int, (p.p->>'undated')::int\n    FROM p\n  ON CONFLICT (folder) DO UPDATE\n     SET last_synced_at = EXCLUDED.last_synced_at,\n         messages_seen  = EXCLUDED.messages_seen,\n         undated        = EXCLUDED.undated\n  RETURNING last_synced_at\n)\nSELECT (SELECT count(*) FROM up WHERE inserted)::int     AS new_rows,\n       (SELECT count(*) FROM up WHERE NOT inserted)::int AS already_known,\n       (p.p->>'undated')::int                            AS undated,\n       (SELECT to_char((s.last_synced_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM s)                         AS synced_at\n  FROM p;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.payload)] }}"
+        }
+      },
+      "name": "Mirror Sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -440,
+        -100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Upsert into mailbox_sent; stamp mailbox_sync. The send path refuses to send until this has run at least once, and stops if its own sends stop appearing here."
+    },
+    {
+      "parameters": {
+        "mailbox": "INBOX",
+        "postProcessAction": "nothing",
+        "format": "simple",
+        "downloadAttachments": false,
+        "options": {
+          "customEmailConfig": "[\"ALL\"]",
+          "forceReconnect": 30,
+          "trackLastMessageId": true
+        }
+      },
+      "name": "Inbox",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2.2,
+      "position": [
+        -880,
+        160
+      ],
+      "credentials": {
+        "imap": {
+          "id": "novascoutImap01",
+          "name": "IMAP - outreach mailbox"
+        }
+      },
+      "notes": "Replies, opt-outs, bounces, out-of-offices. Only new messages after the first activation; the last UID survives restarts, so anything that arrived while n8n was down is caught up."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Classify Inbound -- n8n Code node (Run Once for Each Item).\n//\n// Section 9, Workflow 6: \"Any reply -> kill follow-up sequence, set\n// status='replied'. Opt-out detection: reply matching no/unsubscribe/remove/\n// stop -> add domain to blocklist, permanent.\" Section 5 makes that opt-out the\n// basis of the GDPR/KVKK legitimate-interest position, so it is honoured the\n// moment it is seen.\n//\n// Deterministic, no model (build rule 3). What decides the outcome is the text\n// the person actually WROTE, not the message they sent back. Every reply quotes\n// our email, and our email says \"reply 'no'\" -- classify the whole body and\n// every single reply is an opt-out. So the quoted part is cut first, and the\n// opt-out sentence is stripped again afterwards in case a client quoted it\n// without a marker.\n//\n// Precedence: bounce > auto-reply > opt-out > reply. A bounce or an\n// out-of-office is not a person answering, so neither sets 'replied' -- an\n// out-of-office must not kill the follow-up sequence.\n\n// Section 5 / Section 9 opt-out words -- parsed from the doc and checked at\n// build time. \"no\" counts only as the FIRST word of what they wrote (\"No,\n// thanks\" opts out; \"we have no chatbot, tell me more\" does not). The other\n// three count anywhere in their text.\nconst OPT_OUT_KEYWORDS = ['no', 'unsubscribe', 'remove', 'stop'];\nconst OPT_OUT = \"If this isn't relevant, reply 'no' and I won't follow up.\";\nconst OWN_DOMAIN = \"amitrixlabs.com\";\n\n// The first-word \"no\" in the languages of Section 12's geographies: the person\n// following our instruction may not answer in English. Czech \"ne\" is left out\n// on purpose -- it opens ordinary Turkish questions (\"Ne zaman...?\", \"when...\"),\n// and a false opt-out blocklists a lead permanently.\nconst NO_WORDS = ['no', 'nope', 'não', 'nao', 'nie', 'hayır', 'hayir', 'nem', 'nu'];\n\n// Replies from these are a person, not a company: the domain is never matched\n// to a lead and never blocklisted.\nconst FREEMAIL = [\n  'gmail.com', 'googlemail.com', 'yahoo.com', 'yahoo.co.in', 'yahoo.com.br', 'yahoo.com.mx',\n  'yahoo.com.ar', 'yahoo.ro', 'hotmail.com', 'outlook.com', 'live.com', 'msn.com', 'icloud.com',\n  'me.com', 'aol.com', 'proton.me', 'protonmail.com', 'gmx.com', 'gmx.net', 'yandex.com',\n  'mail.ru', 'mail.com', 'zoho.com', 'zohomail.com', 'rediffmail.com', 'wp.pl', 'o2.pl',\n  'onet.pl', 'interia.pl', 'seznam.cz', 'freemail.hu', 'citromail.hu', 'uol.com.br',\n  'bol.com.br', 'terra.com.br',\n];\n\n// \"On Mon, 14 Sep 2026, X wrote:\" and its equivalents in the leads' languages.\nconst QUOTE_HEADER = /(wrote|escribi[óo]|a [ée]crit|schrieb|escreveu|ha scritto|yazd[ıi]|napisa[łl](?:\\(a\\)|a)?|[íi]rta|napsal(?:\\(a\\)|a)?|a scris)\\s*:\\s*$/i;\nconst QUOTE_OPENER = /^\\s*(on|el|le|am|em|il)\\b/i;\nconst SEPARATOR = /^\\s*(?:-{2,}\\s*(?:original message|forwarded message|mensaje original|mensagem original|message d'origine)\\s*-{2,}|_{10,})\\s*$/i;\nconst OUTLOOK_FROM = /^\\s*(from|de|von|od|kimden|feladó|expeditor)\\s*:\\s*\\S/i;\nconst OUTLOOK_NEXT = /^\\s*(sent|date|to|subject|enviado|fecha|para|asunto|gesendet|datum|an|betreff|wysłano|data|do|temat|tarih|kime|konu)\\s*:/i;\n\nconst AUTO_SUBJECT = /^(?:auto(?:matic)?[ -]?(?:reply|response|antwort)|out of (?:the )?office|ooo\\b|abwesenheit|fuera de (?:la )?oficina|respuesta autom|resposta autom|r[ée]ponse automatique|otomatik yan[ıi]t|automatyczna odpowied|automatick[áa] odpov|automatikus v[áa]lasz|r[ăa]spuns automat)/i;\nconst BOUNCE_SUBJECT = /undeliver|delivery status notification|returned mail|failure notice|delivery (?:has )?failed|mail delivery failed|non[- ]?delivery|could not be delivered/i;\n\nfunction str(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\nfunction domainOf(addr) {\n  const s = str(addr).toLowerCase();\n  const i = s.lastIndexOf('@');\n  return i === -1 ? '' : s.slice(i + 1);\n}\n\nfunction addresses(v) {\n  const found = String(v === null || v === undefined ? '' : v).match(/[^\\s<>,;:\"'()\\[\\]]+@[^\\s<>,;:\"'()\\[\\]]+/g) || [];\n  const out = [];\n  for (let i = 0; i < found.length; i++) {\n    const a = found[i].toLowerCase().replace(/\\.+$/, '');\n    if (out.indexOf(a) === -1) out.push(a);\n  }\n  return out;\n}\n\nfunction messageId(v) {\n  const m = str(v).match(/<[^<>\\s]+>/);\n  if (m) return m[0];\n  const s = str(v).split(/\\s+/)[0].replace(/[<>]/g, '');\n  return s ? '<' + s + '>' : '';\n}\n\n// Every <...@...> token: In-Reply-To + References for a reply, the whole NDR\n// body for a bounce (which quotes the original headers).\nfunction messageIds(v) {\n  const found = String(v || '').match(/<[^<>\\s@]+@[^<>\\s]+>/g) || [];\n  return found.filter(function (x, i) { return found.indexOf(x) === i; });\n}\n\nfunction fallbackId(j) {\n  const s = [str(j.date), str(j.from), str(j.subject)].join('|');\n  let h = 5381;\n  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;\n  return '<no-message-id.' + h.toString(16) + '@inbound.invalid>';\n}\n\nfunction stripHtml(h) {\n  return String(h || '')\n    .replace(/<br\\s*\\/?>/gi, '\\n')\n    .replace(/<\\/(p|div|tr|li|blockquote)>/gi, '\\n')\n    .replace(/<[^>]+>/g, '')\n    .replace(/&nbsp;/g, ' ')\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&#39;/g, \"'\")\n    .replace(/&amp;/g, '&');\n}\n\n// What they wrote above the quoted thread.\nfunction freshText(text) {\n  const lines = String(text || '').replace(/\\r\\n?/g, '\\n').split('\\n');\n  let cut = lines.length;\n  for (let i = 0; i < lines.length; i++) {\n    const ln = lines[i];\n    if (QUOTE_HEADER.test(ln)) {\n      // Gmail wraps a long header over two lines: \"On ..., X <\" / \"x@y> wrote:\".\n      cut = (i > 0 && !QUOTE_OPENER.test(ln) && QUOTE_OPENER.test(lines[i - 1])) ? i - 1 : i;\n      break;\n    }\n    if (SEPARATOR.test(ln)) { cut = i; break; }\n    if (OUTLOOK_FROM.test(ln) && lines.slice(i + 1, i + 5).some(function (w) { return OUTLOOK_NEXT.test(w); })) {\n      cut = i;\n      break;\n    }\n  }\n  const kept = lines.slice(0, cut).filter(function (ln) { return !/^\\s*>/.test(ln); });\n  return kept.join('\\n')\n    .split(OPT_OUT).join(' ')\n    .replace(/^\\s*sent from my .*$/gim, '')\n    .replace(/\\n{3,}/g, '\\n\\n')\n    .trim();\n}\n\nconst GREETING = '(?:hi|hello|hey|dear|hola|ol[áa]|oi|merhaba|cze[śs][ćc]|dzie[ńn] dobry|szia|ahoj|bun[ăa]|salut|good (?:morning|afternoon|evening))';\n\nfunction optOutKeyword(fresh) {\n  let t = String(fresh || '').toLowerCase().trim();\n  // A greeting is not the answer: \"Hi Abdullah,\\nNo thanks.\" and \"Hi Abdullah,\n  // no thanks.\" both open with \"no\" once the greeting is set aside.\n  t = t.replace(new RegExp('^' + GREETING + '\\\\b[^\\\\n]{0,60}\\\\n'), '').trim();\n  t = t.replace(new RegExp('^' + GREETING + '\\\\b[^,\\\\n]{0,40},\\\\s*'), '').trim();\n  const first = (t.match(/^[^a-zÀ-ɏ]*([a-zÀ-ɏ]+)/) || [])[1] || '';\n  if (NO_WORDS.indexOf(first) !== -1) return 'no';\n  for (let i = 0; i < OPT_OUT_KEYWORDS.length; i++) {\n    const k = OPT_OUT_KEYWORDS[i];\n    if (k === 'no') continue;\n    if (new RegExp('\\\\b' + k).test(t)) return k;\n  }\n  return null;\n}\n\nfunction classify(j) {\n  const meta = j.metadata || {};\n  const from = str(j.from);\n  const fromAddr = addresses(from)[0] || '';\n  const fromDomain = domainOf(fromAddr);\n  const subject = str(j.subject);\n  const raw = str(j.textPlain) || stripHtml(j.textHtml);\n  const fresh = freshText(raw);\n\n  const autoSubmitted = str(meta['auto-submitted']).toLowerCase();\n  const isBounce = /mailer-daemon|postmaster|mail delivery (?:subsystem|system)/i.test(from) ||\n    BOUNCE_SUBJECT.test(subject) ||\n    /report-type=\"?delivery-status/i.test(str(meta['content-type']));\n  const isAuto = (autoSubmitted !== '' && autoSubmitted !== 'no') ||\n    str(meta['x-autoreply']) !== '' || str(meta['x-autorespond']) !== '' ||\n    /^auto_reply$/i.test(str(meta['precedence'])) ||\n    AUTO_SUBJECT.test(subject);\n  const kw = isBounce || isAuto ? null : optOutKeyword(fresh);\n  const classification = isBounce ? 'bounce' : isAuto ? 'auto-reply' : kw ? 'opt-out' : 'reply';\n\n  const threadIds = messageIds(str(meta['in-reply-to']) + ' ' + str(meta['references']));\n  const t = new Date(str(j.date)).getTime();\n  return {\n    message_id: messageId(meta['message-id']) || fallbackId(j),\n    received_at: isNaN(t) ? null : new Date(t).toISOString(),\n    from_addr: fromAddr,\n    from_domain: fromDomain,\n    freemail: FREEMAIL.indexOf(fromDomain) !== -1,\n    own_domain: fromDomain === OWN_DOMAIN,\n    subject: subject.slice(0, 300),\n    classification: classification,\n    opt_out_keyword: kw,\n    thread_ids: isBounce ? threadIds.concat(messageIds(raw)).filter(function (x, i, a) { return a.indexOf(x) === i; }) : threadIds,\n    mentioned_addrs: isBounce ? addresses(raw).filter(function (a) { return domainOf(a) !== OWN_DOMAIN; }) : [],\n    reply_text: fresh.slice(0, 4000),\n    body_excerpt: fresh.slice(0, 600),\n  };\n}\n\n// ---------------------------------------------------------------------------\n// Node body\n// ---------------------------------------------------------------------------\n\nreturn { json: { payload: classify($input.item.json) } };\n"
+      },
+      "name": "Classify Inbound",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -660,
+        160
+      ],
+      "notes": "Reads only what they wrote above the quoted thread -- our own email says \"reply 'no'\" and every reply quotes it. bounce > auto-reply > opt-out > reply."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Record Inbound: match one INBOX message to a lead, record it once, and act on\n-- it in the same statement.\n--\n-- Matching, strongest first: our Message-ID in its In-Reply-To/References (or,\n-- for a bounce, anywhere in the NDR); the contact's own address; the address a\n-- bounce names; the lead's domain -- never a freemail or our own domain. Only\n-- leads this workflow has actually emailed can match.\n--\n-- inbound_messages is keyed on Message-ID and every action below hangs off its\n-- INSERT ... RETURNING, so a message the IMAP trigger delivers twice changes\n-- nothing and notifies nobody the second time.\nWITH p AS (\n  SELECT $1::jsonb AS p\n),\nhit AS (\n  SELECT h.lead_id, h.how\n    FROM (\n      SELECT o.lead_id, 'thread' AS how, 1 AS rank\n        FROM outreach_log o, p\n       WHERE o.message_id IN (SELECT jsonb_array_elements_text(p.p->'thread_ids'))\n      UNION ALL\n      SELECT c.lead_id, 'contact-email', 2\n        FROM contacts c, p\n       WHERE lower(c.email) = lower(p.p->>'from_addr')\n         AND EXISTS (SELECT 1 FROM outreach_log o WHERE o.lead_id = c.lead_id AND o.channel = 'email')\n      UNION ALL\n      SELECT c.lead_id, 'bounced-address', 3\n        FROM contacts c, p\n       WHERE p.p->>'classification' = 'bounce'\n         AND lower(c.email) IN (SELECT jsonb_array_elements_text(p.p->'mentioned_addrs'))\n         AND EXISTS (SELECT 1 FROM outreach_log o WHERE o.lead_id = c.lead_id AND o.channel = 'email')\n      UNION ALL\n      SELECT l.id, 'lead-domain', 4\n        FROM leads l, p\n       WHERE NOT (p.p->>'freemail')::boolean\n         AND NOT (p.p->>'own_domain')::boolean\n         AND lower(l.domain) = p.p->>'from_domain'\n         AND EXISTS (SELECT 1 FROM outreach_log o WHERE o.lead_id = l.id AND o.channel = 'email')\n    ) h\n   ORDER BY h.rank, h.lead_id\n   LIMIT 1\n),\nins AS (\n  INSERT INTO inbound_messages (message_id, received_at, from_addr, subject, lead_id, matched_by,\n                                classification, opt_out_keyword, body_excerpt)\n  SELECT p.p->>'message_id', (p.p->>'received_at')::timestamptz, p.p->>'from_addr', p.p->>'subject',\n         (SELECT lead_id FROM hit), (SELECT how FROM hit),\n         CASE WHEN (SELECT lead_id FROM hit) IS NULL THEN 'unmatched' ELSE p.p->>'classification' END,\n         p.p->>'opt_out_keyword', p.p->>'body_excerpt'\n    FROM p\n  ON CONFLICT (message_id) DO NOTHING\n  RETURNING lead_id, classification, received_at\n),\nlast_send AS (\n  SELECT o.id\n    FROM outreach_log o\n   WHERE o.lead_id = (SELECT lead_id FROM ins)\n     AND o.channel = 'email' AND o.message_id IS NOT NULL\n   ORDER BY o.sent_at DESC\n   LIMIT 1\n),\nlogged AS (\n  UPDATE outreach_log o\n     SET replied    = CASE WHEN i.classification IN ('reply', 'opt-out') THEN true ELSE o.replied END,\n         replied_at = CASE WHEN i.classification IN ('reply', 'opt-out')\n                           THEN coalesce(o.replied_at, i.received_at, now()) ELSE o.replied_at END,\n         reply_body = CASE WHEN i.classification IN ('reply', 'opt-out')\n                           THEN coalesce(o.reply_body, p.p->>'reply_text') ELSE o.reply_body END,\n         outcome    = CASE i.classification\n                        WHEN 'opt-out' THEN 'opt-out:' || (p.p->>'opt_out_keyword')\n                        WHEN 'reply'   THEN coalesce(o.outcome, 'replied')\n                        WHEN 'bounce'  THEN 'bounced'\n                        ELSE o.outcome END\n    FROM ins i, p\n   WHERE o.id = (SELECT id FROM last_send)\n     AND i.classification IN ('reply', 'opt-out', 'bounce')\n  RETURNING o.id\n),\nadvanced AS (\n  -- Section 9: \"Any reply -> kill follow-up sequence, set status='replied'\".\n  -- A bounce or an out-of-office is not a reply and does not do this.\n  UPDATE leads l\n     SET status = 'replied', updated_at = now()\n    FROM ins i\n   WHERE l.id = i.lead_id\n     AND i.classification IN ('reply', 'opt-out')\n     AND l.status IN ('sent', 'lost')\n  RETURNING l.id\n),\nblocked AS (\n  -- Section 5 / Section 9: an opt-out blocklists the domain, immediately and\n  -- permanently -- the lead's domain, and the sender's own if it is a company\n  -- domain that differs from it.\n  INSERT INTO blocklist (domain, reason)\n  SELECT DISTINCT v.dom, 'opt-out: replied \"' || (p.p->>'opt_out_keyword') || '\" -- ' || (p.p->>'message_id')\n    FROM ins i\n    JOIN leads l ON l.id = i.lead_id\n    CROSS JOIN p\n    CROSS JOIN LATERAL (VALUES\n      (lower(l.domain)),\n      (CASE WHEN NOT (p.p->>'freemail')::boolean AND NOT (p.p->>'own_domain')::boolean\n            THEN p.p->>'from_domain' END)) AS v(dom)\n   WHERE i.classification = 'opt-out'\n     AND v.dom IS NOT NULL AND v.dom <> ''\n  ON CONFLICT (domain) DO NOTHING\n  RETURNING domain\n)\nSELECT ((SELECT count(*) FROM ins) = 1\n        AND (SELECT lead_id FROM ins) IS NOT NULL\n        AND (SELECT classification FROM ins) IN ('reply', 'opt-out', 'bounce')) AS notify,\n       coalesce((SELECT classification FROM ins), 'already-recorded')           AS classification,\n       p.p->>'opt_out_keyword'                                                  AS opt_out_keyword,\n       l.company_name                                                           AS company_name,\n       l.domain                                                                 AS domain,\n       l.country                                                                AS country,\n       s.fit_score                                                              AS fit_score,\n       c.email                                                                  AS contact_email,\n       p.p->>'from_addr'                                                        AS from_addr,\n       p.p->>'subject'                                                          AS subject,\n       p.p->>'received_at'                                                      AS received_at,\n       (SELECT how FROM hit)                                                    AS matched_by,\n       p.p->>'body_excerpt'                                                     AS body_excerpt,\n       coalesce((SELECT array_agg(domain ORDER BY domain) FROM blocked), '{}')  AS blocklisted,\n       (SELECT lead_id FROM ins)                                                AS lead_id,\n       (SELECT count(*) FROM logged)::int                                       AS outreach_updated,\n       (SELECT count(*) FROM advanced)::int                                     AS lead_updated\n  FROM p\n  LEFT JOIN leads l    ON l.id = (SELECT lead_id FROM hit)\n  LEFT JOIN scores s   ON s.lead_id = l.id\n  LEFT JOIN contacts c ON c.lead_id = l.id;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.payload)] }}"
+        }
+      },
+      "name": "Record Inbound",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -440,
+        160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Match to a lead, record once (keyed on Message-ID), and act: reply -> outreach_log + lead 'replied' (kills follow-ups); opt-out -> that plus blocklist, permanent (Section 5); bounce -> outreach_log 'bounced'."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Build Operator Notification -- n8n Code node (Run Once for Each Item).\n//\n// Section 9, Workflow 6, with HubSpot deferred: \"a short internal notification\n// email fires to the operator's own inbox (not the outreach mailbox) the moment\n// a reply lands -- reusing the same SMTP capability this workflow needs anyway\".\n//\n// Built from the row Record Inbound returned. That row is only marked `notify`\n// the FIRST time a message is recorded (inbound_messages is keyed on\n// Message-ID), so an IMAP re-delivery cannot notify twice.\n\n// NOVASCOUT_OPERATOR_EMAIL, baked at build time. Empty means nobody to tell:\n// the reply is still recorded, the lead still leaves the send queue and the\n// opt-out is still blocklisted -- only this email is skipped, and the build\n// says so loudly.\nconst OPERATOR_EMAIL = \"\";\n\nconst LABEL = { 'reply': 'REPLY', 'opt-out': 'OPT-OUT', 'bounce': 'BOUNCE' };\n\nfunction str(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\nfunction notification(r) {\n  const what = LABEL[r.classification] || str(r.classification).toUpperCase();\n  const who = str(r.company_name) || str(r.domain) || str(r.from_addr);\n  const lines = [];\n  if (r.classification === 'opt-out') {\n    const blocked = Array.isArray(r.blocklisted) && r.blocklisted.length ? r.blocklisted.join(', ') : 'nothing new (already listed)';\n    lines.push('Opt-out detected -- matched \"' + str(r.opt_out_keyword) + '\". Blocklisted: ' + blocked + '.');\n    lines.push('Nothing more will be sent to this domain. If they did not mean it, delete the row from `blocklist` by hand.');\n  } else if (r.classification === 'bounce') {\n    lines.push('A send to this lead bounced. Its follow-ups are stopped; the contact address needs checking.');\n  } else {\n    lines.push('A lead replied. Its follow-ups are stopped and it is in the replied_queue view in NocoDB.');\n  }\n  lines.push('');\n  lines.push('Company:   ' + (str(r.company_name) || '?'));\n  lines.push('Domain:    ' + str(r.domain) + (str(r.country) ? ' (' + str(r.country) + ')' : ''));\n  lines.push('Fit score: ' + (r.fit_score === null || r.fit_score === undefined ? '?' : r.fit_score));\n  lines.push('Contact:   ' + (str(r.contact_email) || '?'));\n  lines.push('From:      ' + str(r.from_addr));\n  lines.push('Subject:   ' + str(r.subject));\n  lines.push('Received:  ' + str(r.received_at));\n  lines.push('Matched:   ' + str(r.matched_by));\n  lines.push('');\n  lines.push('What they wrote:');\n  lines.push('');\n  lines.push(str(r.body_excerpt) || '(no text above the quoted thread)');\n  return {\n    notify: Boolean(r.notify) && OPERATOR_EMAIL !== '',\n    notify_to: OPERATOR_EMAIL,\n    subject: ('[Nova Scout] ' + what + ' from ' + who).slice(0, 200),\n    text: lines.join('\\n'),\n  };\n}\n\n// ---------------------------------------------------------------------------\n// Node body\n// ---------------------------------------------------------------------------\n\nreturn { json: notification($input.item.json) };\n"
+      },
+      "name": "Build Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        160
+      ],
+      "notes": "HubSpot is deferred (Section 9): the operator gets a plain-text email instead, once per message."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "notify",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Notify Operator?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        160
+      ],
+      "notes": "Only the first time a matched reply, opt-out or bounce is recorded -- and only if NOVASCOUT_OPERATOR_EMAIL was set at build time."
+    },
+    {
+      "parameters": {
+        "fromEmail": "\"Abdullah Amir\" <abdullah@amitrixlabs.com>",
+        "toEmail": "={{ $json.notify_to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "name": "Notify Operator",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        220,
+        160
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "novascoutSmtp01",
+          "name": "SMTP - outreach mailbox"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "To the operator's own inbox, never the outreach mailbox (Section 9). A failure here does not undo the recording above."
+    }
+  ],
+  "connections": {
+    "Sent Folder": {
+      "main": [
+        [
+          {
+            "node": "Normalise Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise Sent": {
+      "main": [
+        [
+          {
+            "node": "Mirror Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inbox": {
+      "main": [
+        [
+          {
+            "node": "Classify Inbound",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Inbound": {
+      "main": [
+        [
+          {
+            "node": "Record Inbound",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Inbound": {
+      "main": [
+        [
+          {
+            "node": "Build Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Notification": {
+      "main": [
+        [
+          {
+            "node": "Notify Operator?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Operator?": {
+      "main": [
+        [
+          {
+            "node": "Notify Operator",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

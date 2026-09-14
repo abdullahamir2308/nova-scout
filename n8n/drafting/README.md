@@ -12,7 +12,7 @@ them verbatim into `../workflows/drafting.json`, and the spec-drift guards parse
 python build_workflow.py        # regenerate the workflow JSON
 node   test_grounding.js        # 75 cases -- the grounding guard
 node   test_assemble.js         # 46 cases -- constraint enforcement
-python test_drift_guards.py     # 27 cases -- each guard is made to fire
+python test_drift_guards.py     # 29 cases -- each guard is made to fire
 ```
 
 ## The grounding guard
@@ -114,15 +114,27 @@ still not his mailbox. He is greeted by name on LinkedIn and not by name over
 email. `Devesh.kumar@innovate-research.com` is the mirror image — a
 personal-shaped address whose owner no source names, so it gets no name either.
 
+## Sender identity
+
+The signature (Section 5: name / one line of title / phone) and the sender name
+the system prompt gives the model come from `NOVASCOUT_SENDER_NAME`,
+`NOVASCOUT_SENDER_TITLE` and `NOVASCOUT_SENDER_PHONE` — the environment if set,
+otherwise the repo's `.env`. Both are baked into the Code nodes at build time,
+so a change means rebuild and re-import.
+
+There is **no default name**. The build used to fall back to "Fatima", and
+because the signature is baked in, a rebuild from any shell without the variable
+set silently signed every future draft as the wrong person. A missing name now
+refuses the build (`test_drift_guards.py` proves it, and proves the `.env`
+fallback lands in the shipped node). A missing title or phone only warns;
+nothing is invented to fill the gap.
+
 ## Known gaps
 
-- **The signature is incomplete.** Section 5 wants name / one line of title /
-  phone; Section 13's mailbox item is still open, so only the name is set and the
-  build prints a warning. Nothing was invented to fill the gap. Set
-  `NOVASCOUT_SENDER_TITLE` / `NOVASCOUT_SENDER_PHONE` and rebuild.
 - **There is no demo URL.** Section 13's 90-second recording does not exist, so
-  drafts reference it in words and carry no link. Set `NOVASCOUT_DEMO_URL` and
-  rebuild; the prompt rule flips from "no links" to "exactly this one URL".
+  drafts reference it in words and carry no link. Set `NOVASCOUT_DEMO_URL` in
+  `.env` and rebuild; the prompt rule flips from "no links" to "exactly this one
+  URL".
 - **The `no-demo` and subject checks are email-only.** The LinkedIn DM is sent by
   a human from their own account (Section 6), so it is held to Section 5's
   message rules only where they make sense.

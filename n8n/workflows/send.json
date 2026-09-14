@@ -1,0 +1,457 @@
+{
+  "id": "send0001",
+  "name": "Send & Track - Send",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      },
+      "name": "Every 10 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1100,
+        40
+      ],
+      "notes": "Section 9: cron, business hours only, randomised intervals. It fires around the clock on purpose: business hours are the RECIPIENT's (UTC-6 to UTC+5:30 across Section 12), so the hour filter lives in Decide Send, per lead. At most one message per tick. Activation is a UI Publish action, never the CLI (Section 3)."
+    },
+    {
+      "parameters": {},
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1100,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "nowoverride",
+              "name": "now_override",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "mingap",
+              "name": "min_gap_min",
+              "value": 20,
+              "type": "number"
+            },
+            {
+              "id": "prob",
+              "name": "send_probability",
+              "value": 0.4,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -880,
+        130
+      ],
+      "notes": "Pacing, not policy: a 20-minute floor since the mailbox's last external send, then a 40% coin flip per 10-minute tick -- irregular gaps of roughly 20-60 minutes (Section 5: 'never a synchronised burst'). The warm-up ceiling is NOT here; it is parsed from Section 5 into Decide Send and re-checked in Claim Send.\n\nnow_override must stay empty. It exists so the dry-run variant can replay a scenario at a fixed instant; the build refuses a shipped workflow with it set."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Load Send State: everything Decide Send needs, in ONE statement so it is one\n-- consistent snapshot.\n--\n-- $1 now_override -- '' in the shipped workflow (checked at build time); set only\n--    in the dry-run variant, so a scenario can be replayed at a fixed instant.\n-- $2 min_gap_min, $3 send_probability -- echoed back so Decide reads nothing but\n--    its own input. A Postgres node replaces the items; whatever Config set is\n--    gone by the time Decide runs (Workflow 4's silent-prompt bug).\nWITH clk AS (\n  SELECT coalesce(nullif($1, '')::timestamptz, now()) AS now\n),\n-- Every outbound message that counts toward the mailbox's daily ceiling: the\n-- Sent-folder mirror (the operator's manual sends and the workflow's own), plus\n-- claims whose SMTP outcome is not known yet.\ncounted AS (\n  SELECT m.sent_at AS at, m.source AS kind\n    FROM mailbox_sent m\n   WHERE m.external\n  UNION ALL\n  SELECT o.sent_at, 'claim'\n    FROM outreach_log o\n   WHERE o.channel = 'email' AND o.message_id IS NULL\n),\ncand AS (\n  SELECT d.id AS draft_id,\n         d.lead_id AS lead_id,\n         d.channel AS channel,\n         d.status AS status,\n         d.variant AS variant,\n         d.subject AS subject,\n         coalesce(d.edited_body, d.body) AS body,\n         l.domain AS domain,\n         l.country AS country,\n         l.status AS lead_status,\n         c.email AS to_addr,\n         coalesce(c.verified, false) AS verified,\n         EXISTS (SELECT 1 FROM blocklist b WHERE lower(l.domain) = b.domain OR lower(l.domain) LIKE '%.' || b.domain) AS lead_domain_blocked,\n         EXISTS (SELECT 1 FROM blocklist b WHERE lower(split_part(c.email, '@', 2)) = b.domain OR lower(split_part(c.email, '@', 2)) LIKE '%.' || b.domain) AS recipient_domain_blocked,\n         (SELECT count(*) FROM outreach_log o WHERE o.lead_id = d.lead_id AND o.channel = 'email')::int AS prior_sends,\n         (SELECT count(*) FROM mailbox_sent m WHERE m.lead_id = d.lead_id AND m.source = 'sent-folder')::int AS prior_manual_sends,\n         (SELECT count(*) FROM drafts f WHERE f.lead_id = d.lead_id AND f.channel = 'email' AND f.status = 'sent' AND f.variant LIKE 'follow-up-%')::int AS follow_ups_sent,\n         EXISTS (SELECT 1 FROM outreach_log o WHERE o.lead_id = d.lead_id AND o.replied) AS replied,\n         EXISTS (SELECT 1 FROM outreach_log o WHERE o.lead_id = d.lead_id AND o.outcome = 'bounced') AS bounced\n    FROM drafts d\n    JOIN leads l ON l.id = d.lead_id\n    LEFT JOIN contacts c ON c.lead_id = d.lead_id\n   WHERE d.channel = 'email'     -- Section 6: LinkedIn is sent by a human. Always.\n     AND d.status = 'approved'   -- Workflow 5: nothing goes out that a human did not approve.\n   ORDER BY d.id\n   LIMIT 200\n)\nSELECT to_char((SELECT now FROM clk) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS clock,\n       $2::int AS min_gap_min,\n       $3::float8 AS send_probability,\n       (SELECT to_char((last_synced_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM mailbox_sync WHERE folder = 'Sent') AS sent_mirror_synced_at,\n       (SELECT to_char((min(counted.at)) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM counted) AS first_external_send_at,\n       (SELECT to_char((max(counted.at)) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM counted, clk WHERE counted.at <= clk.now) AS last_external_send_at,\n       (SELECT coalesce(json_agg(json_build_object('at', to_char((counted.at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), 'kind', counted.kind) ORDER BY counted.at), '[]'::json)\n          FROM counted, clk\n         WHERE counted.at >= clk.now - interval '2 days' AND counted.at < clk.now + interval '2 days') AS recent_sends,\n       (SELECT coalesce(json_agg(json_build_object('message_id', m.message_id, 'sent_at', to_char((m.sent_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')) ORDER BY m.sent_at), '[]'::json)\n          FROM mailbox_sent m\n         WHERE m.source = 'workflow' AND NOT m.seen_in_sent_folder) AS unconfirmed_workflow_sends,\n       (SELECT coalesce(json_agg(row_to_json(cand)), '[]'::json) FROM cand) AS candidates,\n       (SELECT coalesce(json_object_agg(k, n), '{}'::json)\n          FROM (SELECT coalesce(channel, '?') || ':' || coalesce(status, '?') AS k, count(*) AS n\n                  FROM drafts GROUP BY 1) s) AS drafts_by_status;",
+        "options": {
+          "queryReplacement": "={{ [$json.now_override, $json.min_gap_min, $json.send_probability] }}"
+        }
+      },
+      "name": "Load Send State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -660,
+        130
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "One row, one snapshot: the Sent-folder mirror, today's sends and claims, every approved EMAIL draft with the facts each guard needs. LinkedIn drafts are not selected -- not filtered later, never read (Section 6)."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Decide Send -- n8n Code node (Run Once for All Items).\n//\n// Section 9, Workflow 6: \"Send trigger: Cron, business hours only, randomised\n// intervals. Guard: query today's send count; abort if at the warm-up ceiling.\n// Ceiling is enforced in the workflow, not by discipline.\"\n//\n// Every decision the send path takes is made here, from the one row \"Load Send\n// State\" returns and ONE clock value -- so a tick cannot straddle midnight and\n// count \"today\" against two different days. At most one message per tick:\n// Section 5 wants \"irregular send intervals ... never a synchronised burst\".\n//\n// This node is not the last line of defence. \"Claim Send\" re-checks the\n// channel, the approval, the blocklist, the unchanged body and the ceiling in\n// one SQL statement under an advisory lock. A bug here can make the workflow\n// send LESS, never more.\n\n// ---------------------------------------------------------------------------\n// Locked constants. build_workflow.py parses each out of NovaScout_MasterRef.md\n// and refuses to build on drift.\n// ---------------------------------------------------------------------------\n\n// Section 5, warm-up schedule: [week, max sends/day]. The last row is\n// open-ended -- \"Week 4+ | 20 (hard ceiling)\".\nconst WARMUP = [\n  [1, 5],\n  [2, 10],\n  [3, 15],\n  [4, 20],\n];\n\n// Section 5, message rules. Verbatim -- this sentence is the opt-out mechanism.\nconst OPT_OUT = \"If this isn't relevant, reply 'no' and I won't follow up.\";\nconst MAX_URLS = 1;\n\n// Section 9: \"Maximum two follow-ups, then mark lost.\"\nconst MAX_FOLLOW_UPS = 2;\n\n// The day the ceiling counts is the SENDER's day. The ceiling is a property of\n// one mailbox, so it needs one clock: Asia/Karachi, docker-compose's\n// GENERIC_TIMEZONE and the IMAP pre-flight's clock. No DST there, so +05:00 is\n// exact.\nconst SENDER_UTC_OFFSET_MIN = 300;\n\n// Section 5: \"within the recipient's business hours\". The recipient's, not the\n// sender's -- leads span every Section 12 geography, UTC-6 to UTC+5:30.\n//\n// Approximate on purpose: fixed standard-time offsets, no DST (the operator's\n// call, 2026-09-14 -- at 5-20 sends/day an hour of drift is not worth a tz\n// database). The countries that do shift (Poland, Czech Republic, Hungary,\n// Romania, Egypt) run one hour LATER than this table in summer, so a send the\n// table places at 16:30 lands at 17:30 local. Egypt's working week is\n// Sunday-Thursday; everyone else here works Monday-Friday.\n//\n// Keys must be exactly Section 12's geography list -- the build refuses\n// otherwise, so a new target country cannot ship without a clock.\nconst COUNTRY_CLOCKS = {\n  'Turkey':         { utc_offset_min: 180,  weekend: [6, 0] },\n  'Mexico':         { utc_offset_min: -360, weekend: [6, 0] },\n  'India':          { utc_offset_min: 330,  weekend: [6, 0] },\n  'Pakistan':       { utc_offset_min: 300,  weekend: [6, 0] },\n  'Egypt':          { utc_offset_min: 120,  weekend: [5, 6] },\n  'Poland':         { utc_offset_min: 60,   weekend: [6, 0] },\n  'Romania':        { utc_offset_min: 120,  weekend: [6, 0] },\n  'Hungary':        { utc_offset_min: 60,   weekend: [6, 0] },\n  'Czech Republic': { utc_offset_min: 60,   weekend: [6, 0] },\n  'UAE':            { utc_offset_min: 240,  weekend: [6, 0] },\n  'South Africa':   { utc_offset_min: 120,  weekend: [6, 0] },\n  'Brazil':         { utc_offset_min: -180, weekend: [6, 0] },\n  'Argentina':      { utc_offset_min: -180, weekend: [6, 0] },\n};\n\n// Local business hours, minutes after local midnight, half-open [start, end).\nconst BUSINESS_START_MIN = 9 * 60;\nconst BUSINESS_END_MIN = 17 * 60;\n\n// A workflow send the Sent-folder mirror has not seen after this long means the\n// mirror is not reading the folder. Zoho files a submitted message into Sent\n// within seconds; fifteen minutes is generous.\nconst MIRROR_GRACE_MIN = 15;\n\n// The signature this build signs with (Section 5: name / title / phone). A body\n// that does not carry it -- opt-out line, blank line, signature -- was drafted\n// under a different identity or had its compliance footer edited. Substituted\n// at build time.\nconst SIGNATURE = \"Abdullah Amir\\nFounder, Amitrix Labs\\n+923178485713\";\n\n// ---------------------------------------------------------------------------\n// Helpers\n// ---------------------------------------------------------------------------\n\nconst MS_MIN = 60 * 1000;\nconst MS_DAY = 24 * 60 * MS_MIN;\n\nconst URL_RE = /\\b(?:https?:\\/\\/|www\\.)[^\\s<>()]+/gi;\nconst EMAIL_RE = /^[^\\s@<>(),;:\"']+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$/;\n\nfunction str(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\nfunction ms(v) {\n  if (v === null || v === undefined || v === '') return null;\n  const t = new Date(v).getTime();\n  return isNaN(t) ? null : t;\n}\n\nfunction iso(t) {\n  return new Date(t).toISOString();\n}\n\n// What gets checked is what gets sent: line endings normalised, trailing\n// whitespace off each line (a grid editor adds both), nothing else touched.\nfunction normaliseBody(v) {\n  return String(v === null || v === undefined ? '' : v)\n    .replace(/\\r\\n?/g, '\\n')\n    .replace(/[ \\t]+\\n/g, '\\n')\n    .trim();\n}\n\nfunction countUrls(v) {\n  const m = String(v).match(URL_RE);\n  return m ? m.length : 0;\n}\n\nfunction ceilingForWeek(week) {\n  let cap = null;\n  for (let i = 0; i < WARMUP.length; i++) {\n    if (week >= WARMUP[i][0]) cap = WARMUP[i][1];\n  }\n  if (cap === null) throw new Error('no warm-up row covers week ' + week);\n  return cap;\n}\n\n// 'YYYY-MM-DD' of the sender's calendar day containing instant t.\nfunction senderDay(t) {\n  return new Date(t + SENDER_UTC_OFFSET_MIN * MS_MIN).toISOString().slice(0, 10);\n}\n\n// The UTC instant at which sender-day `day` begins.\nfunction senderDayStart(day) {\n  return Date.parse(day + 'T00:00:00Z') - SENDER_UTC_OFFSET_MIN * MS_MIN;\n}\n\n// The same derivation the IMAP pre-flight printed: warm-up starts on the day\n// of the first external send; week = floor(days since then / 7) + 1. An empty\n// history is \"not started\" and the first send is day 1 of week 1 -- derived\n// from the mailbox, not assumed.\nfunction warmupState(state, clock) {\n  const today = senderDay(clock);\n  const dayStart = senderDayStart(today);\n  const dayEnd = dayStart + MS_DAY;\n  const first = ms(state.first_external_send_at);\n  let dayIndex = 0;\n  let firstDay = null;\n  if (first !== null) {\n    firstDay = senderDay(first);\n    dayIndex = Math.max(0, Math.round((senderDayStart(today) - senderDayStart(firstDay)) / MS_DAY));\n  }\n  const week = Math.floor(dayIndex / 7) + 1;\n  const ceiling = ceilingForWeek(week);\n  const sends = (state.recent_sends || []).map(function (s) { return ms(s.at); }).filter(function (t) {\n    return t !== null;\n  });\n  const sentToday = sends.filter(function (t) { return t >= dayStart && t < dayEnd; }).length;\n  return {\n    history: first === null ? 'empty' : 'mirrored',\n    first_send_day: firstDay,\n    sender_day: today,\n    day_index: dayIndex,\n    week: week,\n    ceiling: ceiling,\n    sent_today: sentToday,\n    remaining: Math.max(0, ceiling - sentToday),\n    day_start: iso(dayStart),\n    day_end: iso(dayEnd),\n  };\n}\n\n// Local wall-clock for a country at instant t, and whether it is business time.\nfunction localClock(country, t) {\n  const zone = COUNTRY_CLOCKS[str(country)];\n  if (!zone) return null;\n  const local = new Date(t + zone.utc_offset_min * MS_MIN);\n  const minutes = local.getUTCHours() * 60 + local.getUTCMinutes();\n  const dow = local.getUTCDay();\n  const weekend = zone.weekend.indexOf(dow) !== -1;\n  const hh = String(local.getUTCHours()).padStart(2, '0');\n  const mm = String(local.getUTCMinutes()).padStart(2, '0');\n  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];\n  return {\n    local: days[dow] + ' ' + hh + ':' + mm,\n    in_window: !weekend && minutes >= BUSINESS_START_MIN && minutes < BUSINESS_END_MIN,\n  };\n}\n\n// Why this approved email draft may not be sent at all, or null if it may.\n// Business hours are NOT checked here -- an out-of-hours draft is eligible,\n// just not yet.\nfunction ineligibility(c) {\n  if (str(c.channel) !== 'email') {\n    // Section 6: \"LinkedIn sending is manual. Always. No exceptions.\" The query\n    // already filters on channel, so reaching this line means the SQL changed.\n    // Throwing stops the whole tick rather than quietly skipping.\n    throw new Error('Section 6 violation: a ' + JSON.stringify(c.channel) +\n      ' draft reached the send path (draft ' + c.draft_id + ')');\n  }\n  if (str(c.status) !== 'approved') return 'not-approved';\n  const followUp = /^follow-up-/.test(str(c.variant));\n  const body = normaliseBody(c.body);\n\n  if (followUp) {\n    if (str(c.lead_status) !== 'sent') return 'lead-status:' + str(c.lead_status);\n    if (!(Number(c.prior_sends) > 0)) return 'follow-up-without-first-touch';\n    if (Number(c.follow_ups_sent) >= MAX_FOLLOW_UPS) return 'follow-ups-exhausted';\n  } else {\n    if (['drafted', 'approved'].indexOf(str(c.lead_status)) === -1) return 'lead-status:' + str(c.lead_status);\n    if (Number(c.prior_sends) > 0 || Number(c.prior_manual_sends) > 0) return 'already-contacted';\n  }\n  if (c.replied) return 'lead-replied';\n  if (c.bounced) return 'lead-bounced';\n  if (c.lead_domain_blocked) return 'blocklisted-domain';\n  if (c.recipient_domain_blocked) return 'blocklisted-recipient-domain';\n\n  // Section 9 Workflow 3b: \"contacts.verified ... Workflow 6 is the consumer;\n  // this is the flag a send gates on.\"\n  if (!c.verified) return 'contact-unverified';\n  if (!EMAIL_RE.test(str(c.to_addr))) return 'no-valid-address';\n\n  if (/^low-context/.test(str(c.variant)) || /^NOT DRAFTED/.test(body)) return 'low-context';\n  if (!str(c.subject)) return 'no-subject';\n  if (body.indexOf(OPT_OUT) === -1) return 'no-opt-out';\n  if (body.indexOf(OPT_OUT + '\\n\\n' + SIGNATURE) === -1) return 'stale-signature';\n  if (countUrls(body) > MAX_URLS) return 'too-many-urls';\n  if (!COUNTRY_CLOCKS[str(c.country)]) return 'unknown-country:' + str(c.country);\n  return null;\n}\n\nfunction decide(state, rng) {\n  const clock = ms(state.clock);\n  if (clock === null) throw new Error('Load Send State returned no clock');\n  const minGap = Number(state.min_gap_min);\n  const probability = Number(state.send_probability);\n\n  const w = warmupState(state, clock);\n  const eligible = [];\n  const excluded = [];\n  const candidates = (state.candidates || []).slice().sort(function (a, b) {\n    return Number(a.draft_id) - Number(b.draft_id);\n  });\n  for (let i = 0; i < candidates.length; i++) {\n    const c = candidates[i];\n    const why = ineligibility(c);\n    if (why) {\n      excluded.push({ draft_id: c.draft_id, lead_id: c.lead_id, domain: c.domain, reason: why });\n      continue;\n    }\n    const lc = localClock(c.country, clock);\n    eligible.push({\n      draft_id: c.draft_id,\n      lead_id: c.lead_id,\n      domain: c.domain,\n      country: c.country,\n      local_time: lc.local,\n      in_window: lc.in_window,\n    });\n  }\n\n  const out = {\n    send: false,\n    reason: null,\n    detail: null,\n    clock: iso(clock),\n    warmup: w,\n    eligible: eligible,\n    excluded: excluded,\n    payload: null,\n  };\n  function stop(reason, detail) {\n    out.reason = reason;\n    out.detail = detail;\n    return out;\n  }\n\n  // 1. Can the count be trusted at all? The ceiling is only as good as the Sent\n  //    history behind it, and a mirror that never ran or has stopped reading\n  //    the folder undercounts the operator's manual sends without any error.\n  if (!state.sent_mirror_synced_at) {\n    return stop('sent-mirror-never-ran',\n      'The Sent-folder mirror has never read the mailbox, so the manual warm-up sends are ' +\n      'invisible to the ceiling. Publish the Mailbox Watch workflow; it syncs on activation ' +\n      'once the Sent folder holds a message.');\n  }\n  const behind = (state.unconfirmed_workflow_sends || []).filter(function (s) {\n    const t = ms(s.sent_at);\n    return t !== null && clock - t > MIRROR_GRACE_MIN * MS_MIN;\n  });\n  if (behind.length) {\n    return stop('sent-mirror-behind',\n      behind.length + ' workflow send(s) older than ' + MIRROR_GRACE_MIN + ' min have not appeared ' +\n      'in the Sent folder mirror (first: ' + behind[0].message_id + '). The mirror is not reading ' +\n      'the folder, so today\\'s count cannot be trusted.');\n  }\n\n  // 2. The warm-up ceiling (Section 5). A mailbox-level abort: nothing below\n  //    this line can override it.\n  if (w.sent_today >= w.ceiling) {\n    return stop('ceiling-reached',\n      'Week ' + w.week + ' ceiling is ' + w.ceiling + '/day; ' + w.sent_today +\n      ' external send(s) already on sender-day ' + w.sender_day + '.');\n  }\n\n  // 3. Is there anything to send, and is its recipient at work?\n  if (!eligible.length) {\n    return stop('no-eligible-draft', 'No approved email draft passes the send checks.');\n  }\n  const now = eligible.filter(function (e) { return e.in_window; });\n  if (!now.length) {\n    return stop('no-recipient-in-business-hours',\n      eligible.length + ' eligible draft(s), none inside the recipient\\'s business hours right now.');\n  }\n\n  // 4. Pacing. Irregular intervals, never a burst: a floor on the gap since the\n  //    mailbox's last external send (manual or not), then a coin flip per tick.\n  const last = ms(state.last_external_send_at);\n  if (last !== null && minGap > 0 && clock - last < minGap * MS_MIN) {\n    return stop('min-gap',\n      'Last external send was ' + Math.round((clock - last) / MS_MIN) + ' min ago; minimum gap is ' +\n      minGap + ' min.');\n  }\n  if (!(rng() < probability)) {\n    return stop('random-gate', 'Skipped this tick at random (p=' + probability + ') to keep intervals irregular.');\n  }\n\n  // 5. Oldest approved draft first -- Section 7's queue rule.\n  const pick = now[0];\n  const c = candidates.filter(function (x) { return x.draft_id === pick.draft_id; })[0];\n  out.send = true;\n  out.reason = 'send';\n  out.detail = 'Sending draft ' + c.draft_id + ' to ' + c.domain + ' (' + c.country + ', ' +\n    pick.local_time + ' local). Send ' + (w.sent_today + 1) + ' of ' + w.ceiling + ' today.';\n  out.payload = {\n    draft_id: c.draft_id,\n    lead_id: c.lead_id,\n    to_addr: str(c.to_addr),\n    subject: str(c.subject),\n    body: normaliseBody(c.body),\n    raw_body: c.body,\n    clock: iso(clock),\n    day_start: w.day_start,\n    day_end: w.day_end,\n    ceiling: w.ceiling,\n  };\n  return out;\n}\n\n// ---------------------------------------------------------------------------\n// Node body\n// ---------------------------------------------------------------------------\n\nconst state = $input.first().json;\nreturn [{ json: decide(state, Math.random) }];\n"
+      },
+      "name": "Decide Send",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -440,
+        130
+      ],
+      "notes": "Every decision, from one row and one clock: Sent mirror trustworthy -> warm-up week and ceiling (Section 5, parsed from the doc) -> per-draft checks -> recipient business hours -> pacing. Emits exactly one item: send true with one payload, or send false with the reason."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "send",
+              "leftValue": "={{ $json.send }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Send Now?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -220,
+        130
+      ],
+      "notes": "False ends the tick. The reason is in Decide Send's output for anyone reading the execution."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Claim Send: the last line of defence, in one statement under one lock.\n--\n-- Decide Send chose this draft moments ago. Everything that makes a send\n-- permissible is re-checked HERE, atomically, because this is where the draft\n-- actually flips -- a bug in Decide can make the workflow send less, never more:\n--   Section 6   channel = 'email'\n--   Workflow 5  status = 'approved', and the body unchanged since Decide read it\n--   Section 9   contact verified, domain and recipient domain not blocklisted,\n--               no reply or bounce on this lead\n--   Section 5   today's external sends, re-counted, below the ceiling\n--\n-- The advisory lock is its own statement on purpose. The Postgres node runs\n-- this text as one multi-statement query, i.e. one implicit transaction; under\n-- READ COMMITTED each statement takes a fresh snapshot, so the claim below is\n-- counted AFTER any concurrent claim that held the lock has committed. (Inside\n-- a single statement the snapshot would predate the lock, and two overlapping\n-- ticks could both see 4 of 5 and both send.)\n--\n-- The draft flips to 'sent' and the outreach_log claim row is written BEFORE\n-- the SMTP call: a crash between sending and logging then leaves a claim, not\n-- an 'approved' draft that goes out again next tick. At-most-once, on purpose.\nDO $$ BEGIN PERFORM pg_advisory_xact_lock(hashtext('novascout.workflow6.send')); END $$;\nWITH p AS (\n  SELECT $1::jsonb AS p\n),\ncounted AS (\n  SELECT m.message_id AS k\n    FROM mailbox_sent m, p\n   WHERE m.external\n     AND m.sent_at >= (p.p->>'day_start')::timestamptz\n     AND m.sent_at <  (p.p->>'day_end')::timestamptz\n  UNION ALL\n  SELECT 'claim:' || o.id\n    FROM outreach_log o, p\n   WHERE o.channel = 'email' AND o.message_id IS NULL\n     AND o.sent_at >= (p.p->>'day_start')::timestamptz\n     AND o.sent_at <  (p.p->>'day_end')::timestamptz\n),\nd AS (\n  UPDATE drafts d\n     SET status = 'sent'\n    FROM p, leads l, contacts c\n   WHERE d.id = (p.p->>'draft_id')::bigint\n     AND d.channel = 'email'\n     AND d.status = 'approved'\n     AND coalesce(d.edited_body, d.body) = p.p->>'raw_body'\n     AND l.id = d.lead_id\n     AND c.lead_id = d.lead_id\n     AND c.verified\n     AND lower(c.email) = lower(p.p->>'to_addr')\n     AND l.status IN ('drafted', 'approved', 'sent')\n     AND NOT EXISTS (SELECT 1 FROM blocklist b WHERE lower(l.domain) = b.domain OR lower(l.domain) LIKE '%.' || b.domain)\n     AND NOT EXISTS (SELECT 1 FROM blocklist b WHERE lower(split_part(c.email, '@', 2)) = b.domain OR lower(split_part(c.email, '@', 2)) LIKE '%.' || b.domain)\n     AND NOT EXISTS (SELECT 1 FROM outreach_log o\n                      WHERE o.lead_id = d.lead_id AND (o.replied OR o.outcome = 'bounced'))\n     AND (d.variant LIKE 'follow-up-%'\n          OR NOT EXISTS (SELECT 1 FROM outreach_log o WHERE o.lead_id = d.lead_id AND o.channel = 'email'))\n     AND (SELECT count(*) FROM counted) < (p.p->>'ceiling')::int\n  RETURNING d.id, d.lead_id\n),\no AS (\n  INSERT INTO outreach_log (lead_id, draft_id, channel, sent_at, message_body)\n  SELECT d.lead_id, d.id, 'email', (p.p->>'clock')::timestamptz, p.p->>'body'\n    FROM d, p\n  RETURNING id\n)\nSELECT (SELECT count(*) FROM d) = 1       AS claimed,\n       (SELECT id FROM o)                  AS outreach_id,\n       (p.p->>'draft_id')::bigint          AS draft_id,\n       (p.p->>'lead_id')::bigint           AS lead_id,\n       p.p->>'to_addr'                     AS to_addr,\n       p.p->>'subject'                     AS subject,\n       p.p->>'body'                        AS body,\n       p.p->>'clock'                       AS clock,\n       (SELECT count(*) FROM counted)::int AS sent_today_before,\n       (p.p->>'ceiling')::int              AS ceiling\n  FROM p;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.payload)] }}"
+        }
+      },
+      "name": "Claim Send",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        0,
+        40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "The last line of defence: channel, approval, unchanged body, verified contact, blocklist, reply and the Section 5 ceiling, all re-checked in one statement under an advisory lock, and the draft flipped to 'sent' with a claim row BEFORE the SMTP call (at-most-once)."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "claimed",
+              "leftValue": "={{ $json.claimed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Claimed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        220,
+        40
+      ],
+      "notes": "False means the draft changed between Decide and Claim, or the recount hit the ceiling. Nothing is sent."
+    },
+    {
+      "parameters": {
+        "fromEmail": "\"Abdullah Amir\" <abdullah@amitrixlabs.com>",
+        "toEmail": "={{ $json.to_addr }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.body }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "name": "Send Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        440,
+        -40
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "novascoutSmtp01",
+          "name": "SMTP - outreach mailbox"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "SMTP -> the outreach mailbox (Section 2). Plain text, no attribution, one recipient. Continue-on-error so a failure reaches Check SMTP Result instead of stranding the claim. No retry: a timeout after the server accepted would send twice."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Check SMTP Result -- n8n Code node (Run Once for Each Item).\n//\n// The Send Email node runs with \"continue on error\", so a failed send arrives\n// here as an ordinary item ({ error: \"...\" }) instead of stopping the\n// execution. That matters: Claim Send has already flipped the draft to 'sent'\n// and written a claim row, and a hard stop would strand both -- the draft would\n// read as sent when nothing went out.\n//\n// Three outcomes:\n//   ok        -- the server accepted the message for this recipient. Confirm.\n//   account   -- nothing went out, and not because of this draft: auth, TLS,\n//                DNS, a timeout, a 4xx deferral. The draft goes back to\n//                'approved' and the next tick retries.\n//   recipient -- the server permanently refused THIS address. Retrying cannot\n//                help and would stall every draft queued behind it, so the\n//                draft goes back to 'pending' -- the reviewer's queue -- tagged\n//                `+smtp-rejected`, where a human can see it and fix the contact.\n\nconst OWN_DOMAIN = \"amitrixlabs.com\";\n\nfunction str(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\nfunction domainOf(addr) {\n  const s = str(addr).toLowerCase();\n  const i = s.lastIndexOf('@');\n  return i === -1 ? '' : s.slice(i + 1).replace(/[>\\s]+$/, '');\n}\n\nfunction lowerList(v) {\n  return (Array.isArray(v) ? v : []).map(function (a) {\n    return str(a && typeof a === 'object' ? a.address : a).toLowerCase();\n  });\n}\n\n// Checked in this order. A sender, relay or auth problem is ours even when the\n// server phrases it as \"all recipients were rejected\"; only after that does a\n// recipient-shaped failure count as the address's fault.\nconst OURS = /sender address|mail from|relay|auth|login|credential|\\b53[0-8]\\b|\\b5\\.7\\.\\d+\\b/i;\nconst THE_ADDRESS = /recipient address rejected|user unknown|unknown user|no such user|mailbox (?:unavailable|not found|does not exist)|does not exist|invalid recipient|all recipients were rejected|\\b5\\.1\\.\\d+\\b/i;\nconst TRANSIENT = /tls|ssl|certificate|timeout|timed out|connect|econn|enotfound|eai_again|esocket|etimedout|greeting|\\b4\\d\\d\\b|\\b4\\.\\d+\\.\\d+\\b/i;\n\nfunction classifyFailure(text) {\n  const t = str(text);\n  if (OURS.test(t)) return 'account';\n  if (THE_ADDRESS.test(t)) return 'recipient';\n  if (TRANSIENT.test(t)) return 'account';\n  if (/\\b5\\d\\d\\b/.test(t)) return 'recipient';\n  // Unknown: assume it was not the address. A retry costs one tick; wrongly\n  // bouncing a good draft back to review costs a human's attention.\n  return 'account';\n}\n\nfunction checkResult(claim, resp) {\n  const to = str(claim.to_addr).toLowerCase();\n  const r = resp && typeof resp === 'object' ? resp : {};\n  const accepted = lowerList(r.accepted);\n  const rejected = lowerList(r.rejected);\n  const messageId = str(r.messageId);\n  let error = str(r.error);\n  if (!error) {\n    if (rejected.indexOf(to) !== -1) error = 'rejected by server: ' + str(r.response);\n    else if (accepted.indexOf(to) === -1) error = 'recipient not in the accepted list: ' + JSON.stringify(r.accepted || null);\n    else if (!messageId) error = 'server accepted the message but no Message-ID came back';\n  }\n  const ok = !error;\n  const failure = ok ? null : classifyFailure(error);\n  return {\n    ok: ok,\n    failure: failure,\n    payload: {\n      outreach_id: claim.outreach_id,\n      draft_id: claim.draft_id,\n      lead_id: claim.lead_id,\n      to_addr: to,\n      message_id: ok ? messageId : null,\n      external: domainOf(to) !== OWN_DOMAIN,\n      clock: claim.clock,\n      smtp_response: str(r.response).slice(0, 500) || null,\n      error: error ? error.slice(0, 500) : null,\n      failure: failure,\n    },\n  };\n}\n\n// ---------------------------------------------------------------------------\n// Node body\n// ---------------------------------------------------------------------------\n\nconst claim = $('Claim Send').item.json;\nreturn { json: checkResult(claim, $input.item.json) };\n"
+      },
+      "name": "Check SMTP Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        -40
+      ],
+      "notes": "ok -> confirm. account failure (auth, TLS, DNS, 4xx) -> back to approved, retried next tick. recipient failure (5xx on the address) -> back to pending, tagged +smtp-rejected, for a human."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ok",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Sent OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        -40
+      ],
+      "notes": "Accepted by the server, with a Message-ID."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Confirm Send: SMTP accepted the message. Record its Message-ID on the claim\n-- (replies thread on it), advance the lead, and put the send in mailbox_sent\n-- NOW -- so it counts toward the ceiling before the Sent-folder mirror notices\n-- it. When the mirror does, it only sets seen_in_sent_folder on this row.\nWITH p AS (\n  SELECT $1::jsonb AS p\n),\no AS (\n  UPDATE outreach_log o\n     SET message_id = p.p->>'message_id'\n    FROM p\n   WHERE o.id = (p.p->>'outreach_id')::bigint\n     AND o.message_id IS NULL\n  RETURNING o.id, o.lead_id, o.sent_at\n),\nl AS (\n  UPDATE leads l\n     SET status = 'sent', updated_at = now()\n    FROM o\n   WHERE l.id = o.lead_id\n     AND l.status IN ('drafted', 'approved')\n  RETURNING l.id\n),\nm AS (\n  INSERT INTO mailbox_sent (message_id, sent_at, recipients, external, lead_id, source)\n  SELECT p.p->>'message_id', o.sent_at, ARRAY[p.p->>'to_addr'], (p.p->>'external')::boolean, o.lead_id, 'workflow'\n    FROM o, p\n  ON CONFLICT (message_id) DO UPDATE SET lead_id = EXCLUDED.lead_id, source = 'workflow'\n  RETURNING message_id\n)\nSELECT (SELECT count(*) FROM o)::int AS confirmed,\n       (SELECT count(*) FROM l)::int AS lead_advanced,\n       (SELECT message_id FROM m)    AS message_id,\n       (p.p->>'draft_id')::bigint    AS draft_id\n  FROM p;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.payload)] }}"
+        }
+      },
+      "name": "Confirm Send",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1100,
+        -120
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Message-ID onto the claim, lead -> 'sent', and the send into mailbox_sent immediately so it counts before the Sent mirror notices it."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Revert Claim: SMTP did not accept the message, so nothing went out. Remove\n-- the claim (it would otherwise count toward the ceiling forever) and hand the\n-- draft back:\n--   account failure   -> 'approved'; the next tick retries\n--   recipient failure -> 'pending' + '+smtp-rejected', back to a human; retrying\n--                        a refused address would stall the whole queue behind it\nWITH p AS (\n  SELECT $1::jsonb AS p\n),\no AS (\n  DELETE FROM outreach_log o\n   USING p\n   WHERE o.id = (p.p->>'outreach_id')::bigint\n     AND o.message_id IS NULL\n  RETURNING o.id\n),\nd AS (\n  UPDATE drafts d\n     SET status  = CASE WHEN p.p->>'failure' = 'recipient' THEN 'pending' ELSE 'approved' END,\n         variant = CASE WHEN p.p->>'failure' = 'recipient' AND coalesce(d.variant, '') NOT LIKE '%smtp-rejected%'\n                        THEN coalesce(d.variant, '') || '+smtp-rejected'\n                        ELSE d.variant END\n    FROM p\n   WHERE d.id = (p.p->>'draft_id')::bigint\n     AND d.status = 'sent'\n  RETURNING d.status, d.variant\n)\nSELECT (SELECT count(*) FROM o)::int AS claim_removed,\n       (SELECT status FROM d)         AS draft_status,\n       (SELECT variant FROM d)        AS draft_variant,\n       p.p->>'failure'                AS failure,\n       p.p->>'error'                  AS error\n  FROM p;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.payload)] }}"
+        }
+      },
+      "name": "Revert Claim",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1100,
+        40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Nothing went out: the claim is removed and the draft handed back."
+    }
+  ],
+  "connections": {
+    "Every 10 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Load Send State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Send State": {
+      "main": [
+        [
+          {
+            "node": "Decide Send",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Send": {
+      "main": [
+        [
+          {
+            "node": "Send Now?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Now?": {
+      "main": [
+        [
+          {
+            "node": "Claim Send",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Claim Send": {
+      "main": [
+        [
+          {
+            "node": "Claimed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claimed?": {
+      "main": [
+        [
+          {
+            "node": "Send Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Send Email": {
+      "main": [
+        [
+          {
+            "node": "Check SMTP Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check SMTP Result": {
+      "main": [
+        [
+          {
+            "node": "Sent OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sent OK?": {
+      "main": [
+        [
+          {
+            "node": "Confirm Send",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Revert Claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

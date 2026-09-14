@@ -7,8 +7,8 @@ byte-identical to the JS that ships inside the workflow.
 This generator holds the spec-drift guards for Workflow 4. Workflow 4 is the
 node where a drift is most expensive, because its failure mode is not a wrong
 number in a database -- it is a fabricated sentence sent to a real person under
-Fatima's name. So more of the spec is parsed and asserted here than anywhere
-else in the project:
+the sender's own name. So more of the spec is parsed and asserted here than
+anywhere else in the project:
 
     Section 9  grounding threshold      -> "at least two specific facts"
     Section 9  grounding fact vocabulary-> "(therapeutic area, named trial, ...)"
@@ -52,22 +52,86 @@ PG_CRED = {"postgres": {"id": "novascoutPg01", "name": "Postgres - novascout"}}
 # ---------------------------------------------------------------------------
 # Sender identity (Section 5, "Signature: name, one line of title, phone.")
 #
-# Section 13 still lists the outreach domain, the mailbox and the demo recording
-# as open items owned by Fatima. Nothing here invents a value to fill that gap:
-# an unset field is simply omitted from the signature, and the build prints a
-# warning naming what Section 5 wants and Section 13 still blocks. A cold email
-# carrying a plausible-looking phone number that belongs to nobody is worse than
-# one carrying no phone number at all.
+# Read from the environment, falling back to the repo's .env -- the file
+# docker-compose already reads, gitignored, and visible to every shell and
+# every future session without a restart. (A Windows user variable is not: a
+# terminal opened before it was set never sees it.) A real environment
+# variable wins over .env, the usual dotenv precedence.
+#
+# There is deliberately NO default name. There used to be one, "Fatima", and
+# the signature is baked into the Code node at build time -- so a rebuild from
+# any shell without the variable set silently signed every future draft as the
+# wrong person, with nothing to say it had happened. A missing name now
+# refuses the build.
+#
+# Title and phone still only warn when unset. Nothing is invented to fill the
+# gap: a cold email carrying a plausible-looking phone number that belongs to
+# nobody is worse than one carrying no phone number at all.
 # ---------------------------------------------------------------------------
 
-SENDER_NAME = os.environ.get("NOVASCOUT_SENDER_NAME", "Fatima")
-SENDER_TITLE = os.environ.get("NOVASCOUT_SENDER_TITLE", "")
-SENDER_PHONE = os.environ.get("NOVASCOUT_SENDER_PHONE", "")
+ENV_FILE = os.environ.get("NOVASCOUT_ENV_FILE", os.path.join(HERE, "..", "..", ".env"))
 
-# Section 13: "90-second Nova demo screen recording | Fatima". Until that exists
-# there is no URL to send, and Section 5 allows at most one. Empty means the
-# drafts reference the recording in words and carry no link at all.
-DEMO_URL = os.environ.get("NOVASCOUT_DEMO_URL", "")
+_BUILD_SETTINGS = (
+    "NOVASCOUT_SENDER_NAME",
+    "NOVASCOUT_SENDER_TITLE",
+    "NOVASCOUT_SENDER_PHONE",
+    "NOVASCOUT_DEMO_URL",
+)
+
+
+def _env_file_values(path, keys):
+    """Just `keys` from a dotenv file. The same file holds credentials this
+    build has no business reading, so nothing else is kept."""
+    vals = {}
+    if not os.path.isfile(path):
+        return vals
+    with io.open(path, encoding="utf-8-sig") as fh:
+        for ln in fh:
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            k, v = ln.split("=", 1)
+            k = k.strip()
+            if k not in keys:
+                continue
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                v = v[1:-1]
+            vals[k] = v
+    return vals
+
+
+_FILE_SETTINGS = _env_file_values(ENV_FILE, _BUILD_SETTINGS)
+
+
+def _setting(key):
+    """(value, where it came from). An empty environment variable does not
+    shadow a real value in .env."""
+    v = os.environ.get(key, "").strip()
+    if v:
+        return v, "environment"
+    v = _FILE_SETTINGS.get(key, "").strip()
+    if v:
+        return v, os.path.abspath(ENV_FILE)
+    return "", None
+
+
+SENDER_NAME, SENDER_SOURCE = _setting("NOVASCOUT_SENDER_NAME")
+SENDER_TITLE, _ = _setting("NOVASCOUT_SENDER_TITLE")
+SENDER_PHONE, _ = _setting("NOVASCOUT_SENDER_PHONE")
+
+if not SENDER_NAME:
+    raise AssertionError(
+        "NOVASCOUT_SENDER_NAME is not set -- not in the environment and not in %s.\n"
+        "Every email draft is signed with it and the system prompt names it. There\n"
+        "is deliberately no default: a default name is how drafts came to be signed\n"
+        "by the wrong person. Add it to .env and rebuild." % os.path.abspath(ENV_FILE)
+    )
+
+# Section 13: "90-second Nova demo screen recording". Until that exists there
+# is no URL to send, and Section 5 allows at most one. Empty means the drafts
+# reference the recording in words and carry no link at all.
+DEMO_URL, _ = _setting("NOVASCOUT_DEMO_URL")
 
 SIGNATURE = "\n".join([p for p in [SENDER_NAME, SENDER_TITLE, SENDER_PHONE] if p])
 
@@ -413,7 +477,7 @@ _link_rule = (
 
 SYSTEM_PROMPT = "\n".join([
     "You are writing one cold email and one LinkedIn DM to a specific contract",
-    "research organisation (CRO). Fatima, who runs Nova, sends them.",
+    "research organisation (CRO). " + SENDER_NAME + ", who runs Nova, sends them.",
     "",
     "THE ONE RULE THAT MATTERS MOST: one sentence, one fact.",
     "",
@@ -956,6 +1020,7 @@ print("  min facts: %d, fact kinds: %r" % (MIN_FACTS, FACT_KINDS))
 print("  max words: %d, url cap parsed, banned adjectives named in doc: %r" % (MAX_WORDS, BANNED_NAMED))
 print("  drafting inference: temperature=%s presence_penalty=%s" % (DRAFT_TEMPERATURE, DRAFT_PRESENCE_PENALTY))
 print("  opt-out: %r" % OPT_OUT)
+print("  signature: %r (from %s)" % (SIGNATURE, SENDER_SOURCE))
 
 _gaps = []
 if not SENDER_TITLE:
@@ -967,11 +1032,11 @@ if _gaps:
         "\n  WARNING: Section 5 wants a signature of name / one line of title / phone.\n"
         "  Missing: %s. Nothing was invented to fill the gap -- drafts ship with\n"
         "  the signature %r. Set NOVASCOUT_SENDER_TITLE / NOVASCOUT_SENDER_PHONE\n"
-        "  and rebuild once Section 13's mailbox item is closed." % (", ".join(_gaps), SIGNATURE)
+        "  in .env and rebuild." % (", ".join(_gaps), SIGNATURE)
     )
 if not DEMO_URL:
     print(
         "  WARNING: Section 13's '90-second Nova demo screen recording' is still open,\n"
         "  so there is no URL to send. Drafts reference the recording in words and\n"
-        "  carry no link. Set NOVASCOUT_DEMO_URL and rebuild once it exists."
+        "  carry no link. Set NOVASCOUT_DEMO_URL in .env and rebuild once it exists."
     )
