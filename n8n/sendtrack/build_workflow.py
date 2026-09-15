@@ -81,8 +81,12 @@ _BUILD_SETTINGS = (
     "NOVASCOUT_SENDER_TITLE",
     "NOVASCOUT_SENDER_PHONE",
     "NOVASCOUT_MAILBOX_ADDRESS",
-    "NOVASCOUT_OPERATOR_EMAIL",
 )
+# NOVASCOUT_OPERATOR_EMAIL is deliberately not a build setting. Mailbox Watch
+# reads the operator's notification address at runtime from the settings table
+# (migration 008, written by sync_settings.py), so it never lands in a committed
+# workflow -- and the guard after SHIPPED refuses any literal address other than
+# the sender's own From.
 
 
 def _env_file_values(path, keys):
@@ -121,7 +125,6 @@ SENDER_NAME = _setting("NOVASCOUT_SENDER_NAME")
 SENDER_TITLE = _setting("NOVASCOUT_SENDER_TITLE")
 SENDER_PHONE = _setting("NOVASCOUT_SENDER_PHONE")
 MAILBOX = _setting("NOVASCOUT_MAILBOX_ADDRESS")
-OPERATOR_EMAIL = _setting("NOVASCOUT_OPERATOR_EMAIL")
 
 if not SENDER_NAME:
     raise AssertionError(
@@ -136,14 +139,6 @@ if not EMAIL_RE.match(MAILBOX):
         "external send for the warm-up ceiling." % MAILBOX
     )
 OWN_DOMAIN = MAILBOX.rsplit("@", 1)[1].lower()
-if OPERATOR_EMAIL:
-    if not EMAIL_RE.match(OPERATOR_EMAIL):
-        raise AssertionError("NOVASCOUT_OPERATOR_EMAIL %r is not an email address" % OPERATOR_EMAIL)
-    if OPERATOR_EMAIL.lower() == MAILBOX.lower():
-        raise AssertionError(
-            "NOVASCOUT_OPERATOR_EMAIL is the outreach mailbox itself. Section 9: the reply "
-            "notification goes to 'the operator's own inbox (not the outreach mailbox)'."
-        )
 
 # Section 5: "Signature: name, one line of title, phone." Composed exactly as the
 # drafting build composes it -- the send path refuses any body not carrying it.
@@ -669,6 +664,13 @@ SELECT (SELECT count(*) FROM up WHERE inserted)::int     AS new_rows,
        (SELECT __ISO_S__ FROM s)                         AS synced_at
   FROM p;""".replace("__ISO_S__", iso("s.last_synced_at"))
 
+LOAD_SETTINGS_SQL = """-- Load Settings: the operator's notification address, read at runtime from the
+-- settings table (migration 008; written from .env by sync_settings.py), so it
+-- is never baked into this workflow. Normalise Sent treats a message that went
+-- only to it like a note to an own-domain colleague: not a warm-up send.
+-- Always exactly one row; NULL when no address is configured.
+SELECT (SELECT value FROM settings WHERE key = 'operator_email') AS operator_email;"""
+
 RECORD_INBOUND_SQL = """-- Record Inbound: match one INBOX message to a lead, record it once, and act on
 -- it in the same statement.
 --
@@ -680,6 +682,9 @@ RECORD_INBOUND_SQL = """-- Record Inbound: match one INBOX message to a lead, re
 -- inbound_messages is keyed on Message-ID and every action below hangs off its
 -- INSERT ... RETURNING, so a message the IMAP trigger delivers twice changes
 -- nothing and notifies nobody the second time.
+--
+-- The row also carries the operator's notification address, read from the
+-- settings table at runtime, so Build Notification has nothing baked in.
 WITH p AS (
   SELECT $1::jsonb AS p
 ),
@@ -794,7 +799,8 @@ SELECT ((SELECT count(*) FROM ins) = 1
        coalesce((SELECT array_agg(domain ORDER BY domain) FROM blocked), '{}')  AS blocklisted,
        (SELECT lead_id FROM ins)                                                AS lead_id,
        (SELECT count(*) FROM logged)::int                                       AS outreach_updated,
-       (SELECT count(*) FROM advanced)::int                                     AS lead_updated
+       (SELECT count(*) FROM advanced)::int                                     AS lead_updated,
+       (SELECT value FROM settings WHERE key = 'operator_email')                AS operator_email
   FROM p
   LEFT JOIN leads l    ON l.id = (SELECT lead_id FROM hit)
   LEFT JOIN scores s   ON s.lead_id = l.id
@@ -1018,6 +1024,8 @@ _assert_wired("Check SMTP Result (claim.*)", _reads(_check, "claim"), final_sele
 _assert_js_emits("Confirm Send", _sql_payload_reads(CONFIRM_SQL), _check, "code_check_smtp.js")
 _assert_js_emits("Revert Claim", _sql_payload_reads(REVERT_SQL), _check, "code_check_smtp.js")
 _mirror = js("code_mirror_sent.js")
+_assert_wired("Normalise Sent (settings.*)", _reads(_mirror, "settings"), final_select_aliases(LOAD_SETTINGS_SQL),
+              "Load Settings")
 _assert_js_emits("Mirror Sent", _sql_payload_reads(MIRROR_SQL) | set(re.findall(r"x->>?'(\w+)'", MIRROR_SQL)),
                  _mirror, "code_mirror_sent.js")
 _classify = js("code_classify_reply.js")
@@ -1051,7 +1059,7 @@ DECIDE_JS = bake("code_decide.js", SIGNATURE=SIGNATURE)
 CHECK_JS = bake("code_check_smtp.js", OWN_DOMAIN=OWN_DOMAIN)
 MIRROR_JS = bake("code_mirror_sent.js", OWN_DOMAIN=OWN_DOMAIN)
 CLASSIFY_JS = bake("code_classify_reply.js", OWN_DOMAIN=OWN_DOMAIN)
-NOTIFY_JS = bake("code_notify.js", OPERATOR_EMAIL=OPERATOR_EMAIL)
+NOTIFY_JS = bake("code_notify.js")
 FOLLOWUP_JS = bake("code_followup.js", SIGNATURE=SIGNATURE, SENDER_NAME=SENDER_NAME)
 
 
@@ -1084,7 +1092,7 @@ def code_node(name, src, mode, pos, notes):
 
 def pg_node(name, sql, replacement, pos, notes):
     return {"parameters": {"operation": "executeQuery", "query": sql,
-                           "options": {"queryReplacement": replacement}},
+                           "options": {"queryReplacement": replacement} if replacement else {}},
             "name": name, "type": "n8n-nodes-base.postgres", "typeVersion": 2.7, "position": pos,
             "credentials": PG_CRED, "notes": notes}
 
@@ -1225,10 +1233,15 @@ mailwatch_nodes = [
                  "The warm-up ceiling's input. Reads the WHOLE Sent folder on every activation (Fetch Only New "
                  "Emails off), so manual sends made while n8n was down are counted; then each new message as it "
                  "is filed. Keyed on Message-ID, so re-reads are no-ops."),
-    code_node("Normalise Sent", MIRROR_JS, "runOnceForAllItems", [-660, -100],
-              "The IMAP pre-flight's reading: when each message went, and whether it went outside "
-              + OWN_DOMAIN + ". Only external sends warm the domain, so only they count."),
-    pg_node("Mirror Sent", MIRROR_SQL, "={{ [JSON.stringify($json.payload)] }}", [-440, -100],
+    dict(pg_node("Load Settings", LOAD_SETTINGS_SQL, None, [-660, -100],
+                 "The operator's notification address, from the settings table at runtime (sync_settings.py "
+                 "writes it from .env) -- never baked into this JSON. Once per trigger batch."),
+         executeOnce=True),
+    code_node("Normalise Sent", MIRROR_JS, "runOnceForAllItems", [-440, -100],
+              "The IMAP pre-flight's reading: when each message went, and whether it went to anyone outside "
+              + OWN_DOMAIN + " other than the operator's notification address. Only those sends warm the "
+              "domain, so only they count."),
+    pg_node("Mirror Sent", MIRROR_SQL, "={{ [JSON.stringify($json.payload)] }}", [-220, -100],
             "Upsert into mailbox_sent; stamp mailbox_sync. The send path refuses to send until this has run "
             "at least once, and stops if its own sends stop appearing here."),
     imap_trigger("Inbox", "INBOX", True, [-880, 160],
@@ -1244,8 +1257,8 @@ mailwatch_nodes = [
     code_node("Build Notification", NOTIFY_JS, "runOnceForEachItem", [-220, 160],
               "HubSpot is deferred (Section 9): the operator gets a plain-text email instead, once per message."),
     if_node("Notify Operator?", "notify", "={{ $json.notify }}", [0, 160],
-            "Only the first time a matched reply, opt-out or bounce is recorded -- and only if "
-            "NOVASCOUT_OPERATOR_EMAIL was set at build time."),
+            "Only the first time a matched reply, opt-out or bounce is recorded -- and only if the "
+            "settings table holds an operator address (sync_settings.py)."),
     email_node("Notify Operator", "={{ $json.notify_to }}", "={{ $json.subject }}", "={{ $json.text }}",
                [220, 160],
                "To the operator's own inbox, never the outreach mailbox (Section 9). A failure here does not "
@@ -1253,7 +1266,8 @@ mailwatch_nodes = [
 ]
 
 mailwatch_connections = {
-    "Sent Folder": edge("Normalise Sent"),
+    "Sent Folder": edge("Load Settings"),
+    "Load Settings": edge("Normalise Sent"),
     "Normalise Sent": edge("Mirror Sent"),
     "Inbox": edge("Classify Inbound"),
     "Classify Inbound": edge("Record Inbound"),
@@ -1349,6 +1363,44 @@ SHIPPED = [
     ("mailbox-watch.json", workflow("mailwatch0001", "Send & Track - Mailbox Watch", mailwatch_nodes, mailwatch_connections)),
     ("follow-ups.json", workflow("followup0001", "Send & Track - Follow-Ups", followup_nodes, followup_connections)),
 ]
+
+# No literal email address in a committed workflow except the sender's own From.
+# The operator's notification address -- anyone's -- is runtime data (the
+# settings table), and a committed JSON is in git history for good.
+ADDRESS_LITERAL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+
+
+def _strings(o):
+    if isinstance(o, dict):
+        for v in o.values():
+            yield from _strings(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from _strings(v)
+    elif isinstance(o, str):
+        yield o
+
+
+LITERAL_ADDRESSES = {}
+for _file, _wf in SHIPPED:
+    for _n in _wf["nodes"]:
+        for _s in _strings(_n):
+            for _a in ADDRESS_LITERAL.findall(_s):
+                assert _a.lower() == MAILBOX.lower(), (
+                    "%s, node %r: literal email address %r. Only the sender's own From address may be baked "
+                    "into a committed workflow; the operator's notification address, and anyone else's, is "
+                    "read at runtime from the settings table (sync_settings.py)." % (_file, _n["name"], _a))
+                LITERAL_ADDRESSES.setdefault(_a, set()).add("%s: %s" % (_file, _n["name"]))
+
+# Every $('Node') a Code node reads must exist in its workflow -- n8n stops the
+# execution there, and a renamed trigger is easy to miss.
+for _file, _wf in SHIPPED:
+    _names = {n["name"] for n in _wf["nodes"]}
+    for _n in _wf["nodes"]:
+        if _n["type"] == "n8n-nodes-base.code":
+            for _ref in re.findall(r"\$\('([^']+)'\)", _n["parameters"]["jsCode"]):
+                assert _ref in _names, "%s: %s reads $('%s'), but there is no node named %r" % (
+                    _file, _n["name"], _ref, _ref)
 
 
 def _write(path, wf):
@@ -1458,22 +1510,26 @@ if VARIANTS_OUT:
     if FIXTURES:
         fx = json.loads(_read(FIXTURES))
         mw = copy.deepcopy(SHIPPED[1][1])
-        test_nodes = [n for n in mw["nodes"] if n["type"] != "n8n-nodes-base.emailReadImap"]
+        imap = {n["name"] for n in mw["nodes"] if n["type"] == "n8n-nodes-base.emailReadImap"}
+        assert imap == {"Sent Folder", "Inbox"}, "Mailbox Watch's triggers changed: %r" % sorted(imap)
+        # Each fixture takes its trigger's NAME and position, so the shipped
+        # connections stand unchanged and Normalise Sent's read of the trigger
+        # by name resolves to the fixture's items exactly as it would to the
+        # trigger's.
+        test_nodes = [n for n in mw["nodes"] if n["name"] not in imap]
         test_nodes += [
             {"parameters": {}, "name": "Manual Trigger", "type": "n8n-nodes-base.manualTrigger",
              "typeVersion": 1, "position": [-1100, 30]},
-            _fixture_node("Fixture: Sent Folder", fx["sent"], [-880, -100]),
-            _fixture_node("Fixture: Inbox", fx["inbox"], [-880, 160]),
+            _fixture_node("Sent Folder", fx["sent"], [-880, -100]),
+            _fixture_node("Inbox", fx["inbox"], [-880, 160]),
         ]
-        conns = {k: v for k, v in mw["connections"].items() if k not in ("Sent Folder", "Inbox")}
-        conns["Manual Trigger"] = edge("Fixture: Sent Folder", "Fixture: Inbox")
-        conns["Fixture: Sent Folder"] = edge("Normalise Sent")
-        conns["Fixture: Inbox"] = edge("Classify Inbound")
+        conns = dict(mw["connections"])
+        conns["Manual Trigger"] = edge("Sent Folder", "Inbox")
         mw_test = dry_variant(dict(mw, nodes=test_nodes, connections=conns), "mailwatch0001t",
                               "TEST - Mailbox Watch (fixtures, scratch DB, SMTP sink)", {}, set())
         shipped_mw = {n["name"]: n for n in SHIPPED[1][1]["nodes"]}
         for n in mw_test["nodes"]:
-            if n["name"] in shipped_mw:
+            if n["name"] in shipped_mw and n["name"] not in imap:
                 a, b = copy.deepcopy(shipped_mw[n["name"]]), copy.deepcopy(n)
                 a.pop("credentials", None)
                 b.pop("credentials", None)
@@ -1500,9 +1556,7 @@ print("  opt-out keywords (Sections 5+9): %r" % OPT_OUT_KEYWORDS)
 print("  follow-ups (Section 9): after %d days, maximum %d" % (FOLLOW_UP_DAYS, MAX_FOLLOW_UPS))
 print("  From: %s    own domain: %s" % (FROM_HEADER, OWN_DOMAIN))
 print("  signature checked on every body: %r" % SIGNATURE)
-if not OPERATOR_EMAIL:
-    print(
-        "\n  WARNING: NOVASCOUT_OPERATOR_EMAIL is not set. Section 9's reply notification has\n"
-        "  nowhere to go, so none is sent. Replies are still recorded, the lead still\n"
-        "  leaves the send queue and opt-outs are still blocklisted -- check the\n"
-        "  replied_queue view. Set it in .env (not the outreach mailbox) and rebuild.")
+print("  operator notification address: read at runtime from settings.operator_email "
+      "(sync_settings.py) -- not baked in")
+print("  literal email addresses in the shipped JSON: %s" % (
+    "; ".join("%s (%s)" % (a, ", ".join(sorted(w))) for a, w in sorted(LITERAL_ADDRESSES.items())) or "none"))

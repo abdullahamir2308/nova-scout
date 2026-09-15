@@ -2,9 +2,14 @@
 //
 // Turns a batch of Sent-folder messages from the IMAP trigger into rows for
 // mailbox_sent. It is the IMAP pre-flight's reading, kept current: when each
-// message went, and whether any recipient was outside the mailbox's own domain.
-// Only "external" messages count toward Section 5's warm-up ceiling -- a note
-// to yourself or to a colleague on the same domain warms nothing.
+// message went, and whether it counts toward Section 5's warm-up ceiling. A
+// message counts ("external") when any recipient is someone other than:
+//   - an address on the mailbox's own domain -- a note to yourself or to a
+//     colleague warms nothing;
+//   - the operator's own notification address -- Mailbox Watch's reply
+//     notifications go there, and they are not mail to a cold prospect
+//     (operator decision, 2026-09-15). It comes from the `settings` table,
+//     via Load Settings, at runtime; nothing is baked in.
 //
 // The trigger delivers the Sent folder in batches of up to 20, and re-reads the
 // whole folder on every activation (so manual sends made while n8n was down are
@@ -22,7 +27,8 @@ function domainOf(addr) {
   return i === -1 ? '' : s.slice(i + 1);
 }
 
-// Every address in a raw header value: "A <a@x.com>, b@y.com" -> [a@x.com, b@y.com].
+// Every address in a raw header value -- 'Name <first>, second' gives
+// [first, second] -- lower-cased and de-duplicated.
 function addresses(v) {
   const found = String(v === null || v === undefined ? '' : v).match(/[^\s<>,;:"'()\[\]]+@[^\s<>,;:"'()\[\]]+/g) || [];
   const out = [];
@@ -52,7 +58,13 @@ function fallbackId(j) {
   return '<no-message-id.' + h.toString(16) + '@mirror.invalid>';
 }
 
-function sentRows(messages) {
+// The one rule for "does sending to this recipient warm the domain".
+function countsTowardCeiling(addr, operator) {
+  return domainOf(addr) !== OWN_DOMAIN && addr !== operator;
+}
+
+function sentRows(messages, operatorEmail) {
+  const operator = str(operatorEmail).toLowerCase();
   const rows = [];
   let undated = 0;
   for (let i = 0; i < messages.length; i++) {
@@ -72,7 +84,7 @@ function sentRows(messages) {
       message_id: messageId(meta['message-id']) || fallbackId(j),
       sent_at: new Date(t).toISOString(),
       recipients: recipients,
-      external: recipients.some(function (a) { return domainOf(a) !== OWN_DOMAIN; }),
+      external: recipients.some(function (a) { return countsTowardCeiling(a, operator); }),
     });
   }
   return { rows: rows, seen: messages.length, undated: undated };
@@ -82,5 +94,9 @@ function sentRows(messages) {
 // Node body
 // ---------------------------------------------------------------------------
 
-const messages = $input.all().map(function (it) { return it.json; });
-return [{ json: { payload: sentRows(messages) } }];
+// Load Settings sits between the trigger and this node: it runs once per batch
+// and hands on its one row, so the messages themselves are read back from the
+// trigger node by name.
+const settings = $input.first().json;
+const messages = $('Sent Folder').all().map(function (it) { return it.json; });
+return [{ json: { payload: sentRows(messages, settings.operator_email) } }];

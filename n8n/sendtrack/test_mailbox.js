@@ -48,9 +48,25 @@ const a = sentRows([sent({}, { 'message-id': '' })]).rows[0].message_id;
 const b = sentRows([sent({}, { 'message-id': '' })]).rows[0].message_id;
 t.check('no Message-ID -> a stable stand-in key, so a re-read hits the same row', [a === b, /@mirror\.invalid>$/.test(a)], [true, true]);
 t.check('Message-IDs are kept with their brackets', [messageId('  <x@y>  '), messageId('x@y')], ['<x@y>', '<x@y>']);
-const mirrored = runOnceForAll(MIRROR, [{ json: sent() }, { json: sent({}, { 'message-id': '<def@amitrixlabs.com>' }) }], {}, ownDomain);
-t.check('the shipped node body folds a trigger batch into ONE payload item',
-  [mirrored.length, mirrored[0].json.payload.rows.length], [1, 2]);
+// The operator's own notification address is exempt the same way the own domain is.
+const OP = 'operator@example.net';
+t.check("a reply notification to the operator's own address does not count toward the ceiling",
+  sentRows([sent({ to: 'Nova Scout <Operator@Example.NET>' })], OP).rows[0].external, false);
+t.check('... the address from settings is compared case-insensitively too',
+  sentRows([sent({ to: OP })], 'OPERATOR@example.net').rows[0].external, false);
+t.check('... the operator plus an own-domain colleague still warms nothing',
+  sentRows([sent({ to: OP, cc: 'ops@amitrixlabs.com' })], OP).rows[0].external, false);
+t.check('... but copy a prospect in and it counts',
+  sentRows([sent({ to: OP, cc: 'hello@klixar.com' })], OP).rows[0].external, true);
+t.check('only that exact address is exempt -- someone else on its domain counts',
+  sentRows([sent({ to: 'someone.else@example.net' })], OP).rows[0].external, true);
+t.check('no operator address configured (NULL or empty) -> it counts, as before',
+  [sentRows([sent({ to: OP })], null).rows[0].external, sentRows([sent({ to: OP })], '').rows[0].external], [true, true]);
+const batch = [{ json: sent() }, { json: sent({ to: OP }, { 'message-id': '<note@amitrixlabs.com>' }) }];
+const mirrored = runOnceForAll(MIRROR, [{ json: { operator_email: OP } }], { 'Sent Folder': batch }, ownDomain);
+t.check('the shipped node body: messages from the trigger, the address from Load Settings, ONE payload item',
+  [mirrored.length, mirrored[0].json.payload.rows.map((r) => [r.message_id, r.external])],
+  [1, [['<abc123@amitrixlabs.com>', true], ['<note@amitrixlabs.com>', false]]]);
 
 // --- inbound classification -----------------------------------------------------
 const CLASSIFY = path.join(__dirname, 'code_classify_reply.js');
@@ -140,23 +156,29 @@ const node = runForEachItem(CLASSIFY, [{ json: inbound('Stop.') }], {}, ownDomai
 t.check('the shipped node body wraps the classification as payload', node[0].json.payload.classification, 'opt-out');
 
 // --- operator notification ------------------------------------------------------
+// The address arrives on Record Inbound's row, read from the settings table at
+// runtime -- nothing is baked into the node.
 const NOTIFY = path.join(__dirname, 'code_notify.js');
-const withOperator = (op) => (s) => s.replace('__OPERATOR_EMAIL__', JSON.stringify(op));
 const row = {
   notify: true, classification: 'opt-out', opt_out_keyword: 'stop', company_name: 'KLIXAR',
   domain: 'klixar.com', country: 'Argentina', fit_score: 74, contact_email: 'hello@klixar.com',
   from_addr: 'hello@klixar.com', subject: 'Re: question', received_at: '2026-09-15T13:00:00.000Z',
   matched_by: 'thread', body_excerpt: 'Stop emailing us.', blocklisted: ['klixar.com'], lead_id: 7,
+  operator_email: 'ops@example.com',
 };
-let n = runForEachItem(NOTIFY, [{ json: row }], {}, withOperator('ops@example.com'))[0].json;
-t.check('an opt-out notifies the operator', [n.notify, n.notify_to, n.subject], [true, 'ops@example.com', '[Nova Scout] OPT-OUT from KLIXAR']);
+const note = (over) => runForEachItem(NOTIFY, [{ json: Object.assign({}, row, over) }], {})[0].json;
+let n = note({});
+t.check('an opt-out notifies the operator, at the address on the row', [n.notify, n.notify_to, n.subject], [true, 'ops@example.com', '[Nova Scout] OPT-OUT from KLIXAR']);
 t.check('... saying what matched and what was blocklisted', /matched "stop"\. Blocklisted: klixar\.com\./.test(n.text), true);
 t.check('... and what they wrote', /Stop emailing us\./.test(n.text), true);
-n = runForEachItem(NOTIFY, [{ json: row }], {}, withOperator(''))[0].json;
-t.check('no operator address configured -> no email, nothing else changes', n.notify, false);
-n = runForEachItem(NOTIFY, [{ json: Object.assign({}, row, { notify: false }) }], {}, withOperator('ops@example.com'))[0].json;
-t.check('a message already recorded once -> no second notification', n.notify, false);
-n = runForEachItem(NOTIFY, [{ json: Object.assign({}, row, { classification: 'reply', opt_out_keyword: null }) }], {}, withOperator('ops@example.com'))[0].json;
+t.check('no operator address in settings (NULL) -> no email, nothing else changes', note({ operator_email: null }).notify, false);
+t.check('... an empty one likewise', note({ operator_email: '' }).notify, false);
+t.check('a value that is not one address -> no email, rather than a send that fails',
+  [note({ operator_email: 'ops at example.com' }).notify, note({ operator_email: 'ops@localhost' }).notify,
+    note({ operator_email: 'a@example.com, b@example.com' }).notify], [false, false, false]);
+t.check('the address is trimmed and lower-cased', note({ operator_email: ' Ops@Example.COM ' }).notify_to, 'ops@example.com');
+t.check('a message already recorded once -> no second notification', note({ notify: false }).notify, false);
+n = note({ classification: 'reply', opt_out_keyword: null });
 t.check('a plain reply is labelled REPLY', [n.subject, /follow-ups are stopped/.test(n.text)], ['[Nova Scout] REPLY from KLIXAR', true]);
 
 t.done();

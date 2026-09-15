@@ -273,8 +273,39 @@ case("no sender name anywhere -> refuses, no default", "NOVASCOUT_SENDER_NAME is
      env_overrides={"NOVASCOUT_SENDER_NAME": None})
 case("no usable mailbox address -> refuses", "NOVASCOUT_MAILBOX_ADDRESS",
      env_overrides={"NOVASCOUT_MAILBOX_ADDRESS": "not-an-address"})
-case("notifications pointed at the outreach mailbox itself -> refuses", "not the outreach mailbox",
-     env_overrides={"NOVASCOUT_OPERATOR_EMAIL": FIXTURE_MAILBOX})
+
+
+# --- the operator's address is runtime data, never a literal -----------------
+def operator_stays_out(tmp):
+    for root, _, files in os.walk(os.path.join(tmp, "out")):
+        for f in files:
+            text = read(os.path.join(root, f))
+            for addr in ("op@env-var.example", "op@env-file.example"):
+                if addr in text:
+                    return "the operator address %s reached %s" % (addr, f)
+    mw = load(tmp, "mailbox-watch.json")
+    for name in ("Load Settings", "Record Inbound"):
+        if "FROM settings WHERE key = 'operator_email'" not in node(mw, name)["parameters"]["query"]:
+            return "%s does not read the address from the settings table" % name
+    return None
+
+
+positive(
+    "an operator address in .env or the environment never reaches a workflow -- it is runtime data",
+    operator_stays_out,
+    env_overrides={"NOVASCOUT_OPERATOR_EMAIL": "op@env-var.example", "NOVASCOUT_ENV_FILE": "{tmp}/test.env"},
+    files={"test.env": "NOVASCOUT_OPERATOR_EMAIL=op@env-file.example\n"},
+)
+case("a Code node carries a literal email address -> refuses", "literal email address",
+     mutate_file=("code_notify.js", lambda s: s.replace(
+         "const LABEL =", "// questions: someone@example.org\nconst LABEL =", 1)))
+case("Record Inbound stops returning the operator address -> refuses", "does not produce",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "AS operator_email\n  FROM p", "AS operator_address\n  FROM p", 1)))
+case("Normalise Sent reads a field Load Settings does not return -> refuses", "does not produce",
+     mutate_file=("code_mirror_sent.js", lambda s: s.replace("settings.operator_email", "settings.operator", 1)))
+case("Normalise Sent reads its messages from a node that is not there -> refuses", "no node named",
+     mutate_file=("code_mirror_sent.js", lambda s: s.replace("$('Sent Folder')", "$('Sent')", 1)))
 
 # --- the dry run tests what ships -------------------------------------------
 case("the dry-run variant keeps its schedule trigger (an extra difference) -> refuses",

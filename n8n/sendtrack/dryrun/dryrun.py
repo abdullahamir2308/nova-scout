@@ -9,10 +9,14 @@ conversation.
 
 NOT REAL: the database is novascout_dryrun, a copy of novascout taken at the
 start with every contact address rewritten to <local>.at.<domain>@dryrun.invalid
+and the operator's notification address replaced by operator@dryrun.invalid
 (the .invalid TLD cannot resolve); and SMTP goes to smtp_sink.js on
 127.0.0.1:2525 INSIDE the n8n container, which writes to disk and has no route
 anywhere. The real novascout database is only READ (pg_dump); a fingerprint of
 it is printed before and after.
+
+Afterwards the scratch databases are dropped and the three dry-run workflows
+are deleted from n8n again; --keep leaves both for inspection.
 
 Every expectation is asserted. Exit 1 if any guard did not hold.
 """
@@ -43,6 +47,7 @@ KEEP = "--keep" in sys.argv
 CLOCK = "2026-09-14T10:00:00.000Z"
 DAY_START, DAY_END = "2026-09-13T19:00:00.000Z", "2026-09-14T19:00:00.000Z"
 OPT_OUT = "If this isn't relevant, reply 'no' and I won't follow up."
+OPERATOR = "operator@dryrun.invalid"
 
 RESULTS = []
 
@@ -84,7 +89,8 @@ def fingerprint(db):
       'mailbox_sent', (SELECT count(*) FROM mailbox_sent),
       'inbound_messages', (SELECT count(*) FROM inbound_messages),
       'blocklist', (SELECT count(*) FROM blocklist),
-      'max_draft_id', (SELECT max(id) FROM drafts));""").strip())
+      'max_draft_id', (SELECT max(id) FROM drafts),
+      'settings_md5', (SELECT json_object_agg(key, md5(value) ORDER BY key) FROM settings));""").strip())
 
 
 # --- scratch database ---------------------------------------------------------
@@ -98,6 +104,9 @@ def make_base():
                "WHERE email IS NOT NULL AND email <> '';")
     left = int(psql(BASE, "SELECT count(*) FROM contacts WHERE email IS NOT NULL AND email <> '' "
                           "AND email NOT LIKE '%@dryrun.invalid';").strip())
+    # The operator's real notification address never enters the scratch copy.
+    psql(BASE, "DELETE FROM settings;\n"
+               "INSERT INTO settings (key, value) VALUES ('operator_email', '%s');" % OPERATOR)
     return left
 
 
@@ -109,7 +118,7 @@ def fresh(seed_sql=""):
 
 # --- n8n ------------------------------------------------------------------------
 
-def build(fixtures=None, operator=None):
+def build(fixtures=None):
     env = dict(os.environ, SENDTRACK_OUT=os.path.join(SCRATCH, "shipped"),
                SENDTRACK_VARIANTS_OUT=os.path.join(SCRATCH, "variants"), SENDTRACK_DRYRUN_NOW=CLOCK,
                PYTHONIOENCODING="utf-8")
@@ -118,8 +127,6 @@ def build(fixtures=None, operator=None):
         with io.open(path, "w", encoding="utf-8") as fh:
             json.dump(fixtures, fh, ensure_ascii=False)
         env["SENDTRACK_FIXTURES"] = path
-    if operator:
-        env["NOVASCOUT_OPERATOR_EMAIL"] = operator
     p = subprocess.run([sys.executable, os.path.join(SENDTRACK, "build_workflow.py")], env=env,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace")
     if p.returncode != 0:
@@ -253,6 +260,8 @@ real_before = fingerprint(REAL)
 show("real novascout BEFORE", real_before)
 left = make_base()
 expect("every contact address in the scratch copy is rewritten to @dryrun.invalid", left == 0, "%d left" % left)
+expect("the scratch copy's operator notification address is the .invalid stand-in, never the real one",
+       psql(BASE, "SELECT string_agg(key || '=' || value, ',') FROM settings;").strip() == "operator_email=" + OPERATOR)
 show("scratch contacts (sample)", psql_json(BASE, "SELECT lead_id, email FROM contacts WHERE lead_id IN (7, 50, 91, 104) ORDER BY lead_id"))
 creds = psql("n8n", "SELECT string_agg(id || '=' || type, ', ' ORDER BY id) FROM credentials_entity "
                     "WHERE id IN ('novascoutPgDry01', 'novascoutSmtpDry01');").strip()
@@ -517,7 +526,7 @@ fixtures = {
          "metadata": {"message-id": "<reply-7@klixar.example>", "in-reply-to": "<seed-31@amitrixlabs.com>"}, "attributes": {"uid": 15}},
     ],
 }
-build(fixtures=fixtures, operator="operator@dryrun.invalid")
+build(fixtures=fixtures)
 import_wf("mailwatch-test.json")
 before = len(sink_log())
 run = execute("mailwatch0001t")
@@ -557,6 +566,107 @@ for n in notes:
     print("    notification: %s" % m.get("Subject"))
 print()
 
+# --- H. a notification does not use a warm-up slot -----------------------------------
+print("=== H. A reply notification fires and lands in Sent -- the remaining sends do not move ===")
+H_SEED = (MIRROR_ALIVE + manual_sends([4, 5, 6, 7]) + """
+UPDATE drafts SET status = 'sent' WHERE id = 31;
+UPDATE leads SET status = 'sent' WHERE id = 7;
+INSERT INTO outreach_log (lead_id, draft_id, channel, sent_at, message_body, message_id) VALUES
+  (7, 31, 'email', '2026-09-13T15:00:00Z', 'first touch', '<seed-31@amitrixlabs.com>');
+INSERT INTO mailbox_sent (message_id, sent_at, recipients, external, lead_id, source, seen_in_sent_folder) VALUES
+  ('<seed-31@amitrixlabs.com>', '2026-09-13T15:00:00Z', ARRAY['x'], true, 7, 'workflow', true);
+""")
+fresh(H_SEED)
+held = [r["id"] for r in psql_json(DRY, "SELECT id FROM drafts WHERE channel = 'email' AND status = 'approved' ORDER BY id")]
+op = psql(DRY, "SELECT value FROM settings WHERE key = 'operator_email';").strip()
+print("  seeded: Sent mirror alive; 4 manual external sends today -> 1 of 5 left; lead 7 emailed yesterday;")
+print("          settings.operator_email = %s; approved email drafts %s" % (op, held))
+
+print("  -- H1: the send path's count before anything happens (approved drafts held back: this tick only measures) --")
+psql(DRY, "UPDATE drafts SET status = 'pending' WHERE id IN (%s);" % ",".join(map(str, held)))
+run = execute("send0001dry")
+w_before = out_items(run, "Decide Send")[0]["warmup"]
+show("Decide Send warm-up", {k: w_before[k] for k in ("week", "ceiling", "sent_today", "remaining")})
+expect("before: 4 external sends today, 1 remaining", (w_before["sent_today"], w_before["remaining"]) == (4, 1))
+
+print("  -- H2: lead 7 replies; Mailbox Watch records it and notifies the operator --")
+addr7 = psql(DRY, "SELECT email FROM contacts WHERE lead_id = 7;").strip()
+build(fixtures={"sent": [], "inbox": [
+    {"date": "Mon, 14 Sep 2026 06:40:00 -0300", "from": "Enrique <" + addr7 + ">", "to": "abdullah@amitrixlabs.com",
+     "subject": "Re: question", "textPlain": "Interesting -- can you send the recording?" + QUOTE, "textHtml": "",
+     "metadata": {"message-id": "<reply-h@klixar.example>", "in-reply-to": "<seed-31@amitrixlabs.com>"},
+     "attributes": {"uid": 21}}]})
+import_wf("mailwatch-test.json")
+before = len(sink_log())
+run = execute("mailwatch0001t")
+rec = out_items(run, "Record Inbound")[0]
+note = out_items(run, "Build Notification")[0]
+show("Record Inbound", {k: rec[k] for k in ("classification", "notify", "matched_by", "lead_id", "operator_email")})
+show("Build Notification", {k: note[k] for k in ("notify", "notify_to", "subject")})
+fired = sink_log()[before:]
+expect("the notification fired: one message, to the address Record Inbound read from settings at runtime",
+       note["notify"] and note["notify_to"] == op and len(fired) == 1 and fired[0]["rcpt_to"] == ["<%s>" % op],
+       str([f["rcpt_to"] for f in fired]))
+raw, nmsg = sink_message(fired[0]["file"])
+print("  captured notification #%d:" % fired[0]["seq"])
+for h in ("From", "To", "Subject", "Date", "Message-ID"):
+    print("    %-12s %s" % (h + ":", nmsg.get(h)))
+
+print("  -- H3: the mailbox files that notification into Sent; the Sent mirror reads it back --")
+scenario_date = "Mon, 14 Sep 2026 14:58:00 +0500"
+print("    (Date re-stamped %s -> %s: the dry run replays one fixed day; every other header is as sent)"
+      % (nmsg.get("Date"), scenario_date))
+mid = str(nmsg.get("Message-ID"))
+note_copy = {"date": scenario_date, "from": str(nmsg.get("From")), "to": str(nmsg.get("To")),
+             "subject": str(nmsg.get("Subject")), "textPlain": nmsg.get_body(preferencelist=("plain",)).get_content(),
+             "textHtml": "", "metadata": {"message-id": mid}, "attributes": {"uid": 22}}
+build(fixtures={"sent": [note_copy], "inbox": []})
+import_wf("mailwatch-test.json")
+run = execute("mailwatch0001t")
+show("Mirror Sent", out_items(run, "Mirror Sent"))
+row = psql_json(DRY, "SELECT message_id, sent_at, recipients, external, source FROM mailbox_sent WHERE message_id = '%s'"
+                % mid.replace("'", "''"))
+show("mailbox_sent (the notification's Sent copy)", row)
+expect("the notification's Sent copy is mirrored, to the operator address only -- and NOT external",
+       len(row) == 1 and row[0]["recipients"] == [op] and row[0]["external"] is False, str(row))
+
+print("  -- H4: same day, drafts released: the count is unchanged, and the last slot goes to a prospect --")
+psql(DRY, "UPDATE drafts SET status = 'approved' WHERE id IN (%s);" % ",".join(map(str, held)))
+before = len(sink_log())
+run = execute("send0001dry")
+d_after = out_items(run, "Decide Send")[0]
+show("Decide Send", decision_summary(d_after))
+w_after = d_after["warmup"]
+expect("after the notification: STILL 4 external sends today and 1 remaining -- the count did not move",
+       (w_after["sent_today"], w_after["remaining"]) == (w_before["sent_today"], w_before["remaining"]) == (4, 1),
+       "before %d sent / %d remaining, after %d / %d" % (w_before["sent_today"], w_before["remaining"],
+                                                         w_after["sent_today"], w_after["remaining"]))
+sent_now = sink_log()[before:]
+expect("... so the 5th slot went to a prospect: claimed, sent, confirmed",
+       d_after["send"] and (out_items(run, "Confirm Send") or [{}])[0].get("confirmed") == 1 and len(sent_now) == 1
+       and sent_now[0]["rcpt_to"][0].endswith("@dryrun.invalid>") and op not in sent_now[0]["rcpt_to"][0],
+       str([s["rcpt_to"] for s in sent_now]))
+run = execute("send0001dry")
+d_next = out_items(run, "Decide Send")[0]
+expect("a real send still counts: the next tick is refused at 5/5",
+       not d_next["send"] and d_next["reason"] == "ceiling-reached" and d_next["warmup"]["sent_today"] == 5,
+       d_next["detail"])
+
+print("  -- H, control: the same Sent copy with NO operator address configured (the behaviour before this fix) --")
+fresh(H_SEED + "DELETE FROM settings WHERE key = 'operator_email';\n")
+execute("mailwatch0001t")  # still the H3 build: the notification's Sent copy
+row = psql_json(DRY, "SELECT external FROM mailbox_sent WHERE message_id = '%s'" % mid.replace("'", "''"))
+before = len(sink_log())
+run = execute("send0001dry")
+dc = out_items(run, "Decide Send")[0]
+show("Decide Send", decision_summary(dc))
+expect("control: without the operator address, the very same message IS counted as external",
+       row == [{"external": True}], str(row))
+expect("control: ... and it takes the last slot -- 5/5, the prospect send refused",
+       not dc["send"] and dc["reason"] == "ceiling-reached" and dc["warmup"]["sent_today"] == 5
+       and len(sink_log()) == before, dc["detail"])
+print()
+
 # --- the real database, untouched -------------------------------------------------
 stop_sink()
 real_after = fingerprint(REAL)
@@ -565,6 +675,11 @@ expect("the real novascout database is byte-for-byte the same shape as before th
 if not KEEP:
     psql("postgres", "DROP DATABASE IF EXISTS %s WITH (FORCE);\nDROP DATABASE IF EXISTS %s WITH (FORCE);" % (DRY, BASE))
     print("  scratch databases dropped (pass --keep to inspect them)")
+    # The variants point at a dropped database and a stopped sink. n8n has no
+    # CLI delete; every table hanging off a workflow cascades.
+    gone = psql("n8n", "DELETE FROM workflow_entity WHERE id IN ('send0001dry', 'followup0001dry', 'mailwatch0001t') "
+                       "AND name ~ '^(DRY RUN|TEST) - ' RETURNING id;").split()
+    print("  dry-run workflows deleted from n8n: %s" % (", ".join(gone) or "none"))
 
 failed = [r for r in RESULTS if not r[1]]
 print("\n%d checks, %d passed, %d failed" % (len(RESULTS), len(RESULTS) - len(failed), len(failed)))

@@ -17,15 +17,18 @@ parses the Master Ref and refuses to run when code and doc disagree.
 python build_workflow.py          # regenerate the three workflow JSONs
 node   test_decide.js             # 74 cases -- the send decision and every guard in it
 node   test_send_result.js        # 21 cases -- what happens after the SMTP call
-node   test_mailbox.js            # 49 cases -- Sent mirror, reply classification, notification
+node   test_mailbox.js            # 58 cases -- Sent mirror, reply classification, notification
 node   test_followup.js           # 13 cases -- follow-up drafts (cross-checked against the send path)
-python test_drift_guards.py       # 41 cases -- each spec/wiring guard is made to fire
+python test_drift_guards.py       # 45 cases -- each spec/wiring guard is made to fire
 python provision_credentials.py   # n8n SMTP/IMAP credentials from .env (+ the two dry-run ones)
+python sync_settings.py           # the operator's notification address, .env -> the settings table
+python imap_preflight.py          # read-only: IMAP works, and the warm-up state from the real Sent folder
 python dryrun/dryrun.py           # the real send path, end to end, into a scratch DB and an SMTP sink
 python status_now.py              # read-only: what would the send path do right now?
 ```
 
-Migration `postgres/migrations/007_send_and_track.sql` must be applied first.
+Migrations `postgres/migrations/007_send_and_track.sql` and `008_settings.sql` must
+be applied first, and `sync_settings.py` run once.
 
 ## The warm-up ceiling belongs to the mailbox
 
@@ -40,7 +43,9 @@ kept current:
 - **The day** is the sender's (Asia/Karachi, docker-compose's `GENERIC_TIMEZONE`),
   so the count cannot straddle two days. Each tick uses one clock value throughout.
 - **What counts**: every message in the Sent folder with a recipient outside
-  `amitrixlabs.com`, plus any claim whose SMTP outcome is unknown.
+  `amitrixlabs.com` other than the operator's notification address, plus any
+  claim whose SMTP outcome is unknown. A reply notification — anything sent
+  only to the operator — warms nothing, the same as a note to a colleague.
 
 The Mailbox Watch workflow's Sent trigger reads the whole folder on every
 activation into `mailbox_sent`, then each new message as it is filed. The send
@@ -147,9 +152,19 @@ secret, and the build never reads the password (a drift-guard case proves it).
 The From header and the signature every body is checked against come from
 `NOVASCOUT_SENDER_*` and `NOVASCOUT_MAILBOX_ADDRESS`, baked at build time.
 
-Reply notifications go to `NOVASCOUT_OPERATOR_EMAIL` — the operator's own inbox,
-never the outreach mailbox (the build refuses that). **Unset, no notification is
-sent**; replies are still recorded, visible in the `replied_queue` view.
+Reply notifications go to the operator's own inbox, never the outreach mailbox.
+The address is **runtime data, not a build constant**: `sync_settings.py` writes
+`NOVASCOUT_OPERATOR_EMAIL` from `.env` into the `settings` table (migration 008;
+it refuses the outreach mailbox), and Mailbox Watch reads it there — Load
+Settings for the Sent mirror, Record Inbound for the notification. Changing it
+needs a re-sync, not a rebuild. **Unset, no notification is sent**; replies are
+still recorded, visible in the `replied_queue` view.
+
+Not an n8n environment variable, on purpose: n8n 2.x blocks `$env` in Code nodes
+and expressions unless `N8N_BLOCK_ENV_ACCESS_IN_NODE=false`, which would expose
+the whole container environment (`N8N_ENCRYPTION_KEY` included) to every Code
+node. The build refuses any literal email address in the shipped JSON except
+the sender's own From.
 
 ## The dry run
 
@@ -162,6 +177,13 @@ only differences are credentials, Config values and the removed schedule
 trigger. The live database is only read; its fingerprint is compared before and
 after. Every expectation is asserted — exit 1 if any guard did not hold.
 
+The scratch copy's operator address is `operator@dryrun.invalid`, never the real
+one. Scenario H fires a real reply notification into the sink, feeds its Sent
+copy back through the mirror, and checks the send path's remaining count did not
+move; its control run (no operator address configured) shows the same message
+would otherwise have taken the day's last slot. Afterwards the scratch databases
+are dropped and the dry-run workflows deleted from n8n (`--keep` leaves both).
+
 ## Known gaps
 
 - **No threading headers.** The Send Email node cannot set In-Reply-To, so
@@ -171,8 +193,6 @@ after. Every expectation is asserted — exit 1 if any guard did not hold.
   does not require it. Port 465 (implicit TLS) would make TLS mandatory.
 - **5.7.x policy rejections retry.** They are treated as account-level (not the
   address's fault), so a spam-block would be retried each tick.
-- **Notifications count toward the ceiling** if the operator inbox is external
-  — they are real sends from the domain and land in Sent.
 - **Zoho filing SMTP sends into Sent is assumed, not yet observed** — no live
   send has happened. If it does not, the first send will stop the send path
   with `sent-mirror-behind` (fail closed), not over-send.
