@@ -307,12 +307,50 @@ case("Normalise Sent reads a field Load Settings does not return -> refuses", "d
 case("Normalise Sent reads its messages from a node that is not there -> refuses", "no node named",
      mutate_file=("code_mirror_sent.js", lambda s: s.replace("$('Sent Folder')", "$('Sent')", 1)))
 
+# --- IMAP Health ---------------------------------------------------------------
+# Two process boundaries (pre-flight JSON file -> checker HTTP answer) before
+# the node boundaries -- each guarded like one.
+case("Assess Health reads a field Load Health State does not return -> refuses", "does not produce",
+     mutate_file=("code_health.js", lambda s: s.replace("ms(db.sent_synced_at)", "ms(db.sent_synced)", 1)))
+case("Assess Health reads a field the checker never sends -> refuses", "does not produce",
+     mutate_file=("imap_health_server.py", lambda s: s.replace('"hint": None,', '"advice": None,', 1)))
+case("Load Health State reads a field the pre-flight never writes -> refuses", "does not produce",
+     mutate_file=("imap_preflight.py", lambda s: s.replace('"subject": header_text', '"title": header_text', 1)))
+case("Assess Health stops emitting a state field Record Health writes -> refuses", "never emits",
+     mutate_file=("code_health.js", lambda s: s.replace("      consecutive_failures: consecutive,\n", "", 1)))
+case("Load Health State's payload expression drops grace_min -> refuses", "never sets it",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "\"grace_min: $('Config').first().json.grace_min })] }}\"", "\"})] }}\"", 1)))
+case("Section 8 adds a health problem code the JS does not know -> refuses", "problem codes drifted",
+     mutate_doc=lambda d: d.replace("inbox-missed|sent-missed)", "inbox-missed|sent-missed|smtp-failed)", 1))
+case("Section 8 drops a mailbox_health column Record Health writes -> refuses", "does not define",
+     mutate_doc=lambda d: d.replace("failing_since, last_checked_at, last_ok_at,", "failing_since, last_checked_at,", 1))
+case("docker-compose has no imap-health service -> refuses", "no 'imap-health' service",
+     mutate_compose=lambda c: c.replace("\n  imap-health:\n", "\n  imap-checker:\n", 1))
+case("the checker service publishes a port -> refuses", "publishes a port",
+     mutate_compose=lambda c: c.replace("    read_only: true\n", "    read_only: true\n    ports:\n      - \"8765:8765\"\n", 1))
+case("Section 9 sets the health check to every 5 minutes -> refuses", "15-30 minutes",
+     mutate_doc=lambda d: d.replace("health check runs every 20 minutes", "health check runs every 5 minutes", 1))
+case("IMAP Health would alert on a single failing check -> refuses", "single failing check",
+     mutate_file=("build_workflow.py", lambda s: s.replace('"confirm_after": 2,', '"confirm_after": 1,', 1)))
+positive(
+    "Section 9's health-check interval flows straight into the IMAP Health schedule",
+    lambda tmp: None if node(load(tmp, "imap-health.json"), "Every 25 Minutes")["parameters"]["rule"]["interval"]
+    == [{"field": "minutes", "minutesInterval": 25}] else "the schedule is not every 25 minutes",
+    mutate_doc=lambda d: d.replace("health check runs every 20 minutes", "health check runs every 25 minutes", 1),
+)
+
 # --- the dry run tests what ships -------------------------------------------
 case("the dry-run variant keeps its schedule trigger (an extra difference) -> refuses",
      "differs from the shipped workflow",
      mutate_file=("build_workflow.py", lambda s: s.replace(
          '"send_probability": 1},\n                           {"Every 10 Minutes"})',
          '"send_probability": 1},\n                           set())', 1)),
+     env_overrides={"SENDTRACK_VARIANTS_OUT": "{tmp}/variants", "SENDTRACK_DRYRUN_NOW": "2026-09-14T10:00:00Z"})
+case("the dry-run IMAP Health variant keeps its schedule trigger -> refuses", "IMAP Health variant drifted",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         '{},\n                             {"Every %d Minutes" % HEALTH_INTERVAL_MIN})',
+         '{},\n                             set())', 1)),
      env_overrides={"SENDTRACK_VARIANTS_OUT": "{tmp}/variants", "SENDTRACK_DRYRUN_NOW": "2026-09-14T10:00:00Z"})
 
 print("drift guards for Workflow 6\n")

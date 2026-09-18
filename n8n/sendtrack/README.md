@@ -1,34 +1,40 @@
 # Workflow 6 — Send & Track
 
 Sends approved email drafts under Section 5's warm-up ceiling, watches the same
-mailbox for replies and opt-outs, and queues follow-ups. Three workflows:
+mailbox for replies and opt-outs, queues follow-ups, and checks that the mailbox
+watch is still listening. Four workflows:
 
 | File | Id | What it does |
 |---|---|---|
 | `../workflows/send.json` | `send0001` | cron every 10 min → guard → claim → SMTP → log. At most one message per tick. |
 | `../workflows/mailbox-watch.json` | `mailwatch0001` | IMAP on **Sent** (mirror for the ceiling) and on **INBOX** (reply / opt-out / bounce / out-of-office). |
 | `../workflows/follow-ups.json` | `followup0001` | cron every 6 h → follow-up drafts into the review queue, or mark lost. |
+| `../workflows/imap-health.json` | `imaphealth0001` | cron every 20 min → IMAP checker → has Mailbox Watch missed anything? → alert the operator. |
 
 Same generated-not-hand-edited pattern as the other stages: the `.js` files are
 the tested sources, `build_workflow.py` embeds them verbatim, and the build
 parses the Master Ref and refuses to run when code and doc disagree.
 
 ```
-python build_workflow.py          # regenerate the three workflow JSONs
+python build_workflow.py          # regenerate the four workflow JSONs
 node   test_decide.js             # 74 cases -- the send decision and every guard in it
 node   test_send_result.js        # 21 cases -- what happens after the SMTP call
 node   test_mailbox.js            # 58 cases -- Sent mirror, reply classification, notification
 node   test_followup.js           # 13 cases -- follow-up drafts (cross-checked against the send path)
-python test_drift_guards.py       # 45 cases -- each spec/wiring guard is made to fire
+node   test_health.js             # 33 cases -- IMAP Health: problems, when it alerts, what it says
+python test_imap_health.py        # 21 cases -- the checker's answer; Message-ID parity with Mailbox Watch
+python test_drift_guards.py       # 58 cases -- each spec/wiring guard is made to fire
 python provision_credentials.py   # n8n SMTP/IMAP credentials from .env (+ the two dry-run ones)
 python sync_settings.py           # the operator's notification address, .env -> the settings table
 python imap_preflight.py          # read-only: IMAP works, and the warm-up state from the real Sent folder
 python dryrun/dryrun.py           # the real send path, end to end, into a scratch DB and an SMTP sink
+python dryrun/health_dryrun.py    # IMAP Health end to end: real checker, scratch DB, SMTP sink
 python status_now.py              # read-only: what would the send path do right now?
 ```
 
-Migrations `postgres/migrations/007_send_and_track.sql` and `008_settings.sql` must
-be applied first, and `sync_settings.py` run once.
+Migrations `postgres/migrations/007_send_and_track.sql`, `008_settings.sql` and
+`009_mailbox_health.sql` must be applied first, `sync_settings.py` run once, and
+the `imap-health` service running (`docker compose up -d imap-health`).
 
 ## The warm-up ceiling belongs to the mailbox
 
@@ -143,6 +149,50 @@ footer (so the send path accepts it) and lands as `pending`: nothing follows up
 without a human. The clock restarts at the later of the last send and the last
 follow-up drafted. A rejected follow-up uses its slot. Two used and six quiet
 days → `lost`.
+
+## Is Mailbox Watch still listening?
+
+An IMAP trigger only proves it is alive when it fires. When its connection
+drops, n8n unloads the workflow's triggers and retries with a backoff that
+doubles up to 24 hours -- while the database still says "active", "published"
+and `triggerCount=2`. Master Ref Section 9 has the record of the drops in the
+first day.
+
+**IMAP Health** checks every 20 minutes:
+
+1. **Can a fresh read-only IMAP session log in?** `imap_preflight.py` does
+   this -- the same connection logic, unchanged. The n8n image has no Python
+   and n8n 2.x excludes the Execute Command node, so it runs in the
+   `imap-health` container (`imap_health_server.py`, one internal URL:
+   `http://imap-health:8765/check`). That container gets only the IMAP
+   settings, mounts its code read-only, runs as `nobody` on a read-only
+   filesystem, and publishes **no port**. The build refuses a port.
+2. **Has Mailbox Watch missed anything?** With `--ids-json`, the pre-flight
+   also lists the Message-ID of every INBOX and Sent message from the last 48
+   hours. Anything that landed more than 15 minutes ago without a row in
+   `inbound_messages` (INBOX, from Mailbox Watch's first run) or `mailbox_sent`
+   (Sent) was missed. A login only proves the mailbox is reachable. This proves
+   the triggers are listening. `test_imap_health.py` checks that the pre-flight
+   derives each key exactly as both Code nodes do. If it didn't, every message
+   would look missed.
+
+| Problem | Meaning |
+|---|---|
+| `checker-unreachable` | nothing answered at the checker URL -- nothing was checked |
+| `imap-failed` | the fresh IMAP session failed (stage + the pre-flight's reason) |
+| `inbox-missed` | INBOX mail Mailbox Watch has not recorded -- listed, for a by-hand opt-out check |
+| `sent-missed` | Sent mail the mirror has not recorded -- the warm-up ceiling undercounts |
+
+**Alerting:** nothing on one failing check. A host waking from sleep can tick
+the check before Mailbox Watch reconnects, and mail from the sleep looks missed
+for those seconds. After two failing checks in a row, one email goes to
+`settings.operator_email`. Then a reminder every 6 hours, a new email if the
+problem changes, and one when it clears. State lives in `mailbox_health`. An
+alert counts as sent only once SMTP accepts it. It goes only to the operator,
+so it uses no warm-up slot.
+
+**It cannot report its own absence:** when n8n or the host is down, it does
+not run either. Mail that lands then is recorded on the next start.
 
 ## Credentials and identity
 

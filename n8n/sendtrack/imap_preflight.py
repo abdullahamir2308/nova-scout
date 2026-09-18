@@ -12,14 +12,23 @@ notifications go there (Section 9). This script reads the address from .env;
 the workflow reads the copy sync_settings.py writes to the settings table.
 
     python n8n/sendtrack/imap_preflight.py
+    python n8n/sendtrack/imap_preflight.py --ids-json out.json [--ids-hours 48]
+
+--ids-json is for the IMAP health check (imap_health_server.py): in the same
+session, with the same read-only EXAMINE / BODY.PEEK reads, it also writes the
+Message-IDs of every INBOX and Sent message that landed in the last --ids-hours
+hours, so the health check can compare them with what Mailbox Watch recorded.
+Without the flag nothing is fetched or printed differently.
 
 Exit 0 = every check passed. Exit 1 = a check failed. Exit 2 = not run
 (credentials missing from .env).
 """
 import email
+import email.header
 import email.utils
 import imaplib
 import io
+import json
 import os
 import re
 import socket
@@ -37,6 +46,18 @@ REQUIRED = ["NOVASCOUT_MAILBOX_ADDRESS", "NOVASCOUT_MAILBOX_PASSWORD", "NOVASCOU
 # fixed clock -- the sender's. Asia/Karachi is n8n's GENERIC_TIMEZONE in
 # docker-compose.yml and has no DST, so a fixed +05:00 is exact.
 SENDER_TZ = timezone(timedelta(hours=5), "PKT")
+
+IDS_JSON = None
+IDS_HOURS = 48
+_argv = sys.argv[1:]
+while _argv:
+    _a = _argv.pop(0)
+    if _a == "--ids-json" and _argv:
+        IDS_JSON = _argv.pop(0)
+    elif _a == "--ids-hours" and _argv:
+        IDS_HOURS = int(_argv.pop(0))
+    else:
+        raise SystemExit("usage: imap_preflight.py [--ids-json PATH [--ids-hours N]]")
 
 
 def load_env(path):
@@ -101,6 +122,63 @@ def as_utc(dt):
     if dt is None:
         return None
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def message_id(v):
+    """Mailbox Watch's key for a message, derived exactly as code_mirror_sent.js
+    and code_classify_reply.js derive it: the first <...> token, else the first
+    word in brackets. The health check compares these strings as they are."""
+    s = (v or "").strip()
+    m = re.search(r"<[^<>\s]+>", s)
+    if m:
+        return m.group(0)
+    words = s.split()
+    first = re.sub(r"[<>]", "", words[0]) if words else ""
+    return "<%s>" % first if first else ""
+
+
+def header_text(v):
+    if not v:
+        return ""
+    try:
+        return str(email.header.make_header(email.header.decode_header(v))).strip()
+    except (ValueError, LookupError, UnicodeError):
+        return str(v).strip()
+
+
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def imap_date(dt):
+    # SEARCH SINCE takes an English month abbreviation whatever the host locale.
+    return "%02d-%s-%d" % (dt.day, MONTHS[dt.month - 1], dt.year)
+
+
+def fetch_internaldates(spec, stage):
+    typ, dat = M.fetch(spec, "(INTERNALDATE)")
+    if typ != "OK":
+        fail(stage, "FETCH INTERNALDATE: %s %r" % (typ, dat))
+    out = {}
+    for line in dat:
+        if not isinstance(line, bytes):
+            continue
+        m = re.match(rb'(\d+) \(.*INTERNALDATE "([^"]+)"', line)
+        if m:
+            out[int(m.group(1))] = datetime.strptime(m.group(2).decode(), "%d-%b-%Y %H:%M:%S %z")
+    return out
+
+
+def fetch_headers(spec, fields, stage):
+    typ, dat = M.fetch(spec, "(BODY.PEEK[HEADER.FIELDS (%s)])" % fields)
+    if typ != "OK":
+        fail(stage, "FETCH headers: %s %r" % (typ, dat))
+    out = {}
+    for part in dat:
+        if isinstance(part, tuple):
+            m = re.match(rb"(\d+) ", part[0])
+            if m:
+                out[int(m.group(1))] = email.message_from_bytes(part[1])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +248,31 @@ typ, uns = M.search(None, "UNSEEN")
 unseen = len(uns[0].split()) if typ == "OK" and uns and uns[0] else 0
 print("4. INBOX    ok  %d messages, %d unseen (EXAMINE, read-only)" % (inbox_n, unseen))
 
+ids_since = datetime.now(timezone.utc) - timedelta(hours=IDS_HOURS)
+inbox_recent, inbox_no_id = [], 0
+if IDS_JSON:
+    # SINCE compares dates, not times, on the server's clock: ask from a day
+    # earlier and trim by INTERNALDATE -- when the message landed in the folder.
+    typ, found = M.search(None, "SINCE", imap_date(ids_since - timedelta(days=1)))
+    if typ != "OK":
+        fail("inbox-ids", "SEARCH SINCE: %s %r" % (typ, found))
+    seqs = found[0].split() if found and found[0] else []
+    if seqs:
+        spec = b",".join(seqs).decode("ascii")
+        dates = fetch_internaldates(spec, "inbox-ids")
+        hdrs = fetch_headers(spec, "MESSAGE-ID FROM SUBJECT", "inbox-ids")
+        for seq in sorted(dates):
+            at = as_utc(dates[seq])
+            if at < ids_since:
+                continue
+            msg = hdrs.get(seq)
+            mid = message_id(msg.get("Message-ID") if msg is not None else "")
+            if not mid:
+                inbox_no_id += 1
+                continue
+            inbox_recent.append({"message_id": mid, "at": at.isoformat(),
+                                 "from": header_text(msg.get("From")), "subject": header_text(msg.get("Subject"))})
+
 # 5. Sent -- open and read every message's date and recipients.
 typ, dat = M.select(quoted(sent_name), readonly=True)
 if typ != "OK":
@@ -182,25 +285,38 @@ if sent_n:
     # Two fetches rather than one: servers order INTERNALDATE and the header
     # literal differently in a combined response, and a parse that guesses
     # the order wrong silently drops dates.
-    typ, dat = M.fetch("1:*", "(INTERNALDATE)")
-    if typ != "OK":
-        fail("sent-fetch", "FETCH INTERNALDATE: %s %r" % (typ, dat))
-    for line in dat:
-        if not isinstance(line, bytes):
-            continue
-        m = re.match(rb'(\d+) \(.*INTERNALDATE "([^"]+)"', line)
-        if m:
-            internal[int(m.group(1))] = datetime.strptime(m.group(2).decode(), "%d-%b-%Y %H:%M:%S %z")
-    typ, dat = M.fetch("1:*", "(BODY.PEEK[HEADER.FIELDS (DATE TO CC BCC)])")
-    if typ != "OK":
-        fail("sent-fetch", "FETCH headers: %s %r" % (typ, dat))
-    for part in dat:
-        if isinstance(part, tuple):
-            m = re.match(rb"(\d+) ", part[0])
-            if m:
-                headers[int(m.group(1))] = email.message_from_bytes(part[1])
+    internal = fetch_internaldates("1:*", "sent-fetch")
+    headers = fetch_headers("1:*", "DATE TO CC BCC" + (" MESSAGE-ID" if IDS_JSON else ""), "sent-fetch")
 M.logout()
 print("5. Sent     ok  %d messages, %d dated, %d with headers" % (sent_n, len(internal), len(headers)))
+
+if IDS_JSON:
+    sent_recent, sent_no_id, sent_undated = [], 0, 0
+    for seq in sorted(internal):
+        at = as_utc(internal[seq])
+        if at < ids_since:
+            continue
+        msg = headers.get(seq)
+        mid = message_id(msg.get("Message-ID") if msg is not None else "")
+        try:
+            dated = msg is not None and bool(msg.get("Date")) and email.utils.parsedate_to_datetime(msg["Date"]) is not None
+        except (TypeError, ValueError):
+            dated = False
+        if not mid:
+            sent_no_id += 1
+        elif not dated:
+            # The Sent mirror skips a message with no usable Date header (it
+            # counts it as undated), so it would never be found there.
+            sent_undated += 1
+        else:
+            sent_recent.append({"message_id": mid, "at": at.isoformat(), "to": header_text(msg.get("To"))})
+    with io.open(IDS_JSON, "w", encoding="utf-8") as fh:
+        json.dump({"hours": IDS_HOURS, "since": ids_since.isoformat(),
+                   "inbox": inbox_recent, "inbox_no_message_id": inbox_no_id,
+                   "sent": sent_recent, "sent_no_message_id": sent_no_id, "sent_undated": sent_undated},
+                  fh, ensure_ascii=False)
+    print("   last %dh: %d INBOX and %d Sent message(s) by Message-ID -> %s"
+          % (IDS_HOURS, len(inbox_recent), len(sent_recent), IDS_JSON))
 print("\nIMAP CHECK: PASSED")
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,9 @@ enrichment, scoring, or drafting logic yet.
 - **Postgres 16** — single container, two databases: `n8n` (n8n's own state)
   and `novascout` (application schema, built starting Sprint 1)
 - **NocoDB** — review UI layer (Docker), default internal metadata store for now
+- **imap-health** — small Python container that runs the IMAP pre-flight for
+  the IMAP Health workflow (Workflow 6); no published port, see
+  `n8n/sendtrack/README.md`
 - **Ollama** — native Windows install, NOT containerized (needs direct GPU
   access). Runs and is managed separately from the Docker stack.
 

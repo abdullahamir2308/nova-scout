@@ -3,6 +3,7 @@
     n8n/workflows/send.json           send0001       cron -> guard -> claim -> SMTP -> log
     n8n/workflows/mailbox-watch.json  mailwatch0001  IMAP Sent mirror + IMAP reply/opt-out watch
     n8n/workflows/follow-ups.json     followup0001   cron -> follow-up drafts / mark lost
+    n8n/workflows/imap-health.json    imaphealth0001 cron -> IMAP checker -> missed mail? -> alert operator
 
 Same contract as the enrichment, scoring, contacts and drafting generators: the
 .js files are read verbatim and embedded, so the JS that was tested standalone
@@ -234,18 +235,39 @@ def load_lead_statuses(doc):
     return re.findall(r"[a-z_]+", m.group(1))
 
 
-def load_columns(doc, table):
-    m = re.search(r"\n%s\n(.*?)\n\n" % re.escape(table), doc, re.S)
+def _table_block(doc, table):
+    m = re.search(r"\n%s\r?\n(.*?)\r?\n\r?\n" % re.escape(table), doc, re.S)
     if not m:
         raise AssertionError("%s table not found in Section 8 of %s" % (table, MASTER_REF))
+    return m.group(1)
+
+
+def load_columns(doc, table, must="lead_id"):
     cols = []
-    for chunk in re.sub(r"\([^)]*\)", "", m.group(1)).replace("\n", " ").split(","):
-        name = chunk.strip().split(" ")[0].strip()
+    for chunk in re.sub(r"\([^)]*\)", "", _table_block(doc, table)).replace("\n", " ").split(","):
+        name = chunk.strip().split(" ")[0].strip().replace("[]", "")
         if name:
             cols.append(name)
-    if "lead_id" not in cols:
+    if must not in cols:
         raise AssertionError("%s column parse looks wrong in %s: %r" % (table, MASTER_REF, cols))
     return cols
+
+
+def load_health_problems(doc):
+    """Section 8: mailbox_health.problems[] (a|b|c) -- the IMAP health check's problem codes."""
+    m = re.search(r"problems\[\] \(([a-z|-]+)\)", _table_block(doc, "mailbox_health"))
+    if not m:
+        raise AssertionError("mailbox_health problem codes not found in Section 8 of %s -- expected "
+                             "'problems[] (a|b|...)'" % MASTER_REF)
+    return m.group(1).split("|")
+
+
+def load_health_interval(doc):
+    m = re.search(r"health check runs every (\d+) minutes", doc)
+    if not m:
+        raise AssertionError("IMAP health check interval not found in Section 9 of %s -- expected "
+                             "'health check runs every N minutes'" % MASTER_REF)
+    return int(m.group(1))
 
 
 # docker-compose's GENERIC_TIMEZONE is the operator's clock -- the IMAP
@@ -276,7 +298,11 @@ GEOGRAPHIES = load_geographies(DOC)
 LEAD_STATUSES = load_lead_statuses(DOC)
 OUTREACH_COLUMNS = load_columns(DOC, "outreach_log")
 DRAFTS_COLUMNS = load_columns(DOC, "drafts")
-SENDER_ZONE, SENDER_OFFSET = load_sender_offset(_read(COMPOSE))
+HEALTH_COLUMNS = load_columns(DOC, "mailbox_health", must="check_name")
+HEALTH_PROBLEMS = load_health_problems(DOC)
+HEALTH_INTERVAL_MIN = load_health_interval(DOC)
+COMPOSE_TEXT = _read(COMPOSE)
+SENDER_ZONE, SENDER_OFFSET = load_sender_offset(COMPOSE_TEXT)
 
 
 # ---------------------------------------------------------------------------
@@ -909,6 +935,137 @@ SELECT (p.p->>'lead_id')::bigint   AS lead_id,
   FROM p;"""
 
 
+def with_iso(sql):
+    """ISO(x) in the IMAP Health SQL -> iso(x), so every clock value leaves in one format."""
+    return re.sub(r"\bISO\(([\w.]+)\)", lambda m: iso(m.group(1)), sql)
+
+
+HEALTH_LOAD_SQL = with_iso("""-- Load Health State: the IMAP checker's Message-IDs against what Mailbox Watch
+-- has recorded, plus this check's previous state -- one statement, one snapshot,
+-- one clock.
+--
+-- $1 {inbox: [{message_id, at, from, subject}], sent: [{message_id, at, to}], grace_min}
+--    The lists come from Check IMAP (empty when the checker did not answer);
+--    `at` is INTERNALDATE, when the message landed in its folder.
+--
+-- A message is MISSED once it has been in its folder longer than grace_min with
+-- no row. INBOX counts only from when Mailbox Watch first ran: its Inbox trigger
+-- reads new mail only, so older messages were never its to record. Sent is read
+-- whole on every activation, so every Sent message is expected -- except the ones
+-- the pre-flight already leaves out (no Message-ID, or no usable Date header,
+-- which the mirror skips as undated).
+WITH p AS (
+  SELECT $1::jsonb AS p
+),
+clk AS (
+  SELECT now() AS now, make_interval(mins => (p.p->>'grace_min')::int) AS grace
+    FROM p
+),
+watch AS (
+  SELECT least((SELECT min(recorded_at) FROM mailbox_sent WHERE source = 'sent-folder'),
+               (SELECT min(processed_at) FROM inbound_messages)) AS started_at
+),
+inbox AS (
+  SELECT DISTINCT ON (x->>'message_id')
+         x->>'message_id' AS message_id, (x->>'at')::timestamptz AS at, x->>'from' AS from_addr, x->>'subject' AS subject
+    FROM p, jsonb_array_elements(CASE WHEN jsonb_typeof(p.p->'inbox') = 'array' THEN p.p->'inbox' ELSE '[]'::jsonb END) AS x
+   ORDER BY x->>'message_id', (x->>'at')::timestamptz
+),
+sent AS (
+  SELECT DISTINCT ON (x->>'message_id')
+         x->>'message_id' AS message_id, (x->>'at')::timestamptz AS at, x->>'to' AS to_addr
+    FROM p, jsonb_array_elements(CASE WHEN jsonb_typeof(p.p->'sent') = 'array' THEN p.p->'sent' ELSE '[]'::jsonb END) AS x
+   ORDER BY x->>'message_id', (x->>'at')::timestamptz
+),
+missed_inbox AS (
+  SELECT i.* FROM inbox i, clk, watch
+   WHERE i.at <= clk.now - clk.grace
+     AND i.at >= watch.started_at
+     AND NOT EXISTS (SELECT 1 FROM inbound_messages m WHERE m.message_id = i.message_id)
+),
+missed_sent AS (
+  SELECT s.* FROM sent s, clk
+   WHERE s.at <= clk.now - clk.grace
+     AND NOT EXISTS (SELECT 1 FROM mailbox_sent m WHERE m.message_id = s.message_id)
+),
+h AS (
+  SELECT * FROM mailbox_health WHERE check_name = 'imap'
+)
+SELECT ISO(clk.now) AS now,
+       (SELECT value FROM settings WHERE key = 'operator_email') AS operator_email,
+       ISO(watch.started_at) AS watch_started_at,
+       (SELECT ISO(last_synced_at) FROM mailbox_sync WHERE folder = 'Sent') AS sent_synced_at,
+       (SELECT coalesce(jsonb_agg(jsonb_build_object('message_id', message_id, 'at', ISO(at),
+                                                     'from', from_addr, 'subject', subject) ORDER BY at), '[]'::jsonb)
+          FROM missed_inbox) AS missing_inbox,
+       (SELECT coalesce(jsonb_agg(jsonb_build_object('message_id', message_id, 'at', ISO(at),
+                                                     'to', to_addr) ORDER BY at), '[]'::jsonb)
+          FROM missed_sent) AS missing_sent,
+       (SELECT healthy FROM h) AS prev_healthy,
+       (SELECT problems FROM h) AS prev_problems,
+       (SELECT consecutive_failures FROM h) AS prev_consecutive_failures,
+       (SELECT ISO(failing_since) FROM h) AS prev_failing_since,
+       (SELECT ISO(last_alerted_at) FROM h) AS prev_last_alerted_at,
+       (SELECT alerted_problems FROM h) AS prev_alerted_problems
+  FROM clk, watch;""")
+
+HEALTH_RECORD_SQL = with_iso("""-- Record Health: this check into mailbox_health (migration 009). It runs AFTER
+-- the alert, so an alert counts as sent only when SMTP accepted it -- one that
+-- failed is tried again on the next check.
+--
+-- $1 the state Assess Health emitted
+-- $2 Send Alert's output when an alert was attempted; otherwise Assess Health's
+--    own item, which has no `accepted`
+WITH p AS (
+  SELECT $1::jsonb AS s, $2::jsonb AS r
+),
+v AS (
+  SELECT (p.s->>'healthy')::boolean AS healthy,
+         coalesce(p.s->>'alert_kind' = 'problem'
+                  AND p.r->>'error' IS NULL
+                  AND jsonb_typeof(p.r->'accepted') = 'array'
+                  AND jsonb_array_length(p.r->'accepted') > 0, false) AS alert_sent,
+         ARRAY(SELECT jsonb_array_elements_text(
+           CASE WHEN jsonb_typeof(p.s->'problems') = 'array' THEN p.s->'problems' ELSE '[]'::jsonb END)) AS problems,
+         ARRAY(SELECT jsonb_array_elements_text(
+           CASE WHEN jsonb_typeof(p.s->'prev_alerted_problems') = 'array' THEN p.s->'prev_alerted_problems'
+                ELSE '[]'::jsonb END)) AS prev_alerted_problems
+    FROM p
+),
+up AS (
+  INSERT INTO mailbox_health AS h (check_name, healthy, problems, detail, consecutive_failures, failing_since,
+                                   last_checked_at, last_ok_at, last_alerted_at, alerted_problems)
+  SELECT 'imap', v.healthy, v.problems, p.s->>'detail', (p.s->>'consecutive_failures')::int,
+         (p.s->>'failing_since')::timestamptz, now(),
+         CASE WHEN v.healthy THEN now() END,
+         -- Cleared when healthy (the episode is over); stamped only on an alert
+         -- SMTP accepted; otherwise carried forward.
+         CASE WHEN v.healthy THEN NULL WHEN v.alert_sent THEN now()
+              ELSE (p.s->>'prev_last_alerted_at')::timestamptz END,
+         CASE WHEN v.healthy THEN NULL WHEN v.alert_sent THEN v.problems ELSE v.prev_alerted_problems END
+    FROM p, v
+  ON CONFLICT (check_name) DO UPDATE
+     SET healthy              = EXCLUDED.healthy,
+         problems             = EXCLUDED.problems,
+         detail               = EXCLUDED.detail,
+         consecutive_failures = EXCLUDED.consecutive_failures,
+         failing_since        = EXCLUDED.failing_since,
+         last_checked_at      = EXCLUDED.last_checked_at,
+         last_ok_at           = coalesce(EXCLUDED.last_ok_at, h.last_ok_at),
+         last_alerted_at      = EXCLUDED.last_alerted_at,
+         alerted_problems     = EXCLUDED.alerted_problems
+  RETURNING h.healthy, h.problems, h.consecutive_failures, h.failing_since, h.last_alerted_at
+)
+SELECT up.healthy                AS healthy,
+       up.problems               AS problems,
+       up.consecutive_failures   AS consecutive_failures,
+       ISO(up.failing_since)     AS failing_since,
+       ISO(up.last_alerted_at)   AS last_alerted_at,
+       p.s->>'alert_kind'        AS alert_kind,
+       v.alert_sent              AS alert_sent
+  FROM up, p, v;""")
+
+
 # ---------------------------------------------------------------------------
 # SQL guards
 # ---------------------------------------------------------------------------
@@ -1039,6 +1196,32 @@ _assert_wired("Build Follow-Up (r.*)", _reads(_followup, "r"), final_select_alia
 _assert_js_emits("Write Follow-Up", _sql_payload_reads(FOLLOWUP_WRITE_SQL) |
                  set(re.findall(r"p\.p->'draft'->>'(\w+)'", FOLLOWUP_WRITE_SQL)), _followup, "code_followup.js")
 
+# IMAP Health crosses two process boundaries before it reaches n8n -- the
+# pre-flight writes a JSON file, the checker serves it -- and both are guarded
+# the same way as a node boundary.
+_health = js("code_health.js")
+_server = js("imap_health_server.py")
+_preflight = js("imap_preflight.py")
+HEALTH_CONFIG_FIELDS = {"checker_url", "grace_min", "confirm_after", "remind_hours"}
+_assert_wired("Assess Health (db.*)", _reads(_health, "db"), final_select_aliases(HEALTH_LOAD_SQL), "Load Health State")
+_assert_wired("Assess Health (cfg.*)", _reads(_health, "cfg"), HEALTH_CONFIG_FIELDS, "Config")
+_assert_wired("Assess Health (check.*)", _reads(_health, "check") - {"error"},
+              set(re.findall(r'"(\w+)":', _server)), "imap_health_server.py's answer")
+_assert_wired("Load Health State (x->>'...')", set(re.findall(r"x->>'(\w+)'", HEALTH_LOAD_SQL)),
+              set(re.findall(r'"(\w+)":', _preflight)), "imap_preflight.py --ids-json")
+_assert_js_emits("Record Health", _sql_payload_reads(HEALTH_RECORD_SQL, prefix="p.s"), _health, "code_health.js")
+HEALTH_EMAIL_READS = {"notify", "notify_to", "subject", "text"}
+_assert_js_emits("Alert? / Send Alert", HEALTH_EMAIL_READS, _health, "code_health.js")
+
+_found = re.findall(r"^\s*'([a-z-]+)':", _js_block(_health, "PROBLEMS", "code_health.js"), re.M)
+assert _found == HEALTH_PROBLEMS, (
+    "the IMAP health problem codes drifted between Section 8 (mailbox_health.problems) and code_health.js:\n"
+    "  doc: %r\n  js:  %r" % (HEALTH_PROBLEMS, _found))
+_insert_cols = [c.strip() for c in re.search(r"INSERT INTO mailbox_health AS h \(([^)]+)\)", HEALTH_RECORD_SQL)
+                .group(1).replace("\n", " ").split(",")]
+_unknown = [c for c in _insert_cols if c not in HEALTH_COLUMNS]
+assert not _unknown, "Record Health writes mailbox_health.%r, which Section 8 does not define." % _unknown
+
 
 # ---------------------------------------------------------------------------
 # Code nodes with their build constants baked in
@@ -1061,6 +1244,7 @@ MIRROR_JS = bake("code_mirror_sent.js", OWN_DOMAIN=OWN_DOMAIN)
 CLASSIFY_JS = bake("code_classify_reply.js", OWN_DOMAIN=OWN_DOMAIN)
 NOTIFY_JS = bake("code_notify.js")
 FOLLOWUP_JS = bake("code_followup.js", SIGNATURE=SIGNATURE, SENDER_NAME=SENDER_NAME)
+HEALTH_JS = bake("code_health.js")
 
 
 # ---------------------------------------------------------------------------
@@ -1130,6 +1314,18 @@ def imap_trigger(name, mailbox, track_last, pos, notes):
         },
         "name": name, "type": "n8n-nodes-base.emailReadImap", "typeVersion": 2.2, "position": pos,
         "credentials": IMAP_CRED, "notes": notes,
+    }
+
+
+def http_get_node(name, url_expr, timeout_ms, pos, notes):
+    # Continue-on-error so "nothing answered" reaches Assess Health as an item
+    # ({error: ...}) instead of stopping the tick; never-error so a non-2xx
+    # answer is judged there too, not thrown here.
+    return {
+        "parameters": {"url": url_expr, "options": {
+            "timeout": timeout_ms, "response": {"response": {"neverError": True, "responseFormat": "json"}}}},
+        "name": name, "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": pos,
+        "onError": "continueRegularOutput", "notes": notes,
     }
 
 
@@ -1320,6 +1516,99 @@ followup_connections = {
     "Build Follow-Up": edge("Write Follow-Up"),
 }
 
+# ---------------------------------------------------------------------------
+# Workflow: IMAP Health
+# ---------------------------------------------------------------------------
+
+# The checker is the imap-health service in docker-compose.yml, on the port
+# imap_health_server.py listens on; both are asserted below.
+_port = re.search(r"^PORT = (\d+)$", _server, re.M)
+assert _port, "PORT not found in imap_health_server.py"
+HEALTH_CHECKER_SERVICE = "imap-health"
+HEALTH_CONFIG = {"checker_url": "http://%s:%s/check" % (HEALTH_CHECKER_SERVICE, _port.group(1)),
+                 "grace_min": 15, "confirm_after": 2, "remind_hours": 6}
+
+health_nodes = [
+    {"parameters": {"rule": {"interval": [{"field": "minutes", "minutesInterval": HEALTH_INTERVAL_MIN}]}},
+     "name": "Every %d Minutes" % HEALTH_INTERVAL_MIN, "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2,
+     "position": [-1100, 40],
+     "notes": ("Section 9: the health check runs every %d minutes. Activation is a UI Publish action, never the "
+               "CLI (Section 3). While the host sleeps nothing runs -- this included; mail that lands then is "
+               "recorded when Mailbox Watch reconnects." % HEALTH_INTERVAL_MIN)},
+    {"parameters": {}, "name": "Manual Trigger", "type": "n8n-nodes-base.manualTrigger", "typeVersion": 1,
+     "position": [-1100, 220]},
+    {
+        "parameters": {"assignments": {"assignments": [
+            {"id": "checker", "name": "checker_url", "value": HEALTH_CONFIG["checker_url"], "type": "string"},
+            {"id": "grace", "name": "grace_min", "value": HEALTH_CONFIG["grace_min"], "type": "number"},
+            {"id": "confirm", "name": "confirm_after", "value": HEALTH_CONFIG["confirm_after"], "type": "number"},
+            {"id": "remind", "name": "remind_hours", "value": HEALTH_CONFIG["remind_hours"], "type": "number"},
+        ]}, "options": {}},
+        "name": "Config", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [-880, 130],
+        "notes": ("grace_min: how long a message may sit in INBOX or Sent unrecorded before it counts as missed "
+                  "(the triggers record within seconds). confirm_after: consecutive failing checks before an "
+                  "alert -- a host waking can tick this before Mailbox Watch reconnects. remind_hours: repeat "
+                  "while it lasts. checker_url: the imap-health service (docker-compose.yml)."),
+    },
+    http_get_node("Check IMAP", "={{ $json.checker_url }}", 150000, [-660, 130],
+                  "imap_preflight.py -- the same connection logic, unchanged -- run by the imap-health service: "
+                  "a fresh read-only IMAP session, plus the Message-IDs of everything that landed in INBOX and "
+                  "Sent in the last 48 hours. The n8n image has no Python, hence the service."),
+    pg_node("Load Health State", HEALTH_LOAD_SQL,
+            "={{ [JSON.stringify({ inbox: $json.inbox || [], sent: $json.sent || [], "
+            "grace_min: $('Config').first().json.grace_min })] }}", [-440, 130],
+            "Those Message-IDs against inbound_messages and mailbox_sent: anything that landed more than "
+            "grace_min ago with no row was MISSED -- the proof a login alone cannot give that Mailbox Watch is "
+            "still listening. Plus the previous check's state and the operator's address (settings table)."),
+    code_node("Assess Health", HEALTH_JS, "runOnceForAllItems", [-220, 130],
+              "Problems: checker-unreachable, imap-failed, inbox-missed, sent-missed. Alert after confirm_after "
+              "consecutive failing checks, remind every remind_hours, alert again if the problem changes, one "
+              "email when it clears."),
+    if_node("Alert?", "notify", "={{ $json.notify }}", [0, 130],
+            "Only when there is something to say AND the settings table holds an operator address."),
+    email_node("Send Alert", "={{ $json.notify_to }}", "={{ $json.subject }}", "={{ $json.text }}", [220, 40],
+               "To the operator's own inbox, never the outreach mailbox. Sent only to that address, so it counts "
+               "toward no warm-up ceiling (Section 9)."),
+    pg_node("Record Health", HEALTH_RECORD_SQL,
+            "={{ [JSON.stringify($('Assess Health').first().json.state), JSON.stringify($json)] }}", [440, 130],
+            "Every check into mailbox_health. After the alert on purpose: an alert counts as sent only when SMTP "
+            "accepted it, so a failed one is retried on the next check."),
+]
+
+health_connections = {
+    "Every %d Minutes" % HEALTH_INTERVAL_MIN: edge("Config"),
+    "Manual Trigger": edge("Config"),
+    "Config": edge("Check IMAP"),
+    "Check IMAP": edge("Load Health State"),
+    "Load Health State": edge("Assess Health"),
+    "Assess Health": edge("Alert?"),
+    "Alert?": branch("Send Alert", "Record Health"),
+    "Send Alert": edge("Record Health"),
+}
+
+# The Load Health State payload is built in an expression: every field its SQL
+# reads must be put there.
+for _f in _sql_payload_reads(HEALTH_LOAD_SQL):
+    assert re.search(r"\b%s:" % _f, [n for n in health_nodes if n["name"] == "Load Health State"][0]
+                     ["parameters"]["options"]["queryReplacement"]), (
+        "Load Health State reads $1->'%s', but its payload expression never sets it." % _f)
+
+# The checker must be what docker-compose.yml actually runs, reachable only on
+# the compose network: it logs in to the mailbox on every request, unauthenticated.
+_svc = re.search(r"^  %s:\n((?:    .*\n|[ \t]*\n)+)" % re.escape(HEALTH_CHECKER_SERVICE), COMPOSE_TEXT, re.M)
+assert _svc, (
+    "IMAP Health calls %s, but docker-compose.yml has no '%s' service." % (HEALTH_CONFIG["checker_url"],
+                                                                          HEALTH_CHECKER_SERVICE))
+assert "imap_health_server.py" in _svc.group(1), (
+    "the %s service in docker-compose.yml does not run imap_health_server.py" % HEALTH_CHECKER_SERVICE)
+assert not re.search(r"^    ports:", _svc.group(1), re.M), (
+    "the %s service publishes a port. It logs in to the mailbox on every request, unauthenticated -- keep it "
+    "on the compose network only." % HEALTH_CHECKER_SERVICE)
+assert 15 <= HEALTH_INTERVAL_MIN <= 30, (
+    "Section 9 says the health check runs every %d minutes; it is meant to run every 15-30 minutes -- often "
+    "enough to catch a dead Inbox trigger within the hour, rarely enough not to hammer the mailbox with "
+    "logins." % HEALTH_INTERVAL_MIN)
+
 
 # ---------------------------------------------------------------------------
 # Structural guards on the shipped workflows
@@ -1330,7 +1619,7 @@ def _config_values(nodes):
     return {a["name"]: a["value"] for a in cfg["parameters"]["assignments"]["assignments"]}
 
 
-for _nodes in (send_nodes, mailwatch_nodes, followup_nodes):
+for _nodes in (send_nodes, mailwatch_nodes, followup_nodes, health_nodes):
     for _n in _nodes:
         if _n["type"] == "n8n-nodes-base.emailSend":
             p = _n["parameters"]
@@ -1351,6 +1640,12 @@ assert _cfg["min_gap_min"] > 0 and 0 < _cfg["send_probability"] < 1, (
 _cfg = _config_values(followup_nodes)
 assert _cfg["now_override"] == "", "the shipped Follow-Ups workflow has a clock override set"
 assert (_cfg["follow_up_days"], _cfg["max_follow_ups"]) == (FOLLOW_UP_DAYS, MAX_FOLLOW_UPS)
+_cfg = _config_values(health_nodes)
+assert set(_cfg) == HEALTH_CONFIG_FIELDS and _cfg["checker_url"] == HEALTH_CONFIG["checker_url"], (
+    "the shipped IMAP Health Config is not what the build asserts against: %r" % _cfg)
+assert _cfg["confirm_after"] >= 2, (
+    "IMAP Health would alert on a single failing check. A host waking from sleep can tick it before Mailbox "
+    "Watch reconnects (Section 9) -- that is a false alarm on every wake.")
 
 
 def workflow(wid, name, nodes, connections):
@@ -1362,6 +1657,7 @@ SHIPPED = [
     ("send.json", workflow("send0001", "Send & Track - Send", send_nodes, send_connections)),
     ("mailbox-watch.json", workflow("mailwatch0001", "Send & Track - Mailbox Watch", mailwatch_nodes, mailwatch_connections)),
     ("follow-ups.json", workflow("followup0001", "Send & Track - Follow-Ups", followup_nodes, followup_connections)),
+    ("imap-health.json", workflow("imaphealth0001", "Send & Track - IMAP Health", health_nodes, health_connections)),
 ]
 
 # No literal email address in a committed workflow except the sender's own From.
@@ -1536,6 +1832,15 @@ if VARIANTS_OUT:
                 assert a == b, "the Mailbox Watch test variant changed node %r" % n["name"]
         VARIANTS.append(("mailwatch-test.json", mw_test))
 
+    health_wf = SHIPPED[3][1]
+    dry_health = dry_variant(health_wf, "imaphealth0001dry", "DRY RUN - IMAP Health (scratch DB, SMTP sink)", {},
+                             {"Every %d Minutes" % HEALTH_INTERVAL_MIN})
+    got = _node_diff(health_wf, dry_health)
+    want = sorted([("Every %d Minutes" % HEALTH_INTERVAL_MIN, "removed"), ("Load Health State", "credentials"),
+                   ("Send Alert", "credentials"), ("Record Health", "credentials")])
+    assert sorted(got) == want, "the dry-run IMAP Health variant drifted: %r" % sorted(got)
+    VARIANTS.append(("imaphealth-dryrun.json", dry_health))
+
     for _file, _wf in VARIANTS:
         _write(os.path.join(VARIANTS_OUT, _file), _wf)
 
@@ -1558,5 +1863,7 @@ print("  From: %s    own domain: %s" % (FROM_HEADER, OWN_DOMAIN))
 print("  signature checked on every body: %r" % SIGNATURE)
 print("  operator notification address: read at runtime from settings.operator_email "
       "(sync_settings.py) -- not baked in")
+print("  IMAP health (Section 9): every %d min -> %s; problems %r" % (
+    HEALTH_INTERVAL_MIN, HEALTH_CONFIG["checker_url"], HEALTH_PROBLEMS))
 print("  literal email addresses in the shipped JSON: %s" % (
     "; ".join("%s (%s)" % (a, ", ".join(sorted(w))) for a, w in sorted(LITERAL_ADDRESSES.items())) or "none"))

@@ -43,6 +43,36 @@ services:
     ports:
       - "5678:5678"
 
+  imap-health:
+    # The IMAP health check's checker (Master Ref Section 9, Workflow 6). Runs
+    # n8n/sendtrack/imap_preflight.py -- the pre-flight's connection logic,
+    # unchanged -- when the "Send & Track - IMAP Health" workflow calls
+    # http://imap-health:8765/check. It is a separate container because the n8n
+    # image has no Python and n8n 2.x excludes the Execute Command node by
+    # default; enabling that would give every workflow shell access.
+    #
+    # Deliberately small: only the mailbox's IMAP settings (not the whole .env),
+    # code mounted read-only, a read-only filesystem, no root, and NO published
+    # port -- every request logs in to the mailbox, unauthenticated, so it stays
+    # on the compose network. build_workflow.py refuses a `ports:` here.
+    image: python:3.12-alpine
+    restart: unless-stopped
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      NOVASCOUT_MAILBOX_ADDRESS: ${NOVASCOUT_MAILBOX_ADDRESS}
+      NOVASCOUT_MAILBOX_PASSWORD: ${NOVASCOUT_MAILBOX_PASSWORD}
+      NOVASCOUT_IMAP_HOST: ${NOVASCOUT_IMAP_HOST}
+      NOVASCOUT_IMAP_PORT: ${NOVASCOUT_IMAP_PORT:-993}
+      NOVASCOUT_MASTER_REF: /opt/novascout/NovaScout_MasterRef.md
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./n8n/sendtrack:/opt/novascout/sendtrack:ro
+      - ./NovaScout_MasterRef.md:/opt/novascout/NovaScout_MasterRef.md:ro
+    command: ["python", "-u", "/opt/novascout/sendtrack/imap_health_server.py"]
+
   nocodb:
     image: nocodb/nocodb:latest
     restart: unless-stopped

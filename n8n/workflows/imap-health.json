@@ -1,0 +1,323 @@
+{
+  "id": "imaphealth0001",
+  "name": "Send & Track - IMAP Health",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 20
+            }
+          ]
+        }
+      },
+      "name": "Every 20 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1100,
+        40
+      ],
+      "notes": "Section 9: the health check runs every 20 minutes. Activation is a UI Publish action, never the CLI (Section 3). While the host sleeps nothing runs -- this included; mail that lands then is recorded when Mailbox Watch reconnects."
+    },
+    {
+      "parameters": {},
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1100,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "checker",
+              "name": "checker_url",
+              "value": "http://imap-health:8765/check",
+              "type": "string"
+            },
+            {
+              "id": "grace",
+              "name": "grace_min",
+              "value": 15,
+              "type": "number"
+            },
+            {
+              "id": "confirm",
+              "name": "confirm_after",
+              "value": 2,
+              "type": "number"
+            },
+            {
+              "id": "remind",
+              "name": "remind_hours",
+              "value": 6,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -880,
+        130
+      ],
+      "notes": "grace_min: how long a message may sit in INBOX or Sent unrecorded before it counts as missed (the triggers record within seconds). confirm_after: consecutive failing checks before an alert -- a host waking can tick this before Mailbox Watch reconnects. remind_hours: repeat while it lasts. checker_url: the imap-health service (docker-compose.yml)."
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.checker_url }}",
+        "options": {
+          "timeout": 150000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "name": "Check IMAP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -660,
+        130
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "imap_preflight.py -- the same connection logic, unchanged -- run by the imap-health service: a fresh read-only IMAP session, plus the Message-IDs of everything that landed in INBOX and Sent in the last 48 hours. The n8n image has no Python, hence the service."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Load Health State: the IMAP checker's Message-IDs against what Mailbox Watch\n-- has recorded, plus this check's previous state -- one statement, one snapshot,\n-- one clock.\n--\n-- $1 {inbox: [{message_id, at, from, subject}], sent: [{message_id, at, to}], grace_min}\n--    The lists come from Check IMAP (empty when the checker did not answer);\n--    `at` is INTERNALDATE, when the message landed in its folder.\n--\n-- A message is MISSED once it has been in its folder longer than grace_min with\n-- no row. INBOX counts only from when Mailbox Watch first ran: its Inbox trigger\n-- reads new mail only, so older messages were never its to record. Sent is read\n-- whole on every activation, so every Sent message is expected -- except the ones\n-- the pre-flight already leaves out (no Message-ID, or no usable Date header,\n-- which the mirror skips as undated).\nWITH p AS (\n  SELECT $1::jsonb AS p\n),\nclk AS (\n  SELECT now() AS now, make_interval(mins => (p.p->>'grace_min')::int) AS grace\n    FROM p\n),\nwatch AS (\n  SELECT least((SELECT min(recorded_at) FROM mailbox_sent WHERE source = 'sent-folder'),\n               (SELECT min(processed_at) FROM inbound_messages)) AS started_at\n),\ninbox AS (\n  SELECT DISTINCT ON (x->>'message_id')\n         x->>'message_id' AS message_id, (x->>'at')::timestamptz AS at, x->>'from' AS from_addr, x->>'subject' AS subject\n    FROM p, jsonb_array_elements(CASE WHEN jsonb_typeof(p.p->'inbox') = 'array' THEN p.p->'inbox' ELSE '[]'::jsonb END) AS x\n   ORDER BY x->>'message_id', (x->>'at')::timestamptz\n),\nsent AS (\n  SELECT DISTINCT ON (x->>'message_id')\n         x->>'message_id' AS message_id, (x->>'at')::timestamptz AS at, x->>'to' AS to_addr\n    FROM p, jsonb_array_elements(CASE WHEN jsonb_typeof(p.p->'sent') = 'array' THEN p.p->'sent' ELSE '[]'::jsonb END) AS x\n   ORDER BY x->>'message_id', (x->>'at')::timestamptz\n),\nmissed_inbox AS (\n  SELECT i.* FROM inbox i, clk, watch\n   WHERE i.at <= clk.now - clk.grace\n     AND i.at >= watch.started_at\n     AND NOT EXISTS (SELECT 1 FROM inbound_messages m WHERE m.message_id = i.message_id)\n),\nmissed_sent AS (\n  SELECT s.* FROM sent s, clk\n   WHERE s.at <= clk.now - clk.grace\n     AND NOT EXISTS (SELECT 1 FROM mailbox_sent m WHERE m.message_id = s.message_id)\n),\nh AS (\n  SELECT * FROM mailbox_health WHERE check_name = 'imap'\n)\nSELECT to_char((clk.now) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS now,\n       (SELECT value FROM settings WHERE key = 'operator_email') AS operator_email,\n       to_char((watch.started_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS watch_started_at,\n       (SELECT to_char((last_synced_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM mailbox_sync WHERE folder = 'Sent') AS sent_synced_at,\n       (SELECT coalesce(jsonb_agg(jsonb_build_object('message_id', message_id, 'at', to_char((at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),\n                                                     'from', from_addr, 'subject', subject) ORDER BY at), '[]'::jsonb)\n          FROM missed_inbox) AS missing_inbox,\n       (SELECT coalesce(jsonb_agg(jsonb_build_object('message_id', message_id, 'at', to_char((at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),\n                                                     'to', to_addr) ORDER BY at), '[]'::jsonb)\n          FROM missed_sent) AS missing_sent,\n       (SELECT healthy FROM h) AS prev_healthy,\n       (SELECT problems FROM h) AS prev_problems,\n       (SELECT consecutive_failures FROM h) AS prev_consecutive_failures,\n       (SELECT to_char((failing_since) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM h) AS prev_failing_since,\n       (SELECT to_char((last_alerted_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM h) AS prev_last_alerted_at,\n       (SELECT alerted_problems FROM h) AS prev_alerted_problems\n  FROM clk, watch;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify({ inbox: $json.inbox || [], sent: $json.sent || [], grace_min: $('Config').first().json.grace_min })] }}"
+        }
+      },
+      "name": "Load Health State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -440,
+        130
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Those Message-IDs against inbound_messages and mailbox_sent: anything that landed more than grace_min ago with no row was MISSED -- the proof a login alone cannot give that Mailbox Watch is still listening. Plus the previous check's state and the operator's address (settings table)."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Assess Health -- n8n Code node (Run Once for All Items).\n//\n// Section 9, Workflow 6: Mailbox Watch is proven live only when it fires, and\n// nothing proves its IMAP connection is up in between. Every tick of the IMAP\n// Health workflow asks two things and this node judges the answers:\n//\n//   1. Does a fresh read-only IMAP session to the mailbox work?  (Check IMAP --\n//      imap_preflight.py, run by the imap-health service)\n//   2. Has Mailbox Watch recorded every INBOX and Sent message that landed more\n//      than grace_min ago?  (Load Health State -- the pre-flight's Message-IDs\n//      against inbound_messages and mailbox_sent)\n//\n// The second is the one that proves the triggers are listening: a login that\n// works says the mailbox is reachable, not that n8n is still connected to it.\n//\n// Nothing alerts on one bad check. Both outages on 2026-09-16 were a host\n// waking or starting, and on a wake this workflow can tick before Mailbox Watch\n// has reconnected -- mail that arrived during sleep looks \"missed\" for a few\n// seconds. confirm_after consecutive failing checks are needed first. Then one\n// email, a reminder every remind_hours while the same problem lasts, a new\n// email if the problem changes, and one when it clears.\n//\n// The operator's address comes from the settings table at runtime (migration\n// 008) -- nothing is baked into this node.\n\nconst ADDRESS = /^[^\\s@<>(),;:\"']+@[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)+$/;\n\n// The problem codes, in the order an email lists them. Section 8 lists the same\n// set for mailbox_health.problems; the build refuses if they drift.\nconst PROBLEMS = {\n  'checker-unreachable': 'the health checker is not answering',\n  'imap-failed': 'the mailbox is not reachable over IMAP',\n  'inbox-missed': 'Mailbox Watch has missed INBOX mail',\n  'sent-missed': 'Mailbox Watch has missed Sent mail',\n};\n\nconst LIST_MAX = 10;\n\nfunction str(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\nfunction arr(v) {\n  return Array.isArray(v) ? v : [];\n}\n\nfunction ms(iso) {\n  const t = new Date(str(iso)).getTime();\n  return isNaN(t) ? null : t;\n}\n\nfunction operatorAddress(db) {\n  const a = str(db.operator_email).toLowerCase();\n  return ADDRESS.test(a) ? a : '';\n}\n\n// What the n8n HTTP Request node hands on: the checker's JSON body, or -- with\n// continue-on-error -- { error: ... } when nothing answered.\nfunction checkerProblem(check) {\n  if (!check || check.error !== undefined || typeof check.ok !== 'boolean') {\n    const e = check ? check.error : undefined;\n    const why = typeof e === 'string' ? e : e && (e.message || e.code) ? str(e.message || e.code) : 'no usable answer';\n    return { code: 'checker-unreachable', why: why.slice(0, 300) };\n  }\n  if (!check.ok) return { code: 'imap-failed' };\n  return null;\n}\n\nfunction listMessages(rows, line) {\n  const out = rows.slice(0, LIST_MAX).map(line);\n  if (rows.length > LIST_MAX) out.push('  ... and ' + (rows.length - LIST_MAX) + ' more');\n  return out;\n}\n\nfunction problemLines(code, ctx) {\n  const { check, db, cfg, why } = ctx;\n  if (code === 'checker-unreachable') {\n    return [\n      'The health checker did not answer: ' + why,\n      'Nothing was checked, so this says nothing about the mailbox itself -- but until it answers, a dead ' +\n        'Mailbox Watch goes unnoticed. The checker is the imap-health service in docker-compose.yml ' +\n        '(docker compose ps imap-health; docker compose logs imap-health).',\n    ];\n  }\n  if (code === 'imap-failed') {\n    const lines = ['A fresh read-only IMAP session failed at ' + (str(check.stage) || '?') + ': ' + (str(check.detail) || '?')];\n    if (str(check.hint)) lines.push('(hint: ' + str(check.hint) + ')');\n    lines.push(\n      'Mailbox Watch uses the same server and account, so it is almost certainly not receiving mail either -- ' +\n        'replies and opt-outs are not being recorded. n8n retries it by itself, but after a long outage its next ' +\n        'attempt can be hours away (Master Ref Section 3). Once the mailbox answers again, re-publish Mailbox Watch ' +\n        'in the n8n UI, or restart n8n, to reconnect it at once.');\n    return lines;\n  }\n  if (code === 'inbox-missed') {\n    const rows = arr(db.missing_inbox);\n    return [\n      rows.length + ' INBOX message(s) landed more than ' + cfg.grace_min + ' minutes ago and Mailbox Watch has ' +\n        'not recorded them. Its Inbox trigger is not running: replies and opt-outs are not being recorded, ' +\n        'blocklisted or notified.',\n      'Re-publish Mailbox Watch in the n8n UI, or restart n8n -- on activation it catches up on what it missed. ' +\n        'Until then, read these by hand and blocklist any opt-out:',\n    ].concat(listMessages(rows, (r) => '  ' + str(r.at) + '  ' + str(r.from) + '  \"' + str(r.subject) + '\"'));\n  }\n  const rows = arr(db.missing_sent);\n  return [\n    rows.length + ' Sent message(s) landed more than ' + cfg.grace_min + ' minutes ago and are not in the Sent ' +\n      'mirror (mailbox_sent), so the warm-up ceiling does not count them. Re-publishing Mailbox Watch re-reads ' +\n      'the whole folder.',\n  ].concat(listMessages(rows, (r) => '  ' + str(r.at) + '  to ' + (str(r.to) || '?') + '  ' + str(r.message_id)));\n}\n\nfunction assess(check, db, cfg) {\n  const now = ms(db.now);\n  const found = checkerProblem(check);\n  const problems = [];\n  if (found) problems.push(found.code);\n  if (arr(db.missing_inbox).length) problems.push('inbox-missed');\n  if (arr(db.missing_sent).length) problems.push('sent-missed');\n  const healthy = problems.length === 0;\n\n  const prevAlertedAt = str(db.prev_last_alerted_at) || null;\n  const prevAlerted = arr(db.prev_alerted_problems);\n  const consecutive = healthy ? 0 : (Number(db.prev_consecutive_failures) || 0) + 1;\n  const failingSince = healthy ? null : str(db.prev_failing_since) || str(db.now);\n  const confirmed = !healthy && consecutive >= cfg.confirm_after;\n  const sameProblems = problems.slice().sort().join(',') === prevAlerted.slice().sort().join(',');\n  const reminderDue = prevAlertedAt !== null && now - ms(prevAlertedAt) >= cfg.remind_hours * 3600 * 1000;\n\n  let alertKind = null;\n  if (confirmed && (prevAlertedAt === null || !sameProblems || reminderDue)) alertKind = 'problem';\n  else if (healthy && prevAlertedAt !== null) alertKind = 'recovered';\n\n  const ctx = { check: check || {}, db, cfg, why: found && found.why };\n  let subject = '';\n  const lines = [];\n  if (alertKind === 'problem') {\n    subject = '[Nova Scout] IMAP health: ' + problems.map((p) => PROBLEMS[p]).join('; ');\n    problems.forEach((p, i) => {\n      if (i) lines.push('');\n      problemLines(p, ctx).forEach((l) => lines.push(l));\n    });\n    lines.push('');\n    lines.push('Failing since ' + failingSince + ' (' + consecutive + ' consecutive checks); checked ' + str(db.now) + '.');\n    lines.push('A reminder follows every ' + cfg.remind_hours + ' hours while this lasts, and one email when it clears.');\n  } else if (alertKind === 'recovered') {\n    subject = '[Nova Scout] IMAP health: OK again';\n    const was = arr(db.prev_problems);\n    lines.push('IMAP health is OK again: the mailbox answers, and every INBOX and Sent message from the last ' +\n      (Number(ctx.check.hours) || '?') + ' hours is in Mailbox Watch\\'s records.');\n    lines.push('It was: ' + (was.length ? was.map((p) => PROBLEMS[p] || p).join('; ') : '?') + ' -- from ' +\n      (str(db.prev_failing_since) || '?') + ' until ' + str(db.now) + '.');\n    if (was.some((p) => p !== 'checker-unreachable')) {\n      const synced = ms(db.sent_synced_at);\n      const since = ms(db.prev_failing_since);\n      lines.push('');\n      if (synced !== null && since !== null && synced > since) {\n        lines.push('Mailbox Watch read the Sent folder at ' + str(db.sent_synced_at) + ', after the problem began, ' +\n          'so it was connected again at that point.');\n      } else {\n        lines.push('Mailbox Watch has not read the Sent folder since the problem began. Either its connection held ' +\n          'throughout, or n8n is still waiting to retry it (Master Ref Section 3) -- if so, the next message it ' +\n          'misses is reported here.');\n      }\n    }\n  }\n\n  const detail = healthy ? null : problems.map((p) => {\n    if (p === 'checker-unreachable') return p + ': ' + found.why;\n    if (p === 'imap-failed') return p + ' at ' + (str(ctx.check.stage) || '?') + ': ' + (str(ctx.check.detail) || '?');\n    if (p === 'inbox-missed') return p + ': ' + arr(db.missing_inbox).length + ' message(s)';\n    return p + ': ' + arr(db.missing_sent).length + ' message(s)';\n  }).join('; ').slice(0, 2000);\n\n  const notifyTo = operatorAddress(db);\n  return {\n    healthy: healthy,\n    problems: problems,\n    confirmed: confirmed,\n    alert_kind: alertKind,\n    notify: alertKind !== null && notifyTo !== '',\n    notify_to: notifyTo,\n    subject: subject.slice(0, 200),\n    text: lines.join('\\n'),\n    state: {\n      healthy: healthy,\n      problems: problems,\n      detail: detail,\n      consecutive_failures: consecutive,\n      failing_since: failingSince,\n      alert_kind: alertKind,\n      prev_last_alerted_at: prevAlertedAt,\n      prev_alerted_problems: prevAlerted,\n    },\n  };\n}\n\n// ---------------------------------------------------------------------------\n// Node body\n// ---------------------------------------------------------------------------\n\n// Load Health State (a Postgres node) replaced the items, so the checker's\n// answer and the Config values are read back from their nodes by name.\nconst check = $('Check IMAP').first().json;\nconst cfg = $('Config').first().json;\nreturn [{ json: assess(check, $input.first().json, cfg) }];\n"
+      },
+      "name": "Assess Health",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        130
+      ],
+      "notes": "Problems: checker-unreachable, imap-failed, inbox-missed, sent-missed. Alert after confirm_after consecutive failing checks, remind every remind_hours, alert again if the problem changes, one email when it clears."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "notify",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        130
+      ],
+      "notes": "Only when there is something to say AND the settings table holds an operator address."
+    },
+    {
+      "parameters": {
+        "fromEmail": "\"Abdullah Amir\" <abdullah@amitrixlabs.com>",
+        "toEmail": "={{ $json.notify_to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "name": "Send Alert",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        220,
+        40
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "novascoutSmtp01",
+          "name": "SMTP - outreach mailbox"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "To the operator's own inbox, never the outreach mailbox. Sent only to that address, so it counts toward no warm-up ceiling (Section 9)."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Record Health: this check into mailbox_health (migration 009). It runs AFTER\n-- the alert, so an alert counts as sent only when SMTP accepted it -- one that\n-- failed is tried again on the next check.\n--\n-- $1 the state Assess Health emitted\n-- $2 Send Alert's output when an alert was attempted; otherwise Assess Health's\n--    own item, which has no `accepted`\nWITH p AS (\n  SELECT $1::jsonb AS s, $2::jsonb AS r\n),\nv AS (\n  SELECT (p.s->>'healthy')::boolean AS healthy,\n         coalesce(p.s->>'alert_kind' = 'problem'\n                  AND p.r->>'error' IS NULL\n                  AND jsonb_typeof(p.r->'accepted') = 'array'\n                  AND jsonb_array_length(p.r->'accepted') > 0, false) AS alert_sent,\n         ARRAY(SELECT jsonb_array_elements_text(\n           CASE WHEN jsonb_typeof(p.s->'problems') = 'array' THEN p.s->'problems' ELSE '[]'::jsonb END)) AS problems,\n         ARRAY(SELECT jsonb_array_elements_text(\n           CASE WHEN jsonb_typeof(p.s->'prev_alerted_problems') = 'array' THEN p.s->'prev_alerted_problems'\n                ELSE '[]'::jsonb END)) AS prev_alerted_problems\n    FROM p\n),\nup AS (\n  INSERT INTO mailbox_health AS h (check_name, healthy, problems, detail, consecutive_failures, failing_since,\n                                   last_checked_at, last_ok_at, last_alerted_at, alerted_problems)\n  SELECT 'imap', v.healthy, v.problems, p.s->>'detail', (p.s->>'consecutive_failures')::int,\n         (p.s->>'failing_since')::timestamptz, now(),\n         CASE WHEN v.healthy THEN now() END,\n         -- Cleared when healthy (the episode is over); stamped only on an alert\n         -- SMTP accepted; otherwise carried forward.\n         CASE WHEN v.healthy THEN NULL WHEN v.alert_sent THEN now()\n              ELSE (p.s->>'prev_last_alerted_at')::timestamptz END,\n         CASE WHEN v.healthy THEN NULL WHEN v.alert_sent THEN v.problems ELSE v.prev_alerted_problems END\n    FROM p, v\n  ON CONFLICT (check_name) DO UPDATE\n     SET healthy              = EXCLUDED.healthy,\n         problems             = EXCLUDED.problems,\n         detail               = EXCLUDED.detail,\n         consecutive_failures = EXCLUDED.consecutive_failures,\n         failing_since        = EXCLUDED.failing_since,\n         last_checked_at      = EXCLUDED.last_checked_at,\n         last_ok_at           = coalesce(EXCLUDED.last_ok_at, h.last_ok_at),\n         last_alerted_at      = EXCLUDED.last_alerted_at,\n         alerted_problems     = EXCLUDED.alerted_problems\n  RETURNING h.healthy, h.problems, h.consecutive_failures, h.failing_since, h.last_alerted_at\n)\nSELECT up.healthy                AS healthy,\n       up.problems               AS problems,\n       up.consecutive_failures   AS consecutive_failures,\n       to_char((up.failing_since) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')     AS failing_since,\n       to_char((up.last_alerted_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')   AS last_alerted_at,\n       p.s->>'alert_kind'        AS alert_kind,\n       v.alert_sent              AS alert_sent\n  FROM up, p, v;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($('Assess Health').first().json.state), JSON.stringify($json)] }}"
+        }
+      },
+      "name": "Record Health",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        440,
+        130
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Every check into mailbox_health. After the alert on purpose: an alert counts as sent only when SMTP accepted it, so a failed one is retried on the next check."
+    }
+  ],
+  "connections": {
+    "Every 20 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Check IMAP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check IMAP": {
+      "main": [
+        [
+          {
+            "node": "Load Health State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Health State": {
+      "main": [
+        [
+          {
+            "node": "Assess Health",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assess Health": {
+      "main": [
+        [
+          {
+            "node": "Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert?": {
+      "main": [
+        [
+          {
+            "node": "Send Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Health",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Alert": {
+      "main": [
+        [
+          {
+            "node": "Record Health",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
