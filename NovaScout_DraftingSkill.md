@@ -94,6 +94,8 @@ Body (1–5) stays **under 80 words** (locked in the master doc; the research ag
 
 The only non-prospect sentences the model may use. A human edits these; the model never does. Every line is a claim Amitrix Labs stands behind.
 
+> **Since 2026-09-19 these lines live in the `claims_library` table** (migration `010`, Master Ref §8). Workflow 4 reads the table on every run, not this file. Edit and confirm lines there, in NocoDB or psql. The list below is the seed it started from.
+
 ### Problem — a lost lead, as a question (choose one)
 - P1: When a sponsor shortlists you at 11pm, does that lead reach you by morning — or the next CRO on their list?
 - P2: How many sponsor inquiries reach you only after the sponsor has already moved on?

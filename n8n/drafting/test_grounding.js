@@ -562,4 +562,198 @@ t.check(
   SYSTEM_PROMPT
 );
 
+// ===========================================================================
+// Drafting skill v2 -- everything above is the v1 suite, unchanged
+// ===========================================================================
+
+// The active claims-library rows as Get Draft Batch aggregates them (migration
+// 010's seed shape): proof lines carry the countries they serve, and the one
+// with no countries serves everywhere else.
+const TR = ['Turkey', 'Egypt', 'UAE', 'Romania', 'Hungary', 'Poland', 'Czech Republic'];
+const LATAM = ['Mexico', 'Brazil', 'Argentina'];
+function row(code, slot, body, extra) {
+  return Object.assign({ code: code, slot: slot, body: body, countries: null, measured: false, confirmed: false }, extra || {});
+}
+const LIB = [
+  row('A1', 'ask', 'Worth a 48-hour demo built on your own material? Reply yes and I\'ll set it up.'),
+  row('O1', 'outcome', 'We built Nova to answer from your own material, qualify the lead, and route it wherever you already work.'),
+  row('P1', 'problem', 'When a sponsor shortlists you at 11pm, does that lead reach you by morning?'),
+  row('PR-BOTH', 'proof', 'It\'s live at two CROs, in Türkiye and Mexico.'),
+  row('PR-MX', 'proof', 'It\'s live at Vertex Clinical Research in Mexico.', { countries: LATAM }),
+  row('PR-TR', 'proof', 'It\'s live at NoblePath, an oncology CRO in Türkiye.', { countries: TR }),
+];
+const GROUNDED = { city: 'Warsaw', therapeutic_areas: ['oncology'] };
+
+function withLib(over, library) {
+  return lead(Object.assign({ library: library === undefined ? LIB : library }, GROUNDED, over || {}));
+}
+function proofOf(country, library) {
+  return assess(withLib({ country: country }, library), ctgov(0, [])).library_pools.proof
+    .map(function (l) { return l.code; });
+}
+
+// --- the guard itself is not touched ----------------------------------------
+
+t.check(
+  'the library never changes the grounding verdict -- two facts is still groundable without one',
+  assess(lead(GROUNDED), ctgov(0, [])).groundable,
+  true
+);
+t.check(
+  'and a library never makes a one-fact lead groundable',
+  assess(lead({ city: 'Warsaw', library: LIB }), ctgov(0, [])).groundable,
+  false
+);
+t.check(
+  'a small confirmed headcount is not a grounding fact either',
+  assess(lead({ city: 'Warsaw', employee_estimate: 40 }), ctgov(0, [])).fact_count,
+  1
+);
+
+// --- proof is geography-matched: skill section 3, Master Ref section 12 ------
+
+t.check('Mexico gets Vertex', proofOf('Mexico'), ['PR-MX']);
+t.check('so do the other Latin American geographies', [proofOf('Brazil'), proofOf('Argentina')], [['PR-MX'], ['PR-MX']]);
+t.check('Turkey gets NoblePath', proofOf('Turkey'), ['PR-TR']);
+t.check('a country the operator listed as nearby gets NoblePath', proofOf('Poland'), ['PR-TR']);
+t.check('a country no line names gets the line with no countries -- "either elsewhere"', proofOf('India'), ['PR-BOTH']);
+t.check('country matching ignores case', proofOf('mexico'), ['PR-MX']);
+t.check(
+  'an active measured line replaces the plain line for its countries',
+  proofOf('Mexico', LIB.concat([row('PR-MX-N', 'proof', 'Nova handled 140 sponsor conversations at Vertex in 60 days.',
+    { countries: LATAM, measured: true })])),
+  ['PR-MX-N']
+);
+t.check(
+  'but a measured line for other countries does not reach this one',
+  proofOf('Turkey', LIB.concat([row('PR-MX-N', 'proof', 'Nova handled 140 sponsor conversations at Vertex in 60 days.',
+    { countries: LATAM, measured: true })])),
+  ['PR-TR']
+);
+t.check(
+  'a row with no text is not a line, whatever its flags say',
+  proofOf('Mexico', LIB.concat([row('PR-MX-N', 'proof', null, { countries: LATAM, measured: true })])),
+  ['PR-MX']
+);
+
+// --- the other slots --------------------------------------------------------
+
+const POOLS = assess(withLib({ country: 'Poland' }), ctgov(0, [])).library_pools;
+t.check('one problem, outcome and ask pool each, in code order', [POOLS.problem.length, POOLS.outcome.length, POOLS.ask.length], [1, 1, 1]);
+t.check('each line carries its text verbatim', POOLS.problem[0].body, LIB[2].body);
+t.check('and whether a human has confirmed it', POOLS.problem[0].confirmed, false);
+t.check(
+  'a link line resolves by country the same way',
+  assess(withLib({ country: 'Poland' }, LIB.concat([row('L-NP', 'link', 'https://noblepath.example', { countries: TR })])), ctgov(0, []))
+    .library_link.map(function (l) { return l.code; }),
+  ['L-NP']
+);
+t.check(
+  'and serves nobody it does not name',
+  assess(withLib({ country: 'Mexico' }, LIB.concat([row('L-NP', 'link', 'https://noblepath.example', { countries: TR })])), ctgov(0, []))
+    .library_link,
+  []
+);
+
+// --- a library gap holds the lead back instead of drafting around the hole ---
+
+const NO_ASK = assess(withLib({}, LIB.filter(function (r) { return r.slot !== 'ask'; })), ctgov(0, []));
+t.check('a groundable lead with no ask line is held back, not drafted', NO_ASK.ok, false);
+t.check('and says which slot is empty', NO_ASK.skip_reason.indexOf('no active ask line') !== -1, true);
+const NO_PROOF = assess(withLib({ country: 'India' }, LIB.filter(function (r) { return r.code !== 'PR-BOTH'; })), ctgov(0, []));
+t.check('a country with no proof line and no fallback is held back', NO_PROOF.ok, false);
+t.check('and names the country', NO_PROOF.skip_reason.indexOf('none serves India') !== -1, true);
+t.check(
+  'an empty library holds back a groundable lead',
+  assess(withLib({}, []), ctgov(0, [])).ok,
+  false
+);
+t.check(
+  'but not a low-context one -- its note needs no library',
+  assess(lead({ city: 'Warsaw', library: [] }), ctgov(0, [])).ok,
+  true
+);
+t.check('a complete library lets the lead through', assess(withLib(), ctgov(0, [])).ok, true);
+
+// --- what the subject line is built from -------------------------------------
+
+t.check(
+  'the subject is built from the fact the email opens with -- a trial',
+  assess(withLib({ therapeutic_areas: [] }), ctgov(1, ['A Study'])).subject_source,
+  'named_trial'
+);
+t.check(
+  'or a therapeutic area',
+  assess(withLib(), ctgov(0, [])).subject_source,
+  'therapeutic_area'
+);
+t.check(
+  'the prompt names the subject fact by number, the same as the email opener',
+  /Open the email from fact (\d+)\.[^\n]*\nBuild the email subject from fact \1 too/.test(
+    assess(withLib(), ctgov(1, ['A Study'])).prompt),
+  true
+);
+const HC = assess(lead({ city: 'Warsaw', founder_name: 'Anna Nowak', employee_estimate: 40, library: LIB }), ctgov(0, []));
+t.check('with no openable fact, a small confirmed headcount builds the subject', HC.subject_source, 'headcount');
+t.check('and it reaches the prompt, for the subject only', HC.prompt.indexOf('a team of 40 people') !== -1 &&
+  HC.prompt.indexOf('use it nowhere else') !== -1, true);
+t.check(
+  'a headcount the subject does not use never reaches the prompt',
+  assess(withLib({ employee_estimate: 40 }), ctgov(0, [])).prompt.indexOf('40'),
+  -1
+);
+t.check(
+  'a headcount outside Section 12\'s 5-100 band is not "small" -- the problem builds the subject',
+  assess(lead({ city: 'Warsaw', founder_name: 'Anna Nowak', employee_estimate: 150 }), ctgov(0, [])).subject_source,
+  'problem'
+);
+t.check(
+  'nor is a headcount under 5',
+  assess(lead({ city: 'Warsaw', founder_name: 'Anna Nowak', employee_estimate: 4 }), ctgov(0, [])).headcount,
+  null
+);
+t.check(
+  'no headcount at all: the problem builds the subject, with no fact in it',
+  assess(lead({ city: 'Warsaw', founder_name: 'Anna Nowak' }), ctgov(0, [])).prompt.indexOf('put no fact') !== -1,
+  true
+);
+
+t.check(
+  'a hook opening from the trial is told to begin "You\'re sponsoring" -- about them, not the source',
+  assess(withLib({ therapeutic_areas: [] }), ctgov(1, ['A Study'])).prompt.indexOf('begins with the words "You\'re sponsoring"') !== -1,
+  true
+);
+t.check(
+  'and a lead with no trial is not',
+  assess(withLib(), ctgov(0, [])).prompt.indexOf('You\'re sponsoring'),
+  -1
+);
+
+function subjectName(title) {
+  const m = assess(withLib({ therapeutic_areas: [] }), ctgov(1, [title])).prompt.match(/call the trial "([^"]*)"/);
+  return m ? m[1] : null;
+}
+t.check('a trial with a drug code is called by the code in the subject', subjectName('Efficacy of INM004 in Children With STEC-HUS'), 'INM004');
+t.check('a hyphenated code too', subjectName('Safety and Efficacy of RPH-104 Used to Prevent Recurrent Fever Attacks'), 'RPH-104');
+t.check('a title with no code gives its first two non-boilerplate words', subjectName('Hyperbaric Oxygen Brain Injury Treatment Trial'), 'Hyperbaric Oxygen');
+t.check('boilerplate is skipped', subjectName('Registry of Minimally Invasive Cancer Treatment Using Spectral Angio-CT'), 'Minimally Invasive');
+t.check(
+  'no short name is given when the subject is not built from the trial',
+  assess(withLib(), ctgov(0, [])).prompt.indexOf('call the trial'),
+  -1
+);
+
+// --- warm-up week, for the link rule ----------------------------------------
+
+t.check('no external send yet is week 1', assess(withLib({ warmup_week: null }), ctgov(0, [])).warmup_week, 1);
+t.check('the week comes through as counted', assess(withLib({ warmup_week: 3 }), ctgov(0, [])).warmup_week, 3);
+t.check('a nonsense value falls back to week 1, the link-free side', assess(withLib({ warmup_week: 'x' }), ctgov(0, [])).warmup_week, 1);
+
+// --- the areas the assembler must not see named ------------------------------
+
+const AB = assess(withLib({ therapeutic_areas: ['oncology', 'dermatology'] }), ctgov(0, [])).absent_areas;
+t.check('absent areas exclude the lead\'s own', AB.indexOf('Oncology') === -1 && AB.indexOf('Dermatology') === -1, true);
+t.check('and never include Other, which is an ordinary word', AB.indexOf('Other'), -1);
+t.check('and include every other taxonomy area', AB.length, 15);
+
 t.done();

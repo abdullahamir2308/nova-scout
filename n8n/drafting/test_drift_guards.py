@@ -26,6 +26,8 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 MASTER_REF = os.path.join(REPO, "NovaScout_MasterRef.md")
+SKILL = os.path.join(REPO, "NovaScout_DraftingSkill.md")
+CLAIMS_MIGRATION = os.path.join(REPO, "postgres", "migrations", "010_claims_library.sql")
 
 PASSED = []
 FAILED = []
@@ -48,9 +50,25 @@ def write(p, s):
 FIXTURE_SENDER = "Drift Test Sender"
 
 
+def stage_companions(workdir, mutate_skill=None, mutate_migration=None):
+    """The drafting skill and migration 010 are parsed by the build too. Every
+    case gets its own copy, so a case can mutate one without touching the repo."""
+    for label, src, name, mutate in (("skill", SKILL, "DraftingSkill.md", mutate_skill),
+                                     ("migration", CLAIMS_MIGRATION, "010_claims_library.sql",
+                                      mutate_migration)):
+        text = read(src)
+        if mutate:
+            new = mutate(text)
+            assert new != text, "mutation did not change the %s" % label
+            text = new
+        write(os.path.join(workdir, name), text)
+
+
 def run_build(workdir, doc_path, env_overrides=None):
     env = dict(os.environ)
     env["NOVASCOUT_MASTER_REF"] = doc_path
+    env["NOVASCOUT_DRAFTING_SKILL"] = os.path.join(workdir, "DraftingSkill.md")
+    env["NOVASCOUT_CLAIMS_MIGRATION"] = os.path.join(workdir, "010_claims_library.sql")
     env["DRAFTING_OUT"] = os.path.join(workdir, "out", "drafting.json")
     env["NOVASCOUT_ENV_FILE"] = os.path.join(workdir, "no-such.env")
     env["NOVASCOUT_SENDER_NAME"] = FIXTURE_SENDER
@@ -71,10 +89,11 @@ def run_build(workdir, doc_path, env_overrides=None):
 
 
 def case(label, mutate_doc=None, mutate_js=None, js_file="code_assess.js", expect_in="",
-         env_overrides=None):
+         env_overrides=None, mutate_skill=None, mutate_migration=None):
     tmp = tempfile.mkdtemp(prefix="novascout-drift-")
     try:
         shutil.copytree(HERE, os.path.join(tmp, "drafting"))
+        stage_companions(tmp, mutate_skill, mutate_migration)
         doc_path = os.path.join(tmp, "MasterRef.md")
         doc = read(MASTER_REF)
         if mutate_doc:
@@ -105,6 +124,7 @@ def baseline():
     tmp = tempfile.mkdtemp(prefix="novascout-drift-")
     try:
         shutil.copytree(HERE, os.path.join(tmp, "drafting"))
+        stage_companions(tmp)
         doc_path = os.path.join(tmp, "MasterRef.md")
         write(doc_path, read(MASTER_REF))
         rc, err = run_build(tmp, doc_path)
@@ -126,6 +146,7 @@ def env_file_supplies_sender():
     tmp = tempfile.mkdtemp(prefix="novascout-drift-")
     try:
         shutil.copytree(HERE, os.path.join(tmp, "drafting"))
+        stage_companions(tmp)
         doc_path = os.path.join(tmp, "MasterRef.md")
         write(doc_path, read(MASTER_REF))
         env_file = os.path.join(tmp, "test.env")
@@ -349,6 +370,112 @@ case(
     "no sender name in the environment or .env -> build refuses, no default",
     env_overrides={"NOVASCOUT_SENDER_NAME": None},
     expect_in="NOVASCOUT_SENDER_NAME is not set",
+)
+
+# --- drafting skill v2 --------------------------------------------------------
+#
+# The one to read twice is the first pair. The skill's whole design is "only the
+# hook and subject are freely generated; everything else is selected from the
+# library". The model's JSON schema is that rule made physical -- a field it
+# does not have is a part it cannot compose. Either side moving alone refuses.
+case(
+    "the skill lets the model write another part -> build refuses",
+    mutate_skill=lambda s: s.replace("**Only the hook and subject are freely generated**",
+                                     "**Only the hook, subject and problem are freely generated**", 1),
+    expect_in="does not match the drafting skill",
+)
+case(
+    "the model schema gains a body field the skill does not license -> build refuses",
+    mutate_js=lambda s: s.replace('        "linkedin_hook": {"type": "string"},\n',
+                                  '        "linkedin_hook": {"type": "string"},\n'
+                                  '        "email_body": {"type": "string"},\n', 1),
+    js_file="build_workflow.py",
+    expect_in="does not match the drafting skill",
+)
+case(
+    "the generated-parts sentence is reworded past recognition -> build refuses loudly",
+    mutate_skill=lambda s: s.replace("**Only the hook and subject are freely generated**",
+                                     "**The hook and subject get generated**", 1),
+    expect_in="generated-parts rule not found",
+)
+case(
+    "the skill changes the subject length -> build refuses",
+    mutate_skill=lambda s: s.replace("- 30–50 characters.", "- 25–50 characters.", 1),
+    expect_in="subject length drifted",
+)
+case(
+    "the JS loosens the subject floor -> build refuses",
+    mutate_js=lambda s: s.replace("const SUBJECT_MIN_CHARS = 30;", "const SUBJECT_MIN_CHARS = 20;", 1),
+    js_file="code_assemble.js",
+    expect_in="subject length drifted",
+)
+case(
+    "the skill bans a subject word the JS does not -> build refuses",
+    mutate_skill=lambda s: s.replace('No "free," "demo," "offer," "opportunity."',
+                                     'No "free," "demo," "offer," "urgent," "opportunity."', 1),
+    expect_in="bans subject words",
+)
+case(
+    "the JS stops banning a subject word the skill bans -> build refuses",
+    mutate_js=lambda s: s.replace("['free', 'demo', 'offer', 'opportunity']",
+                                  "['free', 'offer', 'opportunity']", 1),
+    js_file="code_assemble.js",
+    expect_in="bans subject words",
+)
+case(
+    "the skill stops forbidding fake-reply subjects the JS checks -> build refuses",
+    mutate_skill=lambda s: s.replace('No "Re:" or "Fwd:"', 'No "Re:" or "Fw:"', 1),
+    expect_in="fake-reply subject prefixes drifted",
+)
+case(
+    "the skill extends the link-free warm-up -> build refuses",
+    mutate_skill=lambda s: s.replace("Warm-up weeks 1–2: zero links", "Warm-up weeks 1–3: zero links", 1),
+    expect_in="link-free warm-up drifted",
+)
+case(
+    "the JS shortens the link-free warm-up -> build refuses",
+    mutate_js=lambda s: s.replace("const LINK_FREE_WEEKS = 2;", "const LINK_FREE_WEEKS = 1;", 1),
+    js_file="code_assemble.js",
+    expect_in="link-free warm-up drifted",
+)
+case(
+    "the skill's body budget disagrees with the Master Ref -> build refuses",
+    mutate_skill=lambda s: s.replace("stays **under 80 words**", "stays **under 90 words**", 1),
+    expect_in="disagree on the word ceiling",
+)
+case(
+    "Section 12's company-size band changes -> build refuses",
+    mutate_doc=lambda d: d.replace("**Company:** 5–100 employees", "**Company:** 5–50 employees", 1),
+    expect_in="small-team band drifted",
+)
+case(
+    "migration 010's countries CHECK loses a Section 12 geography -> build refuses",
+    mutate_migration=lambda s: s.replace("'South Africa', 'Brazil', 'Argentina']", "'South Africa', 'Brazil']", 1),
+    expect_in="claims_countries_are_geographies",
+)
+case(
+    "a subject worked example is dropped from the system prompt -> build refuses",
+    mutate_js=lambda s: s.replace('->  Sponsor leads after hours",', '->  Sponsor inquiries after hours",', 1),
+    js_file="build_workflow.py",
+    expect_in="worked example",
+)
+
+# --- the batch row -> Assess Grounding wiring ---------------------------------
+#
+# Same class as the Ollama-body guard: a column the query stops returning is
+# `undefined` in the Code node, silently. A lost `library` holds every lead back
+# as if the operator's table were empty.
+case(
+    "the batch query stops returning the claims library -> build refuses",
+    mutate_js=lambda s: s.replace("AS library,", "AS claims,", 1),
+    js_file="build_workflow.py",
+    expect_in="returns no such column",
+)
+case(
+    "the batch query stops returning the warm-up week -> build refuses",
+    mutate_js=lambda s: s.replace("AS warmup_week", "AS week", 1),
+    js_file="build_workflow.py",
+    expect_in="returns no such column",
 )
 
 print("drift guards for Workflow 4\n")

@@ -6,14 +6,66 @@ or records why it refused to. Workflow id `drafting0001`.
 Same generated-not-hand-edited pattern as `../enrichment`, `../scoring` and
 `../contacts`: the `.js` files are the tested sources, `build_workflow.py` embeds
 them verbatim into `../workflows/drafting.json`, and the spec-drift guards parse
-`NovaScout_MasterRef.md` and refuse to build when the code and the doc disagree.
+`NovaScout_MasterRef.md` and `NovaScout_DraftingSkill.md` and refuse to build when
+the code and the docs disagree.
 
 ```
 python build_workflow.py        # regenerate the workflow JSON
-node   test_grounding.js        # 75 cases -- the grounding guard
-node   test_assemble.js         # 46 cases -- constraint enforcement
-python test_drift_guards.py     # 29 cases -- each guard is made to fire
+node   test_grounding.js        # 121 cases -- the grounding guard (v1's 75, untouched) + v2
+node   test_assemble.js         # 112 cases -- assembly and constraint enforcement
+python test_drift_guards.py     # 45 cases -- each guard is made to fire
 ```
+
+## Drafting skill v2 — the model writes three sentences
+
+Since 2026-09-19 a first touch is built to `NovaScout_DraftingSkill.md` v2: hook,
+problem, outcome, proof, ask. **Only the hook and the subject are generated.** The
+model returns `email_subject`, `email_hook` and `linkedin_hook`, and nothing else.
+The schema has no other field, and the build refuses one that disagrees with the
+skill's "only the hook and subject are freely generated". The problem, outcome,
+proof and exactly one ask are lines from the **claims library**, the
+`claims_library` table (migration 010), which the operator owns and edits in
+NocoDB or psql. The batch query reads the active rows on every run, so an edit
+reaches the next draft with no rebuild. `code_assemble.js` inserts them verbatim.
+The model never sees them, so it cannot paraphrase a claim or join a prospect
+fact onto one.
+
+| Part | Where it comes from |
+|---|---|
+| Subject, hook | the model, from the fact sheet, under the guard below |
+| Problem, outcome, ask | library lines, rotated on `lead_id`, chosen to fit the 80-word body |
+| Proof | the library line whose `countries` names the lead's country; the line with no countries otherwise; an active `measured` line wins |
+| Link | none in warm-up weeks 1–2; after that only the library's `link` line |
+| Opt-out, signature, greeting | appended here, as in v1 |
+
+`variant` now records the lines used, e.g. `role-inbox/P2.O2.PR-MX.A2+unconfirmed-claim`,
+because that is what the learning loop needs to see which lines earn replies.
+New tags: `subject-*` (length, product name, Re:/Fwd:, banned word, shouting,
+ungrounded), `hook-*` (question, ask, pitch, ungrounded, opener, source, long),
+`link-in-warmup` / `unapproved-link` / `linkedin-link` / `pdf-link`, and
+`unconfirmed-claim` (the library is seeded unconfirmed, as skill §4 is a DRAFT).
+
+**The worked examples in the system prompt carry other companies' facts**
+(INM004, a 40-person team, oncology), and a 9B model copies examples. Any digit
+token in a hook or subject that is not in the lead's facts, or any therapeutic
+area the lead does not have, is tagged `-ungrounded`. Measured: before
+`code_assess.js` started picking the trial's short name (its code, otherwise the
+first two content words of the title), the model gave a trial with no code the
+subject "INM004 trial — a quick question".
+
+**Two hook failures measured on real leads, and what fixed them.** When the model
+was told to vary the LinkedIn hook's wording, it wrote "Your site lists work on
+the Efficacy of INM004…" — the trial is on ClinicalTrials.gov, not their site.
+That instruction was removed (truth beats variety), and the hook is tagged
+`hook-source`. And the trial fact line is phrased from its source, which the
+model copies ("ClinicalTrials.gov lists…"). A per-lead instruction naming the
+opening words, "You're sponsoring", fixed that.
+
+**A redraft retires what it replaces.** Send a lead back to `contact_found` and
+the write statement sets its earlier pending or approved first-touch drafts to
+`rejected` / `bad draft` in the same statement as the insert. Left approved, the
+old draft would be the first thing Workflow 6 sends, because it sends the oldest
+approved draft of a `drafted` lead. New drafts are always `pending`.
 
 ## The grounding guard
 
@@ -101,9 +153,14 @@ model to reproduce a compliance string exactly, every time, is a bet with no
 upside (build rule 3). `test_drift_guards.py` refuses the build on even a
 punctuation change to it.
 
+Since v2 the same goes for every sentence that is not about the prospect: the
+problem, outcome, proof and ask are claims-library lines inserted verbatim (see
+above).
+
 Constraint violations tag the draft's `variant` rather than discarding it —
-`role-inbox+long`, `named+adjective,merge-tag`. The reviewer sees the tag next to
-the text; a silently dropped draft teaches nobody anything.
+`role-inbox/P1.O1.PR-TR.A1+long`, `named/P2.O3.PR-MX.A3+adjective,merge-tag`. The
+reviewer sees the tag next to the text; a silently dropped draft teaches nobody
+anything.
 
 ## A role inbox is not a person
 
@@ -131,13 +188,20 @@ nothing is invented to fill the gap.
 
 ## Known gaps
 
-- **There is no demo URL.** Section 13's 90-second recording does not exist, so
-  drafts reference it in words and carry no link. Set `NOVASCOUT_DEMO_URL` in
-  `.env` and rebuild; the prompt rule flips from "no links" to "exactly this one
-  URL".
-- **The `no-demo` and subject checks are email-only.** The LinkedIn DM is sent by
-  a human from their own account (Section 6), so it is held to Section 5's
-  message rules only where they make sense.
+- **`NOVASCOUT_DEMO_URL` is gone.** Skill v2 moves the recording, the PDF and the
+  LinkedIn profile to the reply payload (skill §8). The one URL a first touch may
+  carry after warm-up is the library's `link` line (seeded inactive, `L-NP`).
+- **Ask line A3 offers the 90-second recording,** which Section 13 still lists as
+  not made. A "yes" to it needs the recording to exist. Deactivate A3 in the
+  library until it does, if that matters.
+- **The subject and link checks are email-only.** The LinkedIn DM is sent by a
+  human from their own account (Section 6), so it is held to Section 5's message
+  rules only where they make sense. Its hook is checked like the email's.
+- **The "only geography known" worked example is 25 characters**, under the
+  skill's 30-character floor. Copied verbatim, it is tagged `subject`.
+- **A 27-word trial title makes a long hook.** Atlant Clinical's LinkedIn DM opens
+  on its real trial title and is tagged `long`, rather than having the title
+  shortened into something the registry does not say.
 
 ## The bug worth remembering
 

@@ -24,6 +24,14 @@
 //                        in the record. Using it to authorise a draft would let
 //                        one model's invention license another's.
 //
+// Drafting skill v2 (NovaScout_DraftingSkill.md) leaves all of that untouched and
+// narrows what the model is asked for: a subject and two one-sentence hooks,
+// nothing else. The problem, outcome, proof and ask are human-written lines from
+// the claims library (migration 010), resolved here for this lead -- proof by
+// its country -- and inserted verbatim by Assemble Drafts. The model never sees
+// them. The guard above decides WHETHER a lead is drafted; the library decides
+// what everything after the first sentence says.
+//
 // Master Ref build rule 3: this is all string matching, so it costs no tokens.
 
 // ---------------------------------------------------------------------------
@@ -77,6 +85,19 @@ const UNSPECIFIC_AREAS = ['Other'];
 
 const AREA_BY_KEY = {};
 for (const a of THERAPEUTIC_AREAS) AREA_BY_KEY[a.toLowerCase()] = a;
+
+// Section 12: "Company: 5-100 employees." A headcount is not one of the four
+// grounding facts and never counts toward MIN_FACTS. It is used for one thing
+// only: the subject line, when no openable fact is available -- the skill's
+// "small confirmed employee count" row. Enrichment records a number only when
+// the site states one (code_fetch.js: "Never estimate"), so a non-null value in
+// this band is the "confirmed" in that row.
+const SMALL_TEAM = { min: 5, max: 100 };
+
+// The four parts of a first touch that come from the approved claims library
+// (NovaScout_DraftingSkill.md v2, section 2) rather than from the model. `link`
+// is optional and only ever used after warm-up.
+const LIBRARY_SLOTS = ['problem', 'outcome', 'proof', 'ask'];
 
 // A role inbox is not a person -- Section 9, Workflow 3b, LOCKED:
 //
@@ -167,6 +188,69 @@ function isRoleInbox(email) {
 function firstName(name) {
   const parts = str(name).split(/\s+/).filter(Boolean);
   return parts.length ? parts[0] : '';
+}
+
+// The active claims-library rows, as the batch query aggregated them. A row
+// with no text is not a line, whatever its flags say.
+function libraryRows(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const out = [];
+  for (const r of list) {
+    if (!r || typeof r !== 'object' || !str(r.body)) continue;
+    out.push({
+      code: str(r.code),
+      slot: str(r.slot),
+      body: str(r.body),
+      countries: Array.isArray(r.countries) && r.countries.length ? r.countries.map(fold) : null,
+      measured: r.measured === true,
+      confirmed: r.confirmed === true,
+    });
+  }
+  return out;
+}
+
+// Which proof (or link) lines serve this lead. Skill section 3: "Geography-
+// matched: Vertex Clinical Research for Mexico and Latin America; NoblePath for
+// Turkiye and nearby; either elsewhere." The mapping itself is data -- each
+// row's `countries` -- so the operator owns it. A row with no countries is the
+// "elsewhere" line, used only when no row names the lead's country.
+//
+// Within the chosen rows a measured line wins: skill section 4, "When filled, it
+// replaces the plain line above and becomes the strongest sentence in the email."
+function forCountry(rows, country) {
+  const key = fold(country);
+  const serving = rows.filter(function (r) { return r.countries && r.countries.indexOf(key) !== -1; });
+  const pick = serving.length ? serving : rows.filter(function (r) { return !r.countries; });
+  const measured = pick.filter(function (r) { return r.measured; });
+  return measured.length ? measured : pick;
+}
+
+function lines(rows) {
+  return rows.map(function (r) { return { code: r.code, body: r.body, confirmed: r.confirmed }; });
+}
+
+// What a trial is called in a subject line. A title does not fit in 50
+// characters, and left to shorten it the model pasted the whole title or -- worse
+// -- borrowed "INM004" from the worked example for a trial that has no code at
+// all. Both measured on Innovate Research. Picking the name is deterministic
+// (build rule 3): the drug/study code if the title has one, otherwise its first
+// two words that are not trial boilerplate.
+const TITLE_FILLER = [
+  'a', 'an', 'the', 'of', 'in', 'and', 'for', 'with', 'to', 'on', 'at', 'by', 'versus', 'vs',
+  'study', 'trial', 'registry', 'efficacy', 'safety', 'evaluation', 'evaluating', 'effect',
+  'effects', 'assessment', 'randomized', 'randomised', 'controlled', 'phase', 'open-label',
+  'multicenter', 'multicentre', 'single', 'double', 'blind', 'double-blind', 'pilot',
+  'clinical', 'prospective', 'observational', 'comparative', 'comparing', 'investigate',
+];
+
+function trialShortName(title) {
+  const t = str(title);
+  const code = t.match(/\b[A-Z]{1,6}-?\d{2,6}[A-Z]?\b/);
+  if (code) return code[0];
+  const content = t.split(/\s+/).filter(function (w) {
+    return TITLE_FILLER.indexOf(w.toLowerCase().replace(/[^a-z-]/g, '')) === -1;
+  });
+  return content.slice(0, 2).join(' ').replace(/[,;:.]+$/, '');
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +477,64 @@ const openLinkedin = pool.length > 1
   ? pool[(seed + 1) % pool.length]
   : openEmail;
 
+// --- What the subject line is built from -----------------------------------
+//
+// The same fact the email opens with, whenever that fact is one a subject can
+// carry (a named trial, a therapeutic area). A subject about one fact over a
+// hook about another reads as two emails stapled together -- and tying the two
+// keeps the lead_id rotation above working for subjects as well, so two
+// companies with the same fact shape do not get the same subject line.
+//
+// Only when the email opens from something a subject cannot use (the city
+// fallback) does the skill's ladder go further down: a small confirmed
+// headcount, and failing that the problem itself, with no prospect fact at all
+// -- the "only geography known" row of the worked examples.
+const n = Number(lead.employee_estimate);
+const headcount = lead.employee_estimate !== null && lead.employee_estimate !== undefined &&
+  Number.isInteger(n) && n >= SMALL_TEAM.min && n <= SMALL_TEAM.max ? n : null;
+
+const openEmailKind = facts.length ? facts[openEmail].kind : null;
+let subjectSource;
+if (openEmailKind === 'named_trial' || openEmailKind === 'therapeutic_area') {
+  subjectSource = openEmailKind;
+} else if (headcount !== null) {
+  subjectSource = 'headcount';
+} else {
+  subjectSource = 'problem';
+}
+
+let subjectLines;
+if (subjectSource === 'headcount') {
+  subjectLines = [
+    'Build the email subject from this headcount, and use it nowhere else -- not in',
+    'either hook: their own site states a team of ' + headcount + ' people. This says',
+    'nothing about what those people do or where they sit.',
+  ];
+} else if (subjectSource === 'problem') {
+  subjectLines = [
+    'None of these facts suits a subject line. Build the subject from the problem',
+    'instead, in the shape of the "only geography known" example, and put no fact',
+    'about them in it.',
+  ];
+} else {
+  subjectLines = [
+    'Build the email subject from fact ' + (openEmail + 1) + ' too -- the same fact the email opens with.',
+  ];
+  if (subjectSource === 'named_trial' && trialTitles.length) {
+    subjectLines.push('In the subject, call the trial "' + trialShortName(trialTitles[0]) + '".');
+  }
+}
+
+// The trial fact reaches the model phrased from its source ("ClinicalTrials.gov
+// lists ..."), and the model copies a fact line almost verbatim. Measured on the
+// v2 prompt: one hook in eight still opened "ClinicalTrials.gov lists ..." --
+// about the source, which skill section 3 rules out. A per-lead instruction
+// naming the opening words is the cheap, targeted fix; Assemble Drafts still
+// tags a hook that ignores it.
+const trialOpeners = [openEmail, openLinkedin].some(function (i) {
+  return facts.length && facts[i].kind === 'named_trial';
+});
+
 const prompt = [
   'Company: ' + str(lead.company_name),
   'Country: ' + str(lead.country),
@@ -402,15 +544,61 @@ const prompt = [
   'what it does NOT establish:',
   factSheet,
   '',
-  'Write the email body and the LinkedIn DM body.',
+  'Write the email subject, the email hook and the LinkedIn hook.',
   'Open the email from fact ' + (openEmail + 1) + '. Open the LinkedIn DM from fact ' +
     (openLinkedin + 1) + '.',
+].concat(subjectLines, trialOpeners ? [
+  'A hook built from the trial fact begins with the words "You\'re sponsoring" -- it',
+  'is about them, not about ClinicalTrials.gov.',
+] : [], [
   'Write no greeting and no sign-off -- those are added afterwards.',
-].join('\n');
+]).join('\n');
+
+// --- The approved claims library --------------------------------------------
+//
+// Parts 2-5 of the email come from here, verbatim, never from the model (skill
+// section 2). They are resolved now, before any GPU time is spent: a groundable
+// lead the library cannot complete -- no active line for a slot, or no proof
+// line for its country and no fallback -- is dropped and stays 'contact_found'
+// until the operator fixes the table. Same self-healing shape as a failed
+// lookup: a gap in the operator's data must not mark a lead low-context, and it
+// must not produce a draft with a hole where the proof should be.
+//
+// A lead that is not groundable does not need the library -- it gets the
+// low-context note either way -- so it is not held back by it.
+const lib = libraryRows(lead.library);
+const bySlot = function (slot) { return lib.filter(function (r) { return r.slot === slot; }); };
+const pools = {
+  problem: lines(bySlot('problem')),
+  outcome: lines(bySlot('outcome')),
+  proof: lines(forCountry(bySlot('proof'), lead.country)),
+  ask: lines(bySlot('ask')),
+};
+const linkPool = lines(forCountry(bySlot('link'), lead.country));
+const emptySlots = LIBRARY_SLOTS.filter(function (s) { return !pools[s].length; });
+const libraryGap = emptySlots.length
+  ? 'the claims library has no active ' + emptySlots.join(', ') + ' line' +
+    (emptySlots.indexOf('proof') !== -1 ? ' (proof: none serves ' + str(lead.country) + ' and no fallback)' : '')
+  : null;
+
+// Warm-up week at draft time, from the same Sent-folder history the send path
+// counts. NULL means no external send yet: the first send will be week 1.
+const w = Number(lead.warmup_week);
+const warmupWeek = Number.isInteger(w) && w >= 1 ? w : 1;
+
+// Every taxonomy area this lead does NOT have. Assemble Drafts flags a hook or
+// subject naming one -- the worked examples in the system prompt name
+// oncology, and a 9B model copies examples.
+const absentAreas = THERAPEUTIC_AREAS.filter(function (a) {
+  return UNSPECIFIC_AREAS.indexOf(a) === -1 && areas.indexOf(a) === -1;
+});
+
+const libraryHolds = groundable && libraryGap !== null;
 
 return {
   json: Object.assign({}, base, {
-    ok: true,
+    ok: !libraryHolds,
+    skip_reason: libraryHolds ? libraryGap : undefined,
     groundable: groundable,
     fact_count: facts.length,
     fact_kinds: factKinds,
@@ -432,6 +620,13 @@ return {
     max_words: MAX_WORDS,
     open_email_fact: facts.length ? facts[openEmail].kind : null,
     open_linkedin_fact: facts.length ? facts[openLinkedin].kind : null,
+    subject_source: subjectSource,
+    headcount: headcount,
+    absent_areas: absentAreas,
+    library_pools: pools,
+    library_link: linkPool,
+    library_gap: libraryGap,
+    warmup_week: warmupWeek,
     system_prompt: SYSTEM_PROMPT,
     prompt: prompt,
   }),
