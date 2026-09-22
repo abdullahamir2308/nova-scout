@@ -14,6 +14,7 @@ python build_workflow.py        # regenerate the workflow JSON
 node   test_grounding.js        # 121 cases -- the grounding guard (v1's 75, untouched) + v2
 node   test_assemble.js         # 112 cases -- assembly and constraint enforcement
 python test_drift_guards.py     # 45 cases -- each guard is made to fire
+python audit_drafts_vs_onepager.py   # read-only: the live queue and library vs nova-one-pager.docx
 ```
 
 ## Drafting skill v2 — the model writes three sentences
@@ -197,11 +198,45 @@ nothing is invented to fill the gap.
 - **The subject and link checks are email-only.** The LinkedIn DM is sent by a
   human from their own account (Section 6), so it is held to Section 5's message
   rules only where they make sense. Its hook is checked like the email's.
-- **The "only geography known" worked example is 25 characters**, under the
-  skill's 30-character floor. Copied verbatim, it is tagged `subject`.
-- **A 27-word trial title makes a long hook.** Atlant Clinical's LinkedIn DM opens
-  on its real trial title and is tagged `long`, rather than having the title
-  shortened into something the registry does not say.
+- **A long trial title makes a long hook.** Atlant Clinical's LinkedIn DM opens
+  on its real trial title (a 28-word hook) and is tagged `long`, rather than
+  having the title shortened into something the registry does not say.
+
+## The one-pager is not built here
+
+`nova-one-pager.docx` (repo root) is the asset Follow-Up #1 offers
+(`../sendtrack/code_followup.js`). **No script in this repo builds it.** Its
+`docProps/core.xml` (creator `Un-named`, revision 1, created and modified 9 ms
+apart) is programmatic output, consistent with the JS `docx` library, and the
+versions created on 2026-09-18 and 2026-09-21 both carried an
+`[Abdullah: ... Do not estimate one.]` note paragraph (the first also had
+`[DATE]` placeholders). The repo's copy is that output **edited in place**
+(`word/document.xml`) to drop the note and, later the same day, to say "pharma
+team" instead of "sponsor". `core.xml` was left alone, so it still shows the
+generator's timestamp.
+
+If whatever generated it runs again and its output replaces this file, the
+source needs the same fixes, or they come back with it. The note already came
+back once: the 2026-09-21 regeneration dropped the `[DATE]`s and re-emitted the
+note.
+
+1. **No internal note and no placeholders:** no `[Abdullah: ...]` paragraph, no
+   `[DATE]`, nothing in square brackets.
+2. **`pharma team` (noun) / `pharma-team` (modifier) for the pharma-side party,
+   never `sponsor`.** A first-touch hook opens "You're sponsoring ..." (the CRO
+   as trial sponsor), and the claims library has said "pharma team" since
+   2026-09-21, so a one-pager that says "sponsor" puts one word on two parties
+   between the email and the asset it leads to. "Sponsor" is right only for the
+   CRO's own registered-sponsor status on ClinicalTrials.gov, which the
+   one-pager does not mention.
+3. **No speed claim beyond "in real time".** The one-pager says Nova answers
+   "in real time"; nothing supports a seconds figure, and `claims_library` O2
+   says the same.
+
+After regenerating, run `python audit_drafts_vs_onepager.py` before the file is
+served. It fails on a placeholder, on the word "sponsor", and on any claim an
+active library line makes that the one-pager does not. It also reads the live
+queue, so run it after a library edit or a redraft too.
 
 ## The bug worth remembering
 

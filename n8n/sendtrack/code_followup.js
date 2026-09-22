@@ -22,7 +22,7 @@ const SENDER_NAME = __SENDER_NAME__;
 // One line per follow-up, and exactly MAX_FOLLOW_UPS of them (checked at build
 // time). Neither states a fact about the lead; the first touch is quoted below.
 const LINES = {
-  1: 'Following up on my note below in case it got buried. Would the 90-second recording of Nova running at NoblePath be useful?',
+  1: 'I put together a short one-pager on how Nova works and adapts to your setup — want me to send it over?',
   2: 'One last note on this, then I will leave it. If a demo built on your own material in 48 hours would help, I can set it up, no commitment.',
 };
 

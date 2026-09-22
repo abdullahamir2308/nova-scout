@@ -48,7 +48,7 @@ Body (1–5) stays **under 80 words** (locked in the master doc; the research ag
 - 30–50 characters. Specific to the prospect or the problem. Never the product name — product-name subjects read as ads.
 - No "Re:" or "Fwd:" (fake-reply pattern, spam signal, and dishonest). No caps. No "free," "demo," "offer," "opportunity."
 - Grounded like the hook: only enrichment facts.
-- Good shapes: a prospect fact (`INM004 trial — a question`), or the problem (`Sponsor inquiries after hours`).
+- Good shapes: a prospect fact (`INM004 trial — a question`), or the problem (`Pharma-team inquiries after hours`).
 
 **Hook**
 - One prospect fact, two at most.

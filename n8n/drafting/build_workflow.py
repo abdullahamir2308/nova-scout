@@ -742,7 +742,7 @@ SYSTEM_PROMPT = "\n".join([
     "  named trial fact (INM004)            ->  INM004 trial — a quick question",
     "  small confirmed employee count (40)  ->  A question for a 40-person team",
     "  oncology focus only                  ->  Your oncology work — one question",
-    "  only geography known                 ->  Sponsor leads after hours",
+    "  only geography known                 ->  Pharma-team inquiries after hours",
     "",
     "FORMAT:",
     "- Plain text. No links of any kind, no bullets, no brackets, no placeholders,",
@@ -760,8 +760,14 @@ SYSTEM_PROMPT = "\n".join([
 # The four worked examples are the user's (2026-09-19) and are asserted present
 # rather than trusted: a later prompt edit that drops one removes the anchoring
 # the subject line was given, with nothing else to show for it.
+#
+# The last one was reworded 2026-09-21 from "Sponsor leads after hours" to say
+# "pharma team", the word the claims library uses for the pharma-side party
+# (Master Ref Section 9, Workflow 4, Terminology). It is the example a lead whose
+# subject source is `problem` is steered to, so it decides a real subject line.
+# It is also 33 characters, inside the 30-50 the prompt teaches; the old one was 25.
 for _example in ("INM004 trial — a quick question", "A question for a 40-person team",
-                 "Your oncology work — one question", "Sponsor leads after hours"):
+                 "Your oncology work — one question", "Pharma-team inquiries after hours"):
     assert _example in SYSTEM_PROMPT, "subject worked example %r missing from the system prompt" % _example
 
 

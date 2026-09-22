@@ -615,13 +615,16 @@ t.check(
   subjectFlags('Your oncology work — one question', { areas: ['Dermatology'], absent_areas: absentGiven(['Dermatology']) }),
   ['subject-ungrounded']
 );
-// The user's "only geography known" example is 25 characters, under the
-// skill's 30-character floor. It carries no fact, so it is not ungrounded --
-// but copied verbatim it is tagged for length, so it cannot slip through.
+// The "only geography known" example is what a `problem`-source subject is steered
+// to, so a model that copies it verbatim puts it in a real lead's subject line.
+// It carries no fact, so it is not ungrounded, and at 33 characters it is inside
+// the skill's 30-50. Copied verbatim it has to pass every subject check. (It used
+// to read "Sponsor leads after hours" -- 25 characters, tagged `subject`, and the
+// wrong word for the pharma-side party; reworded 2026-09-21.)
 t.check(
-  'the geography-only worked example is grounded but under 30 characters',
-  subjectFlags('Sponsor leads after hours'),
-  ['subject']
+  'the geography-only worked example passes every subject check verbatim',
+  subjectFlags('Pharma-team inquiries after hours'),
+  []
 );
 
 // --- Hook: skill section 3 ---------------------------------------------------

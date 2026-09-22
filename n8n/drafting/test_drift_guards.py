@@ -455,7 +455,7 @@ case(
 )
 case(
     "a subject worked example is dropped from the system prompt -> build refuses",
-    mutate_js=lambda s: s.replace('->  Sponsor leads after hours",', '->  Sponsor inquiries after hours",', 1),
+    mutate_js=lambda s: s.replace('->  Pharma-team inquiries after hours",', '->  Pharma-team leads after hours",', 1),
     js_file="build_workflow.py",
     expect_in="worked example",
 )
