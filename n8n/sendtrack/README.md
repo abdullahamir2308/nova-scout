@@ -19,11 +19,11 @@ parses the Master Ref and refuses to run when code and doc disagree.
 python build_workflow.py          # regenerate the four workflow JSONs
 node   test_decide.js             # 74 cases -- the send decision and every guard in it
 node   test_send_result.js        # 21 cases -- what happens after the SMTP call
-node   test_mailbox.js            # 58 cases -- Sent mirror, reply classification, notification
+node   test_mailbox.js            # 71 cases -- Sent mirror, reply classification, positive-signal flag, notification
 node   test_followup.js           # 13 cases -- follow-up drafts (cross-checked against the send path)
 node   test_health.js             # 33 cases -- IMAP Health: problems, when it alerts, what it says
 python test_imap_health.py        # 21 cases -- the checker's answer; Message-ID parity with Mailbox Watch
-python test_drift_guards.py       # 58 cases -- each spec/wiring guard is made to fire
+python test_drift_guards.py       # 60 cases -- each spec/wiring guard is made to fire
 python provision_credentials.py   # n8n SMTP/IMAP credentials from .env (+ the two dry-run ones)
 python sync_settings.py           # the operator's notification address, .env -> the settings table
 python imap_preflight.py          # read-only: IMAP works, and the warm-up state from the real Sent folder
@@ -140,6 +140,25 @@ stripped again in case a client quoted it without a marker.
   freemail domain).
 - `inbound_messages` is keyed on Message-ID, so a re-delivered message changes
   nothing and notifies nobody twice.
+
+## The operator notification: positive/neutral signal, and assets
+
+`Detect Positive Signal` sits between Record Inbound and Build Notification.
+It is deterministic (build rule 3, no model) and reads only `classification`
+and `body_excerpt` from Record Inbound's row — it does not touch, and cannot
+touch, Classify Inbound's classification. Only `classification === 'reply'` is
+scored: bounce/auto-reply/opt-out have already been decided by then, so "Yes,
+please remove me." stays an OPT-OUT on "remove" and its "yes" is never read as
+a positive signal — the notification shows no Signal line at all for it.
+`positive` is a keyword match (`yes`, `sure`, `interested`, `sounds good`,
+`send it`, …) against the reply's own text; anything else is `neutral`.
+
+Build Notification's email already carries the reply text inline
+(`body_excerpt`, "What they wrote"); it now also shows `Signal: POSITIVE
+(matched "…")` or `Signal: NEUTRAL` for a reply, and an `Assets:` section.
+Assets are a `{ label, url }` list in `code_notify.js` — today just the
+one-pager; no recording link exists or is planned, so adding one later is one
+more entry in that list, not a template rebuild.
 
 ## Follow-ups
 

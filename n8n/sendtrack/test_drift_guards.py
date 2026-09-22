@@ -307,6 +307,12 @@ case("Normalise Sent reads a field Load Settings does not return -> refuses", "d
 case("Normalise Sent reads its messages from a node that is not there -> refuses", "no node named",
      mutate_file=("code_mirror_sent.js", lambda s: s.replace("$('Sent Folder')", "$('Sent')", 1)))
 
+# --- Detect Positive Signal / Build Notification wiring ----------------------
+case("Detect Positive Signal reads a field Record Inbound does not produce -> refuses", "does not produce",
+     mutate_file=("code_detect_signal.js", lambda s: s.replace("r.classification", "r.classification_x", 1)))
+case("Build Notification reads a signal field Detect Positive Signal does not emit -> refuses", "does not produce",
+     mutate_file=("code_notify.js", lambda s: s.replace("SIGNAL_LABEL[r.signal]", "SIGNAL_LABEL[r.sentiment]", 1)))
+
 # --- IMAP Health ---------------------------------------------------------------
 # Two process boundaries (pre-flight JSON file -> checker HTTP answer) before
 # the node boundaries -- each guarded like one.

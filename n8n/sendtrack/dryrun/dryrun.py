@@ -234,7 +234,10 @@ def decision_summary(d):
             "excluded": [(x["draft_id"], x["reason"]) for x in d["excluded"]]}
 
 
-MIRROR_ALIVE = "INSERT INTO mailbox_sync (folder, last_synced_at, messages_seen) VALUES ('Sent', '2026-09-14T09:55:00Z', 6);\n"
+MIRROR_ALIVE = (
+    "INSERT INTO mailbox_sync (folder, last_synced_at, messages_seen) VALUES ('Sent', '2026-09-14T09:55:00Z', 6) "
+    "ON CONFLICT (folder) DO UPDATE SET last_synced_at = EXCLUDED.last_synced_at, messages_seen = EXCLUDED.messages_seen;\n"
+)
 
 
 def manual_sends(hours):
@@ -564,6 +567,91 @@ expect("two notifications (reply + opt-out) to the operator -- the duplicate del
 for n in notes:
     _, m = sink_message(n["file"])
     print("    notification: %s" % m.get("Subject"))
+print()
+
+# --- G2. Positive-signal notification flag --------------------------------------
+print("=== G2. Positive-signal flag: positive, neutral, and a false-positive guard ===")
+fresh("""
+UPDATE drafts SET status = 'sent' WHERE id = 31;
+UPDATE leads SET status = 'sent' WHERE id = 7;
+INSERT INTO outreach_log (lead_id, draft_id, channel, sent_at, message_body, message_id) VALUES
+  (7, 31, 'email', '2026-09-13T15:00:00Z', 'first touch', '<seed-31@amitrixlabs.com>');
+INSERT INTO mailbox_sent (message_id, sent_at, recipients, external, lead_id, source) VALUES
+  ('<seed-31@amitrixlabs.com>', '2026-09-13T15:00:00Z', ARRAY['x'], true, 7, 'workflow');
+""")
+addr7 = psql(DRY, "SELECT email FROM contacts WHERE lead_id = 7;").strip()
+# Three distinct replies, all threaded to the same first touch (lead 7): a
+# clear positive, a neutral question, and the false-positive guard -- an
+# opt-out ("remove") whose own first word is "yes".
+fixtures = {"sent": [], "inbox": [
+    {"date": "Mon, 14 Sep 2026 09:00:00 -0300", "from": "Enrique <" + addr7 + ">", "to": "abdullah@amitrixlabs.com",
+     "subject": "Re: question", "textPlain": "Yes, this sounds great -- send it over, we are interested!" + QUOTE,
+     "textHtml": "", "metadata": {"message-id": "<sig-pos@klixar.example>", "in-reply-to": "<seed-31@amitrixlabs.com>"},
+     "attributes": {"uid": 31}},
+    {"date": "Mon, 14 Sep 2026 09:05:00 -0300", "from": "Enrique <" + addr7 + ">", "to": "abdullah@amitrixlabs.com",
+     "subject": "Re: question", "textPlain": "Can you tell me more about how this fits our workflow?" + QUOTE,
+     "textHtml": "", "metadata": {"message-id": "<sig-neutral@klixar.example>", "in-reply-to": "<seed-31@amitrixlabs.com>"},
+     "attributes": {"uid": 32}},
+    {"date": "Mon, 14 Sep 2026 09:10:00 -0300", "from": "Enrique <" + addr7 + ">", "to": "abdullah@amitrixlabs.com",
+     "subject": "Re: question", "textPlain": "Yes, please remove me from your list." + QUOTE,
+     "textHtml": "", "metadata": {"message-id": "<sig-optout@klixar.example>", "in-reply-to": "<seed-31@amitrixlabs.com>"},
+     "attributes": {"uid": 33}},
+]}
+build(fixtures=fixtures)
+import_wf("mailwatch-test.json")
+before = len(sink_log())
+run = execute("mailwatch0001t")
+sig = out_items(run, "Detect Positive Signal")
+show("Detect Positive Signal", [{k: r[k] for k in ("classification", "opt_out_keyword", "signal", "signal_keyword")} for r in sig])
+expect("all three distinct messages were classified", len(sig) == 3, str(len(sig)))
+
+
+def pick(rows, starts):
+    for r in rows:
+        if str(r.get("body_excerpt", "")).startswith(starts):
+            return r
+    raise SystemExit("no Detect Positive Signal row's body_excerpt starts with %r" % starts)
+
+
+pos, neu, optout = pick(sig, "Yes, this sounds great"), pick(sig, "Can you tell me more"), pick(sig, "Yes, please remove me")
+expect("clear positive language -> classification REPLY, signal 'positive'",
+       pos["classification"] == "reply" and pos["signal"] == "positive", str(pos))
+expect("a neutral question -> classification REPLY, signal 'neutral' (not misread as positive)",
+       neu["classification"] == "reply" and neu["signal"] == "neutral", str(neu))
+expect("'Yes, please remove me.' is an OPT-OUT on 'remove' (classification untouched by this feature), "
+       "and its 'yes' is never scored positive",
+       optout["classification"] == "opt-out" and optout["opt_out_keyword"] == "remove" and optout["signal"] == "neutral",
+       str(optout))
+notes = sink_log()[before:]
+expect("three notifications fired, one per distinct message, all to the operator",
+       len(notes) == 3 and all(n["rcpt_to"] == ["<operator@dryrun.invalid>"] for n in notes), str([n["rcpt_to"] for n in notes]))
+# Both replies land under the SAME subject ("[Nova Scout] REPLY from <company>"
+# -- lead 7 for both), so the notifications are told apart by body, not subject.
+texts = []
+for n in notes:
+    _, m = sink_message(n["file"])
+    texts.append(m.get_body(preferencelist=("plain",)).get_content())
+    print("    notification: %s" % m.get("Subject"))
+
+
+def pick_text(texts, needle):
+    for t in texts:
+        if needle in t:
+            return t
+    raise SystemExit("no notification body contains %r" % needle)
+
+
+pos_text = pick_text(texts, "Yes, this sounds great")
+neu_text = pick_text(texts, "Can you tell me more")
+optout_text = pick_text(texts, "Yes, please remove me")
+expect("the positive notification shows the flag and quotes what they actually wrote",
+       "Signal:    POSITIVE" in pos_text and "send it over" in pos_text, pos_text[:200])
+expect("the neutral notification says NEUTRAL, never POSITIVE",
+       "Signal:    NEUTRAL" in neu_text and "POSITIVE" not in neu_text, neu_text[:200])
+expect("the opt-out notification never shows a positive signal for its 'yes' (the false-positive guard)",
+       "POSITIVE" not in optout_text and "Signal:" not in optout_text, optout_text[:200])
+expect("every notification links the one-pager, and none mentions a recording (that asset does not exist)",
+       all("nova-one-pager.docx" in t for t in texts) and not any("recording" in t.lower() for t in texts))
 print()
 
 # --- H. a notification does not use a warm-up slot -----------------------------------

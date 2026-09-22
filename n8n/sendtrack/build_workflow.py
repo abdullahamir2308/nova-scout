@@ -1187,8 +1187,15 @@ _assert_js_emits("Mirror Sent", _sql_payload_reads(MIRROR_SQL) | set(re.findall(
                  _mirror, "code_mirror_sent.js")
 _classify = js("code_classify_reply.js")
 _assert_js_emits("Record Inbound", _sql_payload_reads(RECORD_INBOUND_SQL), _classify, "code_classify_reply.js")
+_detect_signal = js("code_detect_signal.js")
+_assert_wired("Detect Positive Signal (r.*)", _reads(_detect_signal, "r"), final_select_aliases(RECORD_INBOUND_SQL),
+              "Record Inbound")
+DETECT_SIGNAL_EMITS = {"signal", "signal_keyword"}
+_assert_js_emits("Build Notification", DETECT_SIGNAL_EMITS, _detect_signal, "code_detect_signal.js")
 _notify = js("code_notify.js")
-_assert_wired("Build Notification (r.*)", _reads(_notify, "r"), final_select_aliases(RECORD_INBOUND_SQL), "Record Inbound")
+_assert_wired("Build Notification (r.*)", _reads(_notify, "r"),
+              set(final_select_aliases(RECORD_INBOUND_SQL)) | DETECT_SIGNAL_EMITS,
+              "Record Inbound -> Detect Positive Signal")
 NOTIFY_EMAIL_READS = {"notify_to", "subject", "text"}
 _assert_js_emits("Notify Operator", NOTIFY_EMAIL_READS, _notify, "code_notify.js")
 _followup = js("code_followup.js")
@@ -1242,6 +1249,7 @@ DECIDE_JS = bake("code_decide.js", SIGNATURE=SIGNATURE)
 CHECK_JS = bake("code_check_smtp.js", OWN_DOMAIN=OWN_DOMAIN)
 MIRROR_JS = bake("code_mirror_sent.js", OWN_DOMAIN=OWN_DOMAIN)
 CLASSIFY_JS = bake("code_classify_reply.js", OWN_DOMAIN=OWN_DOMAIN)
+DETECT_SIGNAL_JS = bake("code_detect_signal.js")
 NOTIFY_JS = bake("code_notify.js")
 FOLLOWUP_JS = bake("code_followup.js", SIGNATURE=SIGNATURE, SENDER_NAME=SENDER_NAME)
 HEALTH_JS = bake("code_health.js")
@@ -1450,6 +1458,10 @@ mailwatch_nodes = [
             "Match to a lead, record once (keyed on Message-ID), and act: reply -> outreach_log + lead "
             "'replied' (kills follow-ups); opt-out -> that plus blocklist, permanent (Section 5); bounce -> "
             "outreach_log 'bounced'."),
+    code_node("Detect Positive Signal", DETECT_SIGNAL_JS, "runOnceForEachItem", [-330, 160],
+              "Deterministic keyword check (build rule 3, no model) of a reply's own text for the operator "
+              "notification only -- it does not touch Record Inbound's classification. Only classification "
+              "'reply' is scored; an opt-out or bounce is always 'neutral' here."),
     code_node("Build Notification", NOTIFY_JS, "runOnceForEachItem", [-220, 160],
               "HubSpot is deferred (Section 9): the operator gets a plain-text email instead, once per message."),
     if_node("Notify Operator?", "notify", "={{ $json.notify }}", [0, 160],
@@ -1467,7 +1479,8 @@ mailwatch_connections = {
     "Normalise Sent": edge("Mirror Sent"),
     "Inbox": edge("Classify Inbound"),
     "Classify Inbound": edge("Record Inbound"),
-    "Record Inbound": edge("Build Notification"),
+    "Record Inbound": edge("Detect Positive Signal"),
+    "Detect Positive Signal": edge("Build Notification"),
     "Build Notification": edge("Notify Operator?"),
     "Notify Operator?": branch("Notify Operator"),
 }

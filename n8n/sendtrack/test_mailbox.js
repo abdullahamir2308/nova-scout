@@ -1,6 +1,7 @@
 // Unit tests for the Mailbox Watch Code nodes:
 //   code_mirror_sent.js    -- Sent folder -> mailbox_sent rows (the ceiling's input)
 //   code_classify_reply.js -- INBOX message -> reply / opt-out / auto-reply / bounce
+//   code_detect_signal.js  -- deterministic positive/neutral signal on a reply's own text
 //   code_notify.js         -- the operator's notification email
 //
 //   node test_mailbox.js
@@ -155,6 +156,43 @@ t.check('optOutKeyword on an empty body is null', optOutKeyword(''), null);
 const node = runForEachItem(CLASSIFY, [{ json: inbound('Stop.') }], {}, ownDomain);
 t.check('the shipped node body wraps the classification as payload', node[0].json.payload.classification, 'opt-out');
 
+// --- positive-signal detection -----------------------------------------------
+// Deterministic (build rule 3, no model), and does NOT touch classification --
+// it only decides what Build Notification shows, and only for classification
+// 'reply'. code_classify_reply.js above, and its precedence, are untouched;
+// this reuses `classify`'s own output.
+const DETECT = path.join(__dirname, 'code_detect_signal.js');
+const { positiveSignal } = extractFunctions(DETECT, '// Node body', ['positiveSignal']);
+
+[
+  ['Yes, this sounds great -- send it over, we are interested!', 'positive', 'yes'],
+  ["Sure, let's talk next week.", 'positive', 'sure'],
+  ['Can you tell me more about how this fits our workflow?', 'neutral', null],
+  ['We already use a similar tool, not a fit right now.', 'neutral', null],
+].forEach(([text, wantSignal, wantKeyword]) => {
+  const c = classify(inbound(text + GMAIL_QUOTE));
+  t.check(JSON.stringify(text.slice(0, 40)) + ' -> ' + wantSignal,
+    [c.classification, positiveSignal(c)], ['reply', { signal: wantSignal, signal_keyword: wantKeyword }]);
+});
+
+const removed = classify(inbound('Yes, please remove me.' + GMAIL_QUOTE));
+t.check("'Yes, please remove me.' is an OPT-OUT (classification untouched), and its 'yes' is never scored",
+  [removed.classification, removed.opt_out_keyword, positiveSignal(removed)],
+  ['opt-out', 'remove', { signal: 'neutral', signal_keyword: null }]);
+
+const ooo = classify(inbound('Yes, I am out of office until Monday.', {}, { 'auto-submitted': 'auto-replied' }));
+t.check('an auto-reply is never scored, even if it happens to say "yes"',
+  [ooo.classification, positiveSignal(ooo)], ['auto-reply', { signal: 'neutral', signal_keyword: null }]);
+
+t.check('a bounce is never scored', positiveSignal({ classification: 'bounce', body_excerpt: 'Yes indeed' }),
+  { signal: 'neutral', signal_keyword: null });
+
+const detectNode = runForEachItem(DETECT,
+  [{ json: { classification: 'reply', body_excerpt: 'Sounds great, send it over.' } }], {});
+t.check('the shipped node body merges the signal fields onto the row, not a wrapper',
+  [detectNode[0].json.classification, detectNode[0].json.signal, detectNode[0].json.signal_keyword],
+  ['reply', 'positive', 'sounds great']);
+
 // --- operator notification ------------------------------------------------------
 // The address arrives on Record Inbound's row, read from the settings table at
 // runtime -- nothing is baked into the node.
@@ -180,5 +218,29 @@ t.check('the address is trimmed and lower-cased', note({ operator_email: ' Ops@E
 t.check('a message already recorded once -> no second notification', note({ notify: false }).notify, false);
 n = note({ classification: 'reply', opt_out_keyword: null });
 t.check('a plain reply is labelled REPLY', [n.subject, /follow-ups are stopped/.test(n.text)], ['[Nova Scout] REPLY from KLIXAR', true]);
+
+// --- notification content: reply text, the positive/neutral flag, and assets ----
+n = note({ classification: 'reply', opt_out_keyword: null, body_excerpt: 'Yes, sounds great -- send it over.',
+  signal: 'positive', signal_keyword: 'yes' });
+t.check('a positive-flagged reply notifies, showing the flag and the reply text inline',
+  [n.notify, /Signal:\s+POSITIVE \(matched "yes"\)/.test(n.text), /Yes, sounds great -- send it over\./.test(n.text)],
+  [true, true, true]);
+
+n = note({ classification: 'reply', opt_out_keyword: null, body_excerpt: 'Can you tell me more about pricing?',
+  signal: 'neutral', signal_keyword: null });
+t.check('a neutral reply notifies too, showing NEUTRAL and no false POSITIVE',
+  [n.notify, /Signal:\s+NEUTRAL$/m.test(n.text), n.text.includes('POSITIVE')],
+  [true, true, false]);
+
+n = note({ classification: 'opt-out', opt_out_keyword: 'remove', body_excerpt: 'Yes, please remove me.',
+  signal: 'neutral', signal_keyword: null });
+t.check("an opt-out never shows a Signal line, even for a reply body that says \"yes\" (would be a false positive)",
+  [n.notify, n.text.includes('Signal:'), n.text.includes('POSITIVE')], [true, false, false]);
+
+n = note({});
+t.check('every notification links the one-pager, and no recording link exists (not built yet)',
+  [n.text.includes('nova-one-pager.docx'), /recording/i.test(n.text)], [true, false]);
+t.check('the asset section is one line per asset -- today, exactly one',
+  n.text.match(/^  [^:]+: https:\/\//gm).length, 1);
 
 t.done();

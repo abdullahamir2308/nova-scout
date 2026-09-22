@@ -14,11 +14,25 @@
 // workflow JSON. Unset, or not one address, means nobody to tell: the reply is
 // still recorded, the lead still leaves the send queue and the opt-out is still
 // blocklisted -- only this email is skipped.
+//
+// The positive/neutral signal comes from Detect Positive Signal, upstream --
+// a deterministic keyword check of the reply's own text (build rule 3, no
+// model). It is display only, and only ever shown for classification ===
+// 'reply': an opt-out or bounce is never scored (see that node's header).
+//
+// Assets: one link today, the one-pager. No recording link -- that asset
+// does not exist and is not planned right now. ASSETS is a list precisely so
+// a second asset, once one exists, is one more entry here -- not a rebuild.
 
 // One bare address -- the build's rule, and migration 008's CHECK.
 const ADDRESS = /^[^\s@<>(),;:"']+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
 
 const LABEL = { 'reply': 'REPLY', 'opt-out': 'OPT-OUT', 'bounce': 'BOUNCE' };
+const SIGNAL_LABEL = { 'positive': 'POSITIVE', 'neutral': 'NEUTRAL' };
+
+const ASSETS = [
+  { label: 'One-pager', url: 'https://raw.githubusercontent.com/abdullahamir2308/nova-scout/main/nova-one-pager.docx' },
+];
 
 function str(v) {
   return v === null || v === undefined ? '' : String(v).trim();
@@ -52,10 +66,17 @@ function notification(r) {
   lines.push('Subject:   ' + str(r.subject));
   lines.push('Received:  ' + str(r.received_at));
   lines.push('Matched:   ' + str(r.matched_by));
+  if (r.classification === 'reply') {
+    const sig = SIGNAL_LABEL[r.signal] || 'NEUTRAL';
+    lines.push('Signal:    ' + sig + (r.signal_keyword ? ' (matched "' + str(r.signal_keyword) + '")' : ''));
+  }
   lines.push('');
   lines.push('What they wrote:');
   lines.push('');
   lines.push(str(r.body_excerpt) || '(no text above the quoted thread)');
+  lines.push('');
+  lines.push('Assets:');
+  ASSETS.forEach(function (a) { lines.push('  ' + a.label + ': ' + a.url); });
   return {
     notify: Boolean(r.notify) && to !== '',
     notify_to: to,
