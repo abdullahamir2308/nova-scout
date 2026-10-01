@@ -24,13 +24,16 @@
 //                        in the record. Using it to authorise a draft would let
 //                        one model's invention license another's.
 //
-// Drafting skill v2 (NovaScout_DraftingSkill.md) leaves all of that untouched and
-// narrows what the model is asked for: a subject and two one-sentence hooks,
-// nothing else. The problem, outcome, proof and ask are human-written lines from
-// the claims library (migration 010), resolved here for this lead -- proof by
-// its country -- and inserted verbatim by Assemble Drafts. The model never sees
-// them. The guard above decides WHETHER a lead is drafted; the library decides
-// what everything after the first sentence says.
+// Drafting skill v3 (NovaScout_DraftingSkill.md) leaves all of that untouched.
+// What changed is what the model is given and asked for. v2 had a 9B model
+// write a subject and two hooks and pasted claims-library lines in after them,
+// verbatim. v3 sends the whole composition to Claude Sonnet 5.5: one prospect
+// fact to open on, plus the approved claims for this lead -- descriptions, pain
+// angles, benefits, the proof line matched to its country, the asks -- and the
+// model writes the email around them. It may rephrase a claim, never widen it
+// (skill section 0, rule 2); Assemble Drafts enforces section 3 on what comes
+// back. The guard above still decides WHETHER a lead is drafted, before any
+// API call is made.
 //
 // Master Ref build rule 3: this is all string matching, so it costs no tokens.
 
@@ -43,9 +46,6 @@
 
 // Section 9, Workflow 4: "If the record lacks at least two specific facts".
 const MIN_FACTS = 2;
-
-// Section 9, Workflow 4: "under 80 words".
-const MAX_WORDS = 80;
 
 // Section 9, Workflow 3, "Therapeutic area taxonomy". A therapeutic area only
 // counts as a grounding fact if it canonicalises against this locked list.
@@ -94,10 +94,10 @@ for (const a of THERAPEUTIC_AREAS) AREA_BY_KEY[a.toLowerCase()] = a;
 // this band is the "confirmed" in that row.
 const SMALL_TEAM = { min: 5, max: 100 };
 
-// The four parts of a first touch that come from the approved claims library
-// (NovaScout_DraftingSkill.md v2, section 2) rather than from the model. `link`
-// is optional and only ever used after warm-up.
-const LIBRARY_SLOTS = ['problem', 'outcome', 'proof', 'ask'];
+// The claims-library slots a v3 email is composed from (NovaScout_DraftingSkill.md
+// v3, section 4). A lead needs at least one active line in each, or it waits.
+// `link` is optional and only ever used after warm-up, appended by code.
+const LIBRARY_SLOTS = ['description', 'angle', 'benefit', 'proof', 'ask'];
 
 // A role inbox is not a person -- Section 9, Workflow 3b, LOCKED:
 //
@@ -126,6 +126,14 @@ const ROLE_LOCALPARTS = [
 // time the batch query has run. Workflow 3 hit this first and solved it the same
 // way -- code_score.js builds its own system_prompt and carries it forward.
 const SYSTEM_PROMPT = __SYSTEM_PROMPT__;
+
+// The fixed part of the Anthropic Messages API request -- model, max_tokens,
+// effort and the JSON schema -- substituted at build time by build_workflow.py,
+// which parses the model id out of the skill and the Master Ref. Each item adds
+// its own system prompt and user message; the HTTP node sends $json.request as
+// the body. Building the body here rather than in an n8n expression keeps it
+// testable, and keeps a `}}` in the schema from ending the expression early.
+const CLAUDE_REQUEST = __CLAUDE_REQUEST__;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -355,13 +363,14 @@ if (trialCount > 0 && trialTitles.length) {
   facts.push({
     kind: 'named_trial',
     line:
-      // "with you as the sponsor", not "with this company" -- the model copies
-      // this line almost verbatim into the draft, so a third-person phrasing
-      // here comes back as "this company" and "their own material" in a message
-      // addressed to that company. The fact sheet is written in the voice the
-      // draft needs to be in.
+      // Second person -- the model copies this line closely, so a third-person
+      // phrasing came back as "this company" in a message addressed to that
+      // company. But never "with you as the sponsor": skill v3 bans describing
+      // the prospect as sponsoring anything, because "sponsor" now means the
+      // CRO's client in every claim, and v2's "You're sponsoring ..." hooks put
+      // one word on two parties in the same email.
       'ClinicalTrials.gov lists ' + trialCount + ' recruiting trial' +
-      (trialCount === 1 ? '' : 's') + ' with you as the sponsor. ' +
+      (trialCount === 1 ? '' : 's') + ' registered under your company. ' +
       // Phrased off how many titles came back, not off the total: pageSize caps
       // the titles at 3, so "2 trials ... it is titled" was a real mismatch.
       (trialTitles.length === 1 ? 'The only one named is' : 'The ones named are') + ': "' +
@@ -486,9 +495,9 @@ const openLinkedin = pool.length > 1
 // companies with the same fact shape do not get the same subject line.
 //
 // Only when the email opens from something a subject cannot use (the city
-// fallback) does the skill's ladder go further down: a small confirmed
-// headcount, and failing that the problem itself, with no prospect fact at all
-// -- the "only geography known" row of the worked examples.
+// fallback) does the ladder go further down: a small confirmed headcount, and
+// failing that the pain itself, with no prospect fact at all. Skill v3: the
+// subject is "built from a prospect fact or the pain".
 const n = Number(lead.employee_estimate);
 const headcount = lead.employee_estimate !== null && lead.employee_estimate !== undefined &&
   Number.isInteger(n) && n >= SMALL_TEAM.min && n <= SMALL_TEAM.max ? n : null;
@@ -500,7 +509,7 @@ if (openEmailKind === 'named_trial' || openEmailKind === 'therapeutic_area') {
 } else if (headcount !== null) {
   subjectSource = 'headcount';
 } else {
-  subjectSource = 'problem';
+  subjectSource = 'pain';
 }
 
 let subjectLines;
@@ -510,11 +519,10 @@ if (subjectSource === 'headcount') {
     'either hook: their own site states a team of ' + headcount + ' people. This says',
     'nothing about what those people do or where they sit.',
   ];
-} else if (subjectSource === 'problem') {
+} else if (subjectSource === 'pain') {
   subjectLines = [
-    'None of these facts suits a subject line. Build the subject from the problem',
-    'instead, in the shape of the "only geography known" example, and put no fact',
-    'about them in it.',
+    'None of these facts suits a subject line. Build the subject from the pain',
+    'angle you chose instead, and put no fact about them in it.',
   ];
 } else {
   subjectLines = [
@@ -526,11 +534,12 @@ if (subjectSource === 'headcount') {
 }
 
 // The trial fact reaches the model phrased from its source ("ClinicalTrials.gov
-// lists ..."), and the model copies a fact line almost verbatim. Measured on the
-// v2 prompt: one hook in eight still opened "ClinicalTrials.gov lists ..." --
-// about the source, which skill section 3 rules out. A per-lead instruction
-// naming the opening words is the cheap, targeted fix; Assemble Drafts still
-// tags a hook that ignores it.
+// lists ..."), and a model copies a fact line closely. Measured on the v2
+// prompt: one hook in eight still opened "ClinicalTrials.gov lists ..." -- about
+// the source, which the skill rules out. v2 fixed it by naming the opening
+// words, "You're sponsoring"; skill v3 bans exactly that phrase, so the
+// instruction now names v3's words instead. Assemble Drafts tags a hook that
+// ignores either.
 const trialOpeners = [openEmail, openLinkedin].some(function (i) {
   return facts.length && facts[i].kind === 'named_trial';
 });
@@ -544,33 +553,32 @@ const prompt = [
   'what it does NOT establish:',
   factSheet,
   '',
-  'Write the email subject, the email hook and the LinkedIn hook.',
   'Open the email from fact ' + (openEmail + 1) + '. Open the LinkedIn DM from fact ' +
     (openLinkedin + 1) + '.',
 ].concat(subjectLines, trialOpeners ? [
-  'A hook built from the trial fact begins with the words "You\'re sponsoring" -- it',
-  'is about them, not about ClinicalTrials.gov.',
-] : [], [
-  'Write no greeting and no sign-off -- those are added afterwards.',
-]).join('\n');
+  'A hook built from the trial fact says "Your recruiting trial ..." or "You\'re',
+  'running ..." -- about them, not about ClinicalTrials.gov, and never "sponsoring".',
+] : []).join('\n');
 
 // --- The approved claims library --------------------------------------------
 //
-// Parts 2-5 of the email come from here, verbatim, never from the model (skill
-// section 2). They are resolved now, before any GPU time is spent: a groundable
-// lead the library cannot complete -- no active line for a slot, or no proof
-// line for its country and no fallback -- is dropped and stays 'contact_found'
-// until the operator fixes the table. Same self-healing shape as a failed
-// lookup: a gap in the operator's data must not mark a lead low-context, and it
-// must not produce a draft with a hole where the proof should be.
+// Everything in the email that is not a prospect fact comes from here (skill
+// v3, section 0, rule 2): the model composes with these lines and may rephrase
+// them, never widen them. They are resolved now, before any API money is
+// spent: a groundable lead the library cannot complete -- no active line for a
+// slot, or no proof line for its country and no fallback -- is dropped and
+// stays 'contact_found' until the operator fixes the table. Same self-healing
+// shape as a failed lookup: a gap in the operator's data must not mark a lead
+// low-context, and it must not produce a draft with no proof in it.
 //
 // A lead that is not groundable does not need the library -- it gets the
 // low-context note either way -- so it is not held back by it.
 const lib = libraryRows(lead.library);
 const bySlot = function (slot) { return lib.filter(function (r) { return r.slot === slot; }); };
 const pools = {
-  problem: lines(bySlot('problem')),
-  outcome: lines(bySlot('outcome')),
+  description: lines(bySlot('description')),
+  angle: lines(bySlot('angle')),
+  benefit: lines(bySlot('benefit')),
   proof: lines(forCountry(bySlot('proof'), lead.country)),
   ask: lines(bySlot('ask')),
 };
@@ -581,14 +589,47 @@ const libraryGap = emptySlots.length
     (emptySlots.indexOf('proof') !== -1 ? ' (proof: none serves ' + str(lead.country) + ' and no fallback)' : '')
   : null;
 
+// The claims, as the model sees them: each with its code, so it can report
+// which each message used (Assemble Drafts checks every code against this list and
+// records them in `variant` for the learning loop). Only this lead's proof line
+// is offered -- the geography match is decided here, not by the model.
+const CLAIM_HEADINGS = [
+  ['description', 'DESCRIPTION -- introduce what we built with one of these, the first time you mention it:'],
+  ['angle', 'PAIN AND STAKES ANGLES -- build the email around ONE:'],
+  ['benefit', 'BENEFITS -- use one or two:'],
+  ['proof', 'PROOF -- use this; it is matched to their country:'],
+  ['ask', 'ASK -- end each message with ONE of these, rephrased if you like:'],
+];
+const claimsSheet = CLAIM_HEADINGS.map(function (h) {
+  return [h[1]].concat(pools[h[0]].map(function (l) { return '  [' + l.code + '] ' + l.body; })).join('\n');
+}).join('\n\n');
+
+const fullPrompt = prompt + '\n\nAPPROVED CLAIMS FOR THIS EMAIL. Nothing about the product, the problem or the\n' +
+  'proof may come from anywhere else. Rephrase freely; never widen what a line says.\n\n' +
+  claimsSheet + '\n\n' +
+  'Write the email subject, the email (body and ask) and the LinkedIn DM (body and ask).\n' +
+  'Write no greeting and no sign-off -- those are added afterwards. In email_claims\n' +
+  'and linkedin_claims, list the code of every claim that message used.';
+
+// No cache_control on the system prompt. Measured on the 2026-10-02 run: the
+// HTTP node dispatches every item's request before awaiting any, so a batch's
+// calls run concurrently and none can read a cache another has not yet written
+// (four calls, four cache writes, zero reads); and cron runs are 30 minutes
+// apart, past the 5-minute cache lifetime. Caching only added the 25% write
+// premium.
+const request = Object.assign({}, CLAUDE_REQUEST, {
+  system: SYSTEM_PROMPT,
+  messages: [{ role: 'user', content: fullPrompt }],
+});
+
 // Warm-up week at draft time, from the same Sent-folder history the send path
 // counts. NULL means no external send yet: the first send will be week 1.
 const w = Number(lead.warmup_week);
 const warmupWeek = Number.isInteger(w) && w >= 1 ? w : 1;
 
-// Every taxonomy area this lead does NOT have. Assemble Drafts flags a hook or
-// subject naming one -- the worked examples in the system prompt name
-// oncology, and a 9B model copies examples.
+// Every taxonomy area this lead does NOT have. Assemble Drafts flags a draft
+// naming one -- the worked example in the system prompt names oncology and
+// immunology, and a model copies examples.
 const absentAreas = THERAPEUTIC_AREAS.filter(function (a) {
   return UNSPECIFIC_AREAS.indexOf(a) === -1 && areas.indexOf(a) === -1;
 });
@@ -617,7 +658,6 @@ return {
     linkedin_addressing: linkedinAddressing,
     email_greeting: emailGreeting,
     linkedin_greeting: linkedinGreeting,
-    max_words: MAX_WORDS,
     open_email_fact: facts.length ? facts[openEmail].kind : null,
     open_linkedin_fact: facts.length ? facts[openLinkedin].kind : null,
     subject_source: subjectSource,
@@ -628,6 +668,7 @@ return {
     library_gap: libraryGap,
     warmup_week: warmupWeek,
     system_prompt: SYSTEM_PROMPT,
-    prompt: prompt,
+    prompt: fullPrompt,
+    request: request,
   }),
 };

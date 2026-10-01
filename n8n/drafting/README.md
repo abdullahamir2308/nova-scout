@@ -11,62 +11,74 @@ the code and the docs disagree.
 
 ```
 python build_workflow.py        # regenerate the workflow JSON
-node   test_grounding.js        # 121 cases -- the grounding guard (v1's 75, untouched) + v2
-node   test_assemble.js         # 112 cases -- assembly and constraint enforcement
-python test_drift_guards.py     # 45 cases -- each guard is made to fire
+node   test_grounding.js        # 134 cases -- the grounding guard (v1's 75) + the v3 library, prompt and request
+node   test_assemble.js         # 130 cases -- response handling, assembly, every skill v3 section 3 rule
+python test_drift_guards.py     # 55 cases -- each guard is made to fire
+python test_rule_mutations.py   # breaks every rule in turn; the unit suites must fail each time
 python audit_drafts_vs_onepager.py   # read-only: the live queue and library vs nova-one-pager.docx
+python provision_anthropic_credential.py   # ANTHROPIC_API_KEY in .env -> n8n credential novascoutAnthropic01
+python write_drafting_review.py [exec_id]  # read-only: DRAFTING_REVIEW.md from what n8n has deployed
 ```
 
-## Drafting skill v2 — the model writes three sentences
+## Drafting skill v3 — Claude composes, code enforces
 
-Since 2026-09-19 a first touch is built to `NovaScout_DraftingSkill.md` v2: hook,
-problem, outcome, proof, ask. **Only the hook and the subject are generated.** The
-model returns `email_subject`, `email_hook` and `linkedin_hook`, and nothing else.
-The schema has no other field, and the build refuses one that disagrees with the
-skill's "only the hook and subject are freely generated". The problem, outcome,
-proof and exactly one ask are lines from the **claims library**, the
-`claims_library` table (migration 010), which the operator owns and edits in
-NocoDB or psql. The batch query reads the active rows on every run, so an edit
-reaches the next draft with no rebuild. `code_assemble.js` inserts them verbatim.
-The model never sees them, so it cannot paraphrase a claim or join a prospect
-fact onto one.
+Since 2026-10-02 a first touch is built to `NovaScout_DraftingSkill.md` v3. The
+drafting node is **Claude Sonnet 5.5** (`claude-sonnet-5-5`) on the Anthropic API,
+through the n8n credential `novascoutAnthropic01`; enrichment and scoring stay on
+local `qwen3.5:9b`. The request parameters come from the live Sonnet 5.5 docs
+and are recorded in Master Ref Section 3: no sampling parameters (a 400 on this
+model), adaptive thinking by default, effort `high`, structured output through
+`output_config.format`. **If a call fails, nothing is written and the lead stays
+`contact_found`. There is no fallback to the local model.**
+
+v2 had the model write a subject and two hooks and pasted claims-library lines
+after them, verbatim. v3 is composition: the model writes the whole email and the
+LinkedIn DM from the fact it is told to open on, plus this lead's approved claims
+(`claims_library`, migration 012) -- every description, pain angle, benefit and
+ask, and only the proof line matched to the lead's country. It may rephrase a
+claim, never widen it. Its schema is subject, body and **ask as a separate field**
+for each channel, plus the claim codes each message used, so "exactly one ask"
+is checkable.
 
 | Part | Where it comes from |
 |---|---|
-| Subject, hook | the model, from the fact sheet, under the guard below |
-| Problem, outcome, ask | library lines, rotated on `lead_id`, chosen to fit the 80-word body |
-| Proof | the library line whose `countries` names the lead's country; the line with no countries otherwise; an active `measured` line wins |
-| Link | none in warm-up weeks 1–2; after that only the library's `link` line |
-| Opt-out, signature, greeting | appended here, as in v1 |
+| Subject, body, ask | the model, from the fact sheet and the approved claims |
+| Which fact opens each channel, which proof line is offered | Assess Grounding, deterministically |
+| Greeting, opt-out, signature | appended here, never generated |
+| Link | none in warm-up weeks 1-2; after that only the library's `link` line, appended here |
 
-`variant` now records the lines used, e.g. `role-inbox/P2.O2.PR-MX.A2+unconfirmed-claim`,
-because that is what the learning loop needs to see which lines earn replies.
-New tags: `subject-*` (length, product name, Re:/Fwd:, banned word, shouting,
-ungrounded), `hook-*` (question, ask, pitch, ungrounded, opener, source, long),
-`link-in-warmup` / `unapproved-link` / `linkedin-link` / `pdf-link`, and
-`unconfirmed-claim` (the library is seeded unconfirmed, as skill §4 is a DRAFT).
+**Every rule skill section 3 states is enforced in `code_assemble.js` and tagged
+on `variant`** -- length (70-110 target, `long` above 125), one ask, the link
+policy, the product name at most once and in brackets, "AI" at most once, no
+"You're sponsoring", the forbidden claims (guarantees, numbers the library does
+not hold, visitor identification, named CRMs and tools, languages, "chatbot"),
+the geography-matched proof, the subject rules, and v2's grounding checks.
+`DRAFTING_REVIEW.md` (repo root, generated from the deployed workflow) lists
+every tag and its pattern. `test_rule_mutations.py` breaks each rule in the
+source in turn and proves the unit suite fails.
 
-**The worked examples in the system prompt carry other companies' facts**
-(INM004, a 40-person team, oncology), and a 9B model copies examples. Any digit
-token in a hook or subject that is not in the lead's facts, or any therapeutic
-area the lead does not have, is tagged `-ungrounded`. Measured: before
-`code_assess.js` started picking the trial's short name (its code, otherwise the
-first two content words of the title), the model gave a trial with no code the
-subject "INM004 trial — a quick question".
+`variant` records each message's own claim codes in slot order, e.g.
+`role-inbox/D2.ANG-HOURS.BEN-247.PR-TR.A1+unconfirmed-claim`. When the model
+leaves out the ask or proof code -- it did on three of eight messages in the
+first run -- code attributes it from the text rather than trusting the model to
+copy an identifier.
 
-**Two hook failures measured on real leads, and what fixed them.** When the model
-was told to vary the LinkedIn hook's wording, it wrote "Your site lists work on
-the Efficacy of INM004…" — the trial is on ClinicalTrials.gov, not their site.
-That instruction was removed (truth beats variety), and the hook is tagged
-`hook-source`. And the trial fact line is phrased from its source, which the
-model copies ("ClinicalTrials.gov lists…"). A per-lead instruction naming the
-opening words, "You're sponsoring", fixed that.
+**Prompt caching is off on purpose.** The HTTP node dispatches every item's
+request before awaiting any, so a run's calls are concurrent and never read each
+other's cache (measured: four writes, zero reads), and cron runs are 30 minutes
+apart, past the 5-minute cache lifetime.
+
+**Terminology, reversed in v3.** "Sponsor" is the CRO's client again, in the
+claims, the prompt, the drafts and the one-pager. The prospect is never the one
+sponsoring: the trial fact says "registered under your company", and any draft
+that says "You're sponsoring" is tagged `prospect-sponsor`.
 
 **A redraft retires what it replaces.** Send a lead back to `contact_found` and
 the write statement sets its earlier pending or approved first-touch drafts to
-`rejected` / `bad draft` in the same statement as the insert. Left approved, the
-old draft would be the first thing Workflow 6 sends, because it sends the oldest
-approved draft of a `drafted` lead. New drafts are always `pending`.
+`rejected` / `bad draft` in the same statement as the insert. New drafts are
+always `pending`. A lead Workflow 6 has already emailed must be put back to
+`sent` after its redraft (2026-10-02 did this for leads 7, 91 and 104); its new
+email draft can never send, because Workflow 6 refuses `already-contacted`.
 
 ## The grounding guard
 
@@ -149,17 +161,15 @@ produced without a merge tag.
 
 The opt-out sentence, the signature and the greeting are appended in
 `code_assemble.js`, not generated. Section 5 locks the opt-out **verbatim** and
-makes it the basis of the GDPR/KVKK legitimate-interest position; asking a 9B
-model to reproduce a compliance string exactly, every time, is a bet with no
-upside (build rule 3). `test_drift_guards.py` refuses the build on even a
-punctuation change to it.
+makes it the basis of the GDPR/KVKK legitimate-interest position.
+`test_drift_guards.py` refuses the build on even a punctuation change to it, in
+the JS or in the skill's section 4.
 
-Since v2 the same goes for every sentence that is not about the prospect: the
-problem, outcome, proof and ask are claims-library lines inserted verbatim (see
-above).
+Nothing about the product, the problem or the proof may come from anywhere but
+the approved claims the prompt lists; what comes back is checked against them
+(numbers, deployments, claim codes).
 
-Constraint violations tag the draft's `variant` rather than discarding it —
-`role-inbox/P1.O1.PR-TR.A1+long`, `named/P2.O3.PR-MX.A3+adjective,merge-tag`. The
+Constraint violations tag the draft's `variant` rather than discarding it. The
 reviewer sees the tag next to the text; a silently dropped draft teaches nobody
 anything.
 
@@ -189,18 +199,18 @@ nothing is invented to fill the gap.
 
 ## Known gaps
 
-- **`NOVASCOUT_DEMO_URL` is gone.** Skill v2 moves the recording, the PDF and the
-  LinkedIn profile to the reply payload (skill §8). The one URL a first touch may
-  carry after warm-up is the library's `link` line (seeded inactive, `L-NP`).
-- **Ask line A3 offers the 90-second recording,** which Section 13 still lists as
-  not made. A "yes" to it needs the recording to exist. Deactivate A3 in the
-  library until it does, if that matters.
+- **Every claim is unconfirmed.** Migration 012 seeded the v3 library with
+  `confirmed=false`, so every draft carries `unconfirmed-claim` until a human
+  confirms the lines. Read each row's `note` first: BEN-CAPTURE, BEN-BRIEF and
+  BEN-SEE were narrowed to the Nova Agent Kit code. D2, BEN-BOOK, BEN-247 and
+  BEN-ROUTE were seeded as written, with the question the code raised.
+- **The model favours D2** ("... and books the call"): 7 of 8 drafts on
+  2026-10-02. That is one of the lines the code reading questioned.
+- **A pattern check is a pattern check.** The claim rules catch the phrasings
+  their patterns name (`DRAFTING_REVIEW.md` lists them). A forbidden claim worded
+  some other way gets past them, and the human review is the backstop.
 - **The subject and link checks are email-only.** The LinkedIn DM is sent by a
-  human from their own account (Section 6), so it is held to Section 5's message
-  rules only where they make sense. Its hook is checked like the email's.
-- **A long trial title makes a long hook.** Atlant Clinical's LinkedIn DM opens
-  on its real trial title (a 28-word hook) and is tagged `long`, rather than
-  having the title shortened into something the registry does not say.
+  human from their own account (Section 6). Any URL in a DM is tagged.
 
 ## The one-pager is not built here
 
@@ -222,20 +232,22 @@ note.
 
 1. **No internal note and no placeholders:** no `[Abdullah: ...]` paragraph, no
    `[DATE]`, nothing in square brackets.
-2. **`pharma team` (noun) / `pharma-team` (modifier) for the pharma-side party,
-   never `sponsor`.** A first-touch hook opens "You're sponsoring ..." (the CRO
-   as trial sponsor), and the claims library has said "pharma team" since
-   2026-09-21, so a one-pager that says "sponsor" puts one word on two parties
-   between the email and the asset it leads to. "Sponsor" is right only for the
-   CRO's own registered-sponsor status on ClinicalTrials.gov, which the
-   one-pager does not mention.
+2. **`sponsor` for the CRO's client, never `pharma team`, and nothing calling
+   the reader a sponsor** (skill v3, 2026-10-02 -- this reverses the 2026-09-21
+   rule). The claims and the drafts say "sponsor" for the client again.
 3. **No speed claim beyond "in real time".** The one-pager says Nova answers
-   "in real time"; nothing supports a seconds figure, and `claims_library` O2
-   says the same.
+   "in real time"; nothing supports a seconds figure, and no active claim
+   says more (the audit's section B fails on a seconds claim).
+4. **The five capability bullets under "What Nova does"** (added 2026-10-02):
+   qualification fields, routing of investigators and trainees, the
+   capabilities deck, the booking link, the dashboard. Each is worded to what
+   the Nova Agent Kit code does, and several active claims cite them as
+   evidence (`audit_drafts_vs_onepager.py`, section C).
 
 After regenerating, run `python audit_drafts_vs_onepager.py` before the file is
-served. It fails on a placeholder, on the word "sponsor", and on any claim an
-active library line makes that the one-pager does not. It also reads the live
+served. It fails on a placeholder, on leftover "pharma team" wording, on anything calling
+the reader a sponsor, and on any claim an active library line makes that the
+one-pager does not. It also reads the live
 queue, so run it after a library edit or a redraft too.
 
 ## The bug worth remembering
@@ -249,5 +261,5 @@ execution reported `"status": "success"`.
 
 Unit tests could not catch it (they test the Code node, not the wiring) and
 runtime could not catch it (nothing errored). It is now a **build-time** guard:
-every `$json.X` the Ollama body reads must be a field `code_assess.js` actually
-emits, with two drift-guard cases proving the guard fires.
+every `$json.X` the model node's body reads (today the Claude Draft node's
+`$json.request`) must be a field `code_assess.js` actually emits, with two drift-guard cases proving the guard fires.

@@ -19,8 +19,12 @@ const ASSESS = path.join(__dirname, 'code_assess.js');
 // first live run, which is the whole reason it is emitted here rather than set
 // on the Config node.
 const SYSTEM_PROMPT = 'SYSTEM PROMPT SENTINEL';
+// The request base build_workflow.py substitutes (skill v3): model, max_tokens,
+// effort, schema. A stand-in with the same keys; the build checks the real one.
+const CLAUDE_REQUEST = { model: 'claude-sonnet-5-5', max_tokens: 16000, output_config: { effort: 'high' } };
 const withSystemPrompt = function (src) {
-  return src.replace('__SYSTEM_PROMPT__', JSON.stringify(SYSTEM_PROMPT));
+  return src.replace('__SYSTEM_PROMPT__', JSON.stringify(SYSTEM_PROMPT))
+    .replace('__CLAUDE_REQUEST__', JSON.stringify(CLAUDE_REQUEST));
 };
 
 // A lead row shaped like the Get Draft Batch query returns it.
@@ -477,7 +481,7 @@ t.check(
 );
 t.check(
   'and still reports the true total',
-  assess(lead(), ctgov(9, ['A', 'B'])).fact_sheet.indexOf('lists 9 recruiting trials with you') !== -1,
+  assess(lead(), ctgov(9, ['A', 'B'])).fact_sheet.indexOf('lists 9 recruiting trials registered under your company') !== -1, // [v3] wording: no "sponsor" for the prospect
   true
 );
 
@@ -563,11 +567,11 @@ t.check(
 );
 
 // ===========================================================================
-// Drafting skill v2 -- everything above is the v1 suite, unchanged
+// Drafting skill v3 -- everything above is the v1 suite, unchanged
 // ===========================================================================
 
 // The active claims-library rows as Get Draft Batch aggregates them (migration
-// 010's seed shape): proof lines carry the countries they serve, and the one
+// 012's seed shape): proof lines carry the countries they serve, and the one
 // with no countries serves everywhere else.
 const TR = ['Turkey', 'Egypt', 'UAE', 'Romania', 'Hungary', 'Poland', 'Czech Republic'];
 const LATAM = ['Mexico', 'Brazil', 'Argentina'];
@@ -575,9 +579,10 @@ function row(code, slot, body, extra) {
   return Object.assign({ code: code, slot: slot, body: body, countries: null, measured: false, confirmed: false }, extra || {});
 }
 const LIB = [
-  row('A1', 'ask', 'Worth a 48-hour demo built on your own material? Reply yes and I\'ll set it up.'),
-  row('O1', 'outcome', 'We built Nova to answer from your own material, qualify the lead, and route it wherever you already work.'),
-  row('P1', 'problem', 'When a sponsor shortlists you at 11pm, does that lead reach you by morning?'),
+  row('A1', 'ask', 'Would a 48-hour demo built on your own material be worth a look? One word back is enough.'),
+  row('ANG-HOURS', 'angle', 'Sponsors often research CROs outside your working hours.'),
+  row('BEN-247', 'benefit', 'It answers sponsors from your own SOPs and service pages, in real time, at any hour.'),
+  row('D1', 'description', 'an AI assistant for your website that turns sponsor inquiries into qualified leads'),
   row('PR-BOTH', 'proof', 'It\'s live at two CROs, in Türkiye and Mexico.'),
   row('PR-MX', 'proof', 'It\'s live at Vertex Clinical Research in Mexico.', { countries: LATAM }),
   row('PR-TR', 'proof', 'It\'s live at NoblePath, an oncology CRO in Türkiye.', { countries: TR }),
@@ -610,7 +615,7 @@ t.check(
   1
 );
 
-// --- proof is geography-matched: skill section 3, Master Ref section 12 ------
+// --- proof is geography-matched: Master Ref section 12 ----------------------
 
 t.check('Mexico gets Vertex', proofOf('Mexico'), ['PR-MX']);
 t.check('so do the other Latin American geographies', [proofOf('Brazil'), proofOf('Argentina')], [['PR-MX'], ['PR-MX']]);
@@ -620,13 +625,13 @@ t.check('a country no line names gets the line with no countries -- "either else
 t.check('country matching ignores case', proofOf('mexico'), ['PR-MX']);
 t.check(
   'an active measured line replaces the plain line for its countries',
-  proofOf('Mexico', LIB.concat([row('PR-MX-N', 'proof', 'Nova handled 140 sponsor conversations at Vertex in 60 days.',
+  proofOf('Mexico', LIB.concat([row('PR-MX-N', 'proof', 'A measured number from the dashboard.',
     { countries: LATAM, measured: true })])),
   ['PR-MX-N']
 );
 t.check(
   'but a measured line for other countries does not reach this one',
-  proofOf('Turkey', LIB.concat([row('PR-MX-N', 'proof', 'Nova handled 140 sponsor conversations at Vertex in 60 days.',
+  proofOf('Turkey', LIB.concat([row('PR-MX-N', 'proof', 'A measured number from the dashboard.',
     { countries: LATAM, measured: true })])),
   ['PR-TR']
 );
@@ -636,12 +641,17 @@ t.check(
   ['PR-MX']
 );
 
-// --- the other slots --------------------------------------------------------
+// --- the v3 slots -------------------------------------------------------------
 
 const POOLS = assess(withLib({ country: 'Poland' }), ctgov(0, [])).library_pools;
-t.check('one problem, outcome and ask pool each, in code order', [POOLS.problem.length, POOLS.outcome.length, POOLS.ask.length], [1, 1, 1]);
-t.check('each line carries its text verbatim', POOLS.problem[0].body, LIB[2].body);
-t.check('and whether a human has confirmed it', POOLS.problem[0].confirmed, false);
+t.check('one pool per v3 slot', Object.keys(POOLS).sort(), ['angle', 'ask', 'benefit', 'description', 'proof']);
+t.check('each line carries its text as the table holds it', POOLS.description[0].body, LIB[3].body);
+t.check('and whether a human has confirmed it', POOLS.benefit[0].confirmed, false);
+t.check(
+  'a v2-shaped row (problem/outcome) is offered to nobody',
+  Object.keys(assess(withLib({}, LIB.concat([row('P1', 'problem', 'Old?')])), ctgov(0, [])).library_pools).indexOf('problem'),
+  -1
+);
 t.check(
   'a link line resolves by country the same way',
   assess(withLib({ country: 'Poland' }, LIB.concat([row('L-NP', 'link', 'https://noblepath.example', { countries: TR })])), ctgov(0, []))
@@ -657,23 +667,35 @@ t.check(
 
 // --- a library gap holds the lead back instead of drafting around the hole ---
 
-const NO_ASK = assess(withLib({}, LIB.filter(function (r) { return r.slot !== 'ask'; })), ctgov(0, []));
-t.check('a groundable lead with no ask line is held back, not drafted', NO_ASK.ok, false);
-t.check('and says which slot is empty', NO_ASK.skip_reason.indexOf('no active ask line') !== -1, true);
+['description', 'angle', 'benefit', 'ask'].forEach(function (slot) {
+  const held = assess(withLib({}, LIB.filter(function (r) { return r.slot !== slot; })), ctgov(0, []));
+  t.check('a groundable lead with no ' + slot + ' line is held back, not drafted', [held.ok, held.skip_reason.indexOf('no active ' + slot + ' line') !== -1], [false, true]);
+});
 const NO_PROOF = assess(withLib({ country: 'India' }, LIB.filter(function (r) { return r.code !== 'PR-BOTH'; })), ctgov(0, []));
 t.check('a country with no proof line and no fallback is held back', NO_PROOF.ok, false);
 t.check('and names the country', NO_PROOF.skip_reason.indexOf('none serves India') !== -1, true);
-t.check(
-  'an empty library holds back a groundable lead',
-  assess(withLib({}, []), ctgov(0, [])).ok,
-  false
-);
-t.check(
-  'but not a low-context one -- its note needs no library',
-  assess(lead({ city: 'Warsaw', library: [] }), ctgov(0, [])).ok,
-  true
-);
+t.check('an empty library holds back a groundable lead', assess(withLib({}, []), ctgov(0, [])).ok, false);
+t.check('but not a low-context one -- its note needs no library', assess(lead({ city: 'Warsaw', library: [] }), ctgov(0, [])).ok, true);
 t.check('a complete library lets the lead through', assess(withLib(), ctgov(0, [])).ok, true);
+
+// --- the prompt and the request ------------------------------------------------
+
+const P = assess(withLib({ country: 'Poland' }), ctgov(0, []));
+t.check('every approved claim reaches the prompt with its code',
+  ['[D1] an AI assistant', '[ANG-HOURS] Sponsors', '[BEN-247] It answers', '[PR-TR] It\'s live at NoblePath', '[A1] Would a 48-hour'].map(function (s) {
+    return P.prompt.indexOf(s) !== -1;
+  }), [true, true, true, true, true]);
+t.check('only this lead\'s proof line is offered -- Vertex is not, for Poland',
+  [P.prompt.indexOf('Vertex'), P.prompt.indexOf('two CROs')], [-1, -1]);
+t.check('the model is asked to report the codes each message used',
+  P.prompt.indexOf('email_claims') !== -1 && P.prompt.indexOf('linkedin_claims') !== -1, true);
+t.check('the request carries the build\'s model, max_tokens and effort',
+  [P.request.model, P.request.max_tokens, P.request.output_config.effort], ['claude-sonnet-5-5', 16000, 'high']);
+t.check('no sampling parameter is sent (a 400 on Sonnet 5.5)',
+  ['temperature', 'top_p', 'top_k'].filter(function (k) { return k in P.request; }), []);
+t.check('the system prompt goes in as-is, uncached (concurrent calls never read a cache; see code_assess.js)',
+  P.request.system, SYSTEM_PROMPT);
+t.check('the user message is the prompt itself', P.request.messages, [{ role: 'user', content: P.prompt }]);
 
 // --- what the subject line is built from -------------------------------------
 
@@ -699,13 +721,13 @@ t.check('and it reaches the prompt, for the subject only', HC.prompt.indexOf('a 
   HC.prompt.indexOf('use it nowhere else') !== -1, true);
 t.check(
   'a headcount the subject does not use never reaches the prompt',
-  assess(withLib({ employee_estimate: 40 }), ctgov(0, [])).prompt.indexOf('40'),
-  -1
+  /\b40\b/.test(assess(withLib({ employee_estimate: 40 }), ctgov(0, [])).prompt),
+  false
 );
 t.check(
-  'a headcount outside Section 12\'s 5-100 band is not "small" -- the problem builds the subject',
+  'a headcount outside Section 12\'s 5-100 band is not "small" -- the pain builds the subject',
   assess(lead({ city: 'Warsaw', founder_name: 'Anna Nowak', employee_estimate: 150 }), ctgov(0, [])).subject_source,
-  'problem'
+  'pain'
 );
 t.check(
   'nor is a headcount under 5',
@@ -713,19 +735,26 @@ t.check(
   null
 );
 t.check(
-  'no headcount at all: the problem builds the subject, with no fact in it',
+  'no headcount at all: the pain builds the subject, with no fact in it',
   assess(lead({ city: 'Warsaw', founder_name: 'Anna Nowak' }), ctgov(0, [])).prompt.indexOf('put no fact') !== -1,
   true
 );
 
+// --- skill v3: the prospect is never the one sponsoring ------------------------
+
+const TRIAL = assess(withLib({ therapeutic_areas: [] }), ctgov(1, ['A Study']));
+t.check('the trial fact never says "sponsor" -- v2\'s "with you as the sponsor" is gone',
+  /sponsor/i.test(TRIAL.fact_sheet), false);
+t.check('it says the trial is registered under their company', TRIAL.fact_sheet.indexOf('registered under your company') !== -1, true);
 t.check(
-  'a hook opening from the trial is told to begin "You\'re sponsoring" -- about them, not the source',
-  assess(withLib({ therapeutic_areas: [] }), ctgov(1, ['A Study'])).prompt.indexOf('begins with the words "You\'re sponsoring"') !== -1,
+  'a hook opening from the trial is told v3\'s words, and never "sponsoring"',
+  TRIAL.prompt.indexOf('"Your recruiting trial ..."') !== -1 && TRIAL.prompt.indexOf('never "sponsoring"') !== -1,
   true
 );
+t.check('the prompt no longer teaches "You\'re sponsoring"', TRIAL.prompt.indexOf("You're sponsoring"), -1);
 t.check(
-  'and a lead with no trial is not',
-  assess(withLib(), ctgov(0, [])).prompt.indexOf('You\'re sponsoring'),
+  'and a lead with no trial gets no trial instruction',
+  assess(withLib(), ctgov(0, [])).prompt.indexOf('Your recruiting trial'),
   -1
 );
 

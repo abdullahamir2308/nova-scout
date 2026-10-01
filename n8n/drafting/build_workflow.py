@@ -14,19 +14,26 @@ anywhere else in the project:
     Section 9  grounding fact vocabulary-> "(therapeutic area, named trial, ...)"
     Section 9  therapeutic-area enum    -> what counts as a therapeutic-area fact
     Section 9  banned adjectives        -> "revolutionary" / "cutting-edge"
-    Section 9  word ceiling             -> "under 80 words"
+    Section 9  link-free warm-up        -> "Links: none in warm-up weeks 1-2"
     Section 5  opt-out sentence         -> VERBATIM, it is the GDPR/KVKK basis
-    Section 3  drafting inference params-> temperature / presence_penalty
+    Section 5  body length              -> must agree with the skill
+    Section 3  drafting model and effort-> the Anthropic request
     Section 8  drafts table columns     -> what the INSERT is allowed to touch
     Section 12 company size band        -> what a "small" headcount is
 
-Drafting skill v2 (NovaScout_DraftingSkill.md) is parsed the same way:
+Drafting skill v3 (NovaScout_DraftingSkill.md) is parsed the same way:
 
-    section 2  "Only the hook and subject are freely generated" -> the model's
-               output schema; nothing else can be composed
-    section 2  body word budget         -> must agree with the Master Ref
-    section 3  subject 30-50 characters, no Re:/Fwd:, banned subject words
-    section 3  "Warm-up weeks 1-2: zero links"
+    section 1  "the model composes the whole email" -> the output schema has a
+               body, an ask and a subject, and the claims it used
+    section 3  body 70-110 words, never more than 125
+    section 3  subject 30-55 characters, no Re:/Fwd:
+    section 3  product name and "AI" at most once each
+    section 3  banned adjectives
+    section 4  the fixed opt-out -> must be Section 5's, verbatim
+    section 5  the worked example -> embedded in the system prompt as written
+    section 6  the drafting model -> must be Section 3's
+
+Migration 012's slot CHECK must be the slots Assess Grounding resolves.
 
 When one fires, the fix is to update the JS to match the doc -- never the other
 way round.
@@ -57,6 +64,14 @@ CLAIMS_MIGRATION = os.environ.get(
     os.path.join(HERE, "..", "..", "postgres", "migrations", "010_claims_library.sql"),
 )
 
+# Migration 012 gives the library its v3 slots. They must be the slots Assess
+# Grounding resolves, or a slot the table allows would never reach the model
+# (or one the model is promised would be impossible to fill).
+CLAIMS_V3_MIGRATION = os.environ.get(
+    "NOVASCOUT_CLAIMS_V3_MIGRATION",
+    os.path.join(HERE, "..", "..", "postgres", "migrations", "012_claims_library_v3.sql"),
+)
+
 
 def js(name):
     with io.open(os.path.join(HERE, name), encoding="utf-8") as fh:
@@ -74,6 +89,10 @@ def _skill():
 
 
 PG_CRED = {"postgres": {"id": "novascoutPg01", "name": "Postgres - novascout"}}
+
+# Created by provision_anthropic_credential.py from ANTHROPIC_API_KEY in .env.
+# The key lives encrypted in n8n, never in this JSON.
+ANTHROPIC_CRED = {"anthropicApi": {"id": "novascoutAnthropic01", "name": "Anthropic - Nova Scout drafting"}}
 
 
 # ---------------------------------------------------------------------------
@@ -154,12 +173,6 @@ if not SENDER_NAME:
         "by the wrong person. Add it to .env and rebuild." % os.path.abspath(ENV_FILE)
     )
 
-# There is no demo-URL setting any more. v1 let the model write one URL, the
-# recording's. Skill v2 moves the recording, the PDF and the LinkedIn profile to
-# the reply payload (skill section 8), and the one URL a first touch may carry
-# after warm-up is a line in the claims library (slot `link`), not a build
-# constant.
-
 SIGNATURE = "\n".join([p for p in [SENDER_NAME, SENDER_TITLE, SENDER_PHONE] if p])
 
 
@@ -168,6 +181,15 @@ SIGNATURE = "\n".join([p for p in [SENDER_NAME, SENDER_TITLE, SENDER_PHONE] if p
 # ---------------------------------------------------------------------------
 
 NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+
+
+def _number(word, where):
+    w = word.lower()
+    if w in NUMBER_WORDS:
+        return NUMBER_WORDS[w]
+    if w.isdigit():
+        return int(w)
+    raise AssertionError("%r in %s is not a number" % (word, where))
 
 
 def load_min_facts(doc=None):
@@ -179,12 +201,7 @@ def load_min_facts(doc=None):
             "grounding threshold not found in %s -- expected 'lacks at least N "
             "specific facts'" % MASTER_REF
         )
-    word = m.group(1).lower()
-    if word in NUMBER_WORDS:
-        return NUMBER_WORDS[word]
-    if word.isdigit():
-        return int(word)
-    raise AssertionError("grounding threshold %r in %s is not a number" % (word, MASTER_REF))
+    return _number(m.group(1), MASTER_REF)
 
 
 def load_fact_kinds(doc=None):
@@ -209,18 +226,20 @@ def load_fact_kinds(doc=None):
     return kinds
 
 
-def load_max_words(doc=None):
-    """Parse the word ceiling. Stated twice (Section 5 and Section 9) -- both
-    must agree, or the spec itself is ambiguous and the build should stop."""
-    doc = doc if doc is not None else _doc()
-    found = set(int(n) for n in re.findall(r"[Uu]nder (\d+) words", doc))
+# "70-110 words and never more than 125" (skill) / "70-110 words, never more
+# than 125" (Master Ref). One pattern for both phrasings.
+_LENGTH_RE = r"(\d+)[–-](\d+) words,? (?:and )?never more than (\d+)"
+
+
+def load_length_rule(text, where):
+    """Every statement of the body-length rule in `text`. They must all agree."""
+    found = set(tuple(int(n) for n in m) for m in re.findall(_LENGTH_RE, text))
     if not found:
-        raise AssertionError("word ceiling not found in %s -- expected 'under N words'" % MASTER_REF)
+        raise AssertionError("body length rule not found in %s -- expected 'N-M words ... never more "
+                             "than C'" % where)
     if len(found) > 1:
-        raise AssertionError(
-            "%s states more than one word ceiling: %r -- resolve the doc first"
-            % (MASTER_REF, sorted(found))
-        )
+        raise AssertionError("%s states more than one body length rule: %r -- resolve the doc first"
+                             % (where, sorted(found)))
     return found.pop()
 
 
@@ -242,6 +261,15 @@ def load_opt_out(doc=None):
     return m.group(1)
 
 
+def load_skill_opt_out(skill=None):
+    """Skill section 4, Fixed: '- Opt-out: "..."'. Must be Section 5's, verbatim."""
+    skill = skill if skill is not None else _skill()
+    m = re.search(r'^- Opt-out: "(.+)"\s*$', skill, re.M)
+    if not m:
+        raise AssertionError("the fixed opt-out not found in %s -- expected '- Opt-out: \"...\"'" % SKILL)
+    return m.group(1)
+
+
 def load_banned_adjectives(doc=None):
     """Parse the adjectives Section 9 names explicitly."""
     doc = doc if doc is not None else _doc()
@@ -252,6 +280,16 @@ def load_banned_adjectives(doc=None):
             '"x" or "y", no merge-tag\'' % MASTER_REF
         )
     return [a.lower() for a in re.findall(r'"([^"]+)"', m.group(1))]
+
+
+def load_skill_banned_adjectives(skill=None):
+    """Skill section 3, Everywhere: "No banned adjectives (a, b, c)." """
+    skill = skill if skill is not None else _skill()
+    m = re.search(r"No banned adjectives \(([^)]+)\)", skill)
+    if not m:
+        raise AssertionError("banned adjectives not found in %s -- expected 'No banned adjectives "
+                             "(a, b, ...)'" % SKILL)
+    return [a.strip().lower() for a in m.group(1).split(",") if a.strip()]
 
 
 def load_therapeutic_areas(doc=None):
@@ -277,24 +315,27 @@ def load_therapeutic_areas(doc=None):
     return areas
 
 
-def load_drafting_inference(doc=None):
-    """Parse Section 3's drafting temperature / presence_penalty.
-
-    Section 3 marks these UNVERIFIED and says to test them rather than assume
-    the extraction settings transfer. Parsing them means the workflow always
-    ships whatever the doc currently says -- so when they are tested and
-    changed, the change lands here by rebuilding, not by remembering.
-    """
+def load_drafting_model(doc=None):
+    """Section 3: "**Drafting model: `<id>`**, effort `<level>` ...". The skill
+    names the model too (section 6); the two must agree, and the request ships
+    exactly this id."""
     doc = doc if doc is not None else _doc()
-    m = re.search(
-        r"For drafting, `temperature: ([\d.]+)`, `presence_penalty: ([\d.]+)`", doc
-    )
+    m = re.search(r"\*\*Drafting model: `([a-z0-9-]+)`\*\*, effort `(low|medium|high|xhigh|max)`", doc)
     if not m:
         raise AssertionError(
-            "drafting inference settings not found in %s -- expected 'For drafting, "
-            "`temperature: X`, `presence_penalty: Y`'" % MASTER_REF
+            "drafting model not found in Section 3 of %s -- expected '**Drafting model: `id`**, "
+            "effort `level`'" % MASTER_REF
         )
-    return float(m.group(1)), float(m.group(2))
+    return m.group(1), m.group(2)
+
+
+def load_skill_model(skill=None):
+    skill = skill if skill is not None else _skill()
+    m = re.search(r"^- Drafting node: `([a-z0-9-]+)` via the Anthropic API", skill, re.M)
+    if not m:
+        raise AssertionError("drafting model not found in section 6 of %s -- expected '- Drafting node: "
+                             "`id` via the Anthropic API'" % SKILL)
+    return m.group(1)
 
 
 def load_drafts_columns(doc=None):
@@ -315,7 +356,7 @@ def load_drafts_columns(doc=None):
 
 def load_small_team(doc=None):
     """Section 12's company-size band -- what makes a confirmed headcount
-    'small' enough for the skill's headcount subject line."""
+    'small' enough for a headcount subject line."""
     doc = doc if doc is not None else _doc()
     m = re.search(r"\*\*Company:\*\*\s*(\d+)[-–](\d+) employees", doc)
     if not m:
@@ -335,74 +376,72 @@ def load_geographies(doc=None):
     return [g.strip() for g in m.group(1).split(",") if g.strip()]
 
 
-def load_generated_parts(skill=None):
-    """Skill section 2: "Only the hook and subject are freely generated".
-
-    This sentence is the whole v2 design -- everything else is selected from the
-    library -- so it decides the model's output schema. If the skill ever lets
-    the model write another part, the schema here is wrong until someone decides
-    how, and the build stops rather than quietly keep the old split.
-    """
-    skill = skill if skill is not None else _skill()
-    m = re.search(r"\*\*Only the ([a-z ,]+?) (?:is|are) freely generated\*\*", skill)
+def load_link_free_weeks(doc=None):
+    """Section 9, Workflow 4: "**Links:** none in warm-up weeks 1-N". The
+    existing link policy, kept by v3; the v3 skill itself only says the ask
+    carries no link."""
+    doc = doc if doc is not None else _doc()
+    m = re.search(r"\*\*Links:\*\* none in warm-up weeks 1[–-](\d+)", doc)
     if not m:
-        raise AssertionError(
-            "the generated-parts rule not found in %s -- expected '**Only the hook and "
-            "subject are freely generated**'" % SKILL
-        )
-    return sorted(p.strip() for p in re.split(r",| and ", m.group(1)) if p.strip())
-
-
-def load_skill_word_budget(skill=None):
-    """Skill section 2: "Body (1-5) stays under N words". It says it is the
-    Master Ref's number; the build checks that it is."""
-    skill = skill if skill is not None else _skill()
-    m = re.search(r"Body \(1[–-]5\) stays \*\*under (\d+) words\*\*", skill)
-    if not m:
-        raise AssertionError("body word budget not found in %s -- expected 'Body (1-5) stays "
-                             "**under N words**'" % SKILL)
+        raise AssertionError("link-free warm-up weeks not found in %s -- expected '**Links:** none in "
+                             "warm-up weeks 1-N'" % MASTER_REF)
     return int(m.group(1))
 
 
-def _skill_subject_block(skill):
-    m = re.search(r"\n\*\*Subject\*\*\n(.*?)\n\n", skill, re.S)
-    if not m:
-        raise AssertionError("the **Subject** rules block not found in section 3 of %s" % SKILL)
-    return m.group(1)
+def load_composes(skill=None):
+    """Skill section 1: v3's "model composes the whole email". This sentence is
+    the whole v3 design, so it decides the model's output schema: a body and an
+    ask, not a hook to paste library lines after. If the skill ever goes back
+    to line-picking, the schema is wrong until someone decides how, and the
+    build stops rather than quietly keep composing."""
+    skill = skill if skill is not None else _skill()
+    if not re.search(r"model composes the whole email from the hook fact plus approved claims", skill):
+        raise AssertionError(
+            "the composition rule not found in %s -- expected 'model composes the whole email from the "
+            "hook fact plus approved claims' (skill v3, section 1)" % SKILL
+        )
+    return True
 
 
 def load_subject_rules(skill=None):
-    """Skill section 3, Subject: the character range, the fake-reply prefixes
-    and the banned words, all parsed rather than retyped."""
+    """Skill section 3, Subject: the character range and the fake-reply
+    prefixes, parsed rather than retyped."""
     skill = skill if skill is not None else _skill()
-    block = _skill_subject_block(skill)
-    chars = re.search(r"^- (\d+)[–-](\d+) characters\.", block, re.M)
-    if not chars:
-        raise AssertionError("subject length not found in %s -- expected '- N-M characters.'" % SKILL)
-    prefixes = re.search(r'No "(\w+):" or "(\w+):"', block)
-    if not prefixes:
-        raise AssertionError('subject reply prefixes not found in %s -- expected \'No "Re:" or '
-                             '"Fwd:"\'' % SKILL)
-    banned = re.search(r'No ((?:"\w+[,.]?"[ ]*){2,})', block)
-    if not banned:
-        raise AssertionError('banned subject words not found in %s -- expected \'No "free," '
-                             '"demo," ...\'' % SKILL)
-    return {
-        "min": int(chars.group(1)),
-        "max": int(chars.group(2)),
-        "prefixes": [p.lower() for p in prefixes.groups()],
-        "banned": [w.lower() for w in re.findall(r'"(\w+)[,.]?"', banned.group(1))],
-    }
-
-
-def load_link_free_weeks(skill=None):
-    """Skill section 3, Links: "Warm-up weeks 1-N: zero links." """
-    skill = skill if skill is not None else _skill()
-    m = re.search(r"Warm-up weeks 1[–-](\d+): zero links", skill)
+    m = re.search(r"\*\*Subject\.\*\* (\d+)[–-](\d+) characters\.([^\n]*)", skill)
     if not m:
-        raise AssertionError("link-free warm-up weeks not found in %s -- expected 'Warm-up "
-                             "weeks 1-N: zero links'" % SKILL)
-    return int(m.group(1))
+        raise AssertionError("subject rules not found in %s -- expected '**Subject.** N-M characters.'" % SKILL)
+    rest = m.group(3)
+    prefixes = re.findall(r'no "(\w+):"', rest, re.I)
+    if len(prefixes) < 2:
+        raise AssertionError('subject reply prefixes not found in %s -- expected \'No "Re:", no "Fwd:"\'' % SKILL)
+    if "Never the product name" not in rest or 'Never "AI"' not in rest:
+        raise AssertionError('subject rules in %s no longer say \'Never the product name. Never "AI".\'' % SKILL)
+    return {"min": int(m.group(1)), "max": int(m.group(2)), "prefixes": [p.lower() for p in prefixes]}
+
+
+def load_at_most_once(skill=None):
+    """Skill section 3, Naming the product: the name and "AI" at most N times."""
+    skill = skill if skill is not None else _skill()
+    name = re.search(r"The name appears at most (\w+), in brackets", skill)
+    ai = re.search(r'The word "AI" appears at most (\w+)', skill)
+    if not name or not ai:
+        raise AssertionError("the product-name / \"AI\" limits not found in %s" % SKILL)
+    once = {"once": 1, "twice": 2}
+    return once.get(name.group(1), None), once.get(ai.group(1), None)
+
+
+def load_worked_example(skill=None):
+    """Skill section 5's v3 example: the subject and the body, exactly as the
+    skill writes them. It is the one example the model is shown, so it is
+    parsed rather than retyped -- an edit to the skill's example reaches the
+    prompt by rebuilding."""
+    skill = skill if skill is not None else _skill()
+    m = re.search(r"\*\*v3 \(same facts, nothing invented\):\*\*\s*\n\s*\nSubject: `([^`]+)`\s*\n\s*\n((?:>.*\n?)+)",
+                  skill)
+    if not m:
+        raise AssertionError("the v3 worked example not found in section 5 of %s" % SKILL)
+    paras = [p.strip() for p in re.sub(r"^> ?", "", m.group(2), flags=re.M).split("\n\n")]
+    return m.group(1), "\n\n".join(p for p in paras if p)
 
 
 def load_claims_countries():
@@ -415,26 +454,68 @@ def load_claims_countries():
     return re.findall(r"'([^']+)'", m.group(1))
 
 
+def load_claims_slots():
+    """The slots migration 012's claims_slot_v3 CHECK allows."""
+    with io.open(CLAIMS_V3_MIGRATION, encoding="utf-8") as fh:
+        sql = fh.read()
+    m = re.search(r"claims_slot_v3\s+CHECK \(slot IN \(([^)]*)\)\)", sql)
+    if not m:
+        raise AssertionError("claims_slot_v3 not found in %s" % CLAIMS_V3_MIGRATION)
+    return re.findall(r"'([^']+)'", m.group(1))
+
+
 DOC = _doc()
 SKILL_DOC = _skill()
 MIN_FACTS = load_min_facts(DOC)
 FACT_KINDS = load_fact_kinds(DOC)
-MAX_WORDS = load_max_words(DOC)
+LENGTH = load_length_rule(SKILL_DOC, SKILL)
 OPT_OUT = load_opt_out(DOC)
 BANNED_NAMED = load_banned_adjectives(DOC)
+SKILL_BANNED = load_skill_banned_adjectives(SKILL_DOC)
 THERAPEUTIC_AREAS = load_therapeutic_areas(DOC)
-DRAFT_TEMPERATURE, DRAFT_PRESENCE_PENALTY = load_drafting_inference(DOC)
+DRAFT_MODEL, DRAFT_EFFORT = load_drafting_model(DOC)
 DRAFTS_COLUMNS = load_drafts_columns(DOC)
 SMALL_TEAM = load_small_team(DOC)
 GEOGRAPHIES = load_geographies(DOC)
-GENERATED_PARTS = load_generated_parts(SKILL_DOC)
+LINK_FREE_WEEKS = load_link_free_weeks(DOC)
+COMPOSES = load_composes(SKILL_DOC)
 SUBJECT_RULES = load_subject_rules(SKILL_DOC)
-LINK_FREE_WEEKS = load_link_free_weeks(SKILL_DOC)
+NAME_MAX, AI_MAX = load_at_most_once(SKILL_DOC)
+EXAMPLE_SUBJECT, EXAMPLE_BODY = load_worked_example(SKILL_DOC)
 
-_skill_budget = load_skill_word_budget(SKILL_DOC)
-assert _skill_budget == MAX_WORDS, (
-    "the drafting skill and the Master Ref disagree on the word ceiling:\n"
-    "  %s: body under %d words\n  %s: under %d words" % (SKILL, _skill_budget, MASTER_REF, MAX_WORDS)
+# Claims the Nova Agent Kit source does not support (checked 2026-10-02; see the
+# `note` on each claims_library row) are narrowed in the table. The skill's
+# worked example predates that check and still uses the wider wording, and the
+# model copies its one example closely -- so the same narrowing is applied to
+# the example before it reaches the prompt. Each pair must still match: when
+# the skill's example is edited, this list is refused until it is revisited.
+EXAMPLE_NARROWINGS = [
+    # BEN-BRIEF: the RFP intake records therapeutic area and study phase, not a brief.
+    ("collects their study brief", "collects their therapeutic area and study phase"),
+]
+for _wide, _narrow in EXAMPLE_NARROWINGS:
+    assert _wide in EXAMPLE_BODY, (
+        "the skill's worked example no longer says %r -- revisit EXAMPLE_NARROWINGS in build_workflow.py" % _wide
+    )
+    EXAMPLE_BODY = EXAMPLE_BODY.replace(_wide, _narrow)
+
+_doc_length = load_length_rule(DOC, MASTER_REF)
+assert _doc_length == LENGTH, (
+    "the drafting skill and the Master Ref disagree on the body length:\n"
+    "  %s: %d-%d words, never more than %d\n  %s: %d-%d words, never more than %d"
+    % ((SKILL,) + LENGTH + (MASTER_REF,) + _doc_length)
+)
+
+_skill_opt_out = load_skill_opt_out(SKILL_DOC)
+assert _skill_opt_out == OPT_OUT, (
+    "the drafting skill's fixed opt-out is not Section 5's, verbatim:\n  skill: %r\n  doc:   %r"
+    % (_skill_opt_out, OPT_OUT)
+)
+
+_skill_model = load_skill_model(SKILL_DOC)
+assert _skill_model == DRAFT_MODEL, (
+    "the drafting skill and the Master Ref name different drafting models:\n  skill: %s\n  doc:   %s"
+    % (_skill_model, DRAFT_MODEL)
 )
 
 _claims_countries = load_claims_countries()
@@ -469,12 +550,6 @@ def _assert_assess_matches_spec():
         "  doc: at least %d specific facts\n  js:  MIN_FACTS = %d" % (MIN_FACTS, found)
     )
 
-    found_words = _js_int(src, "MAX_WORDS", "code_assess.js")
-    assert found_words == MAX_WORDS, (
-        "word ceiling drifted between the Master Ref and code_assess.js:\n"
-        "  doc: under %d words\n  js:  MAX_WORDS = %d" % (MAX_WORDS, found_words)
-    )
-
     found_areas = _js_string_array(src, "THERAPEUTIC_AREAS", "code_assess.js")
     assert found_areas == THERAPEUTIC_AREAS, (
         "therapeutic-area taxonomy drifted between the Master Ref and code_assess.js:\n"
@@ -507,6 +582,15 @@ def _assert_assess_matches_spec():
         "  doc: %d-%d employees\n  js:  SMALL_TEAM = %r" % (SMALL_TEAM + (found_band,))
     )
 
+    # Migration 012's slots are the table; LIBRARY_SLOTS (+ the optional link)
+    # are what Assess Grounding resolves and offers the model.
+    slots = _js_string_array(src, "LIBRARY_SLOTS", "code_assess.js")
+    table = load_claims_slots()
+    assert sorted(slots + ["link"]) == sorted(table), (
+        "the claims-library slots drifted between migration 012 and code_assess.js:\n"
+        "  sql: %r\n  js:  LIBRARY_SLOTS = %r (+ link)" % (table, slots)
+    )
+
 
 def _assert_assemble_matches_spec():
     src = js("code_assemble.js")
@@ -518,16 +602,18 @@ def _assert_assemble_matches_spec():
         "mechanism and must match VERBATIM:\n  doc: %r\n  js:  %r" % (OPT_OUT, m.group(1))
     )
 
-    found_words = _js_int(src, "MAX_WORDS", "code_assemble.js")
-    assert found_words == MAX_WORDS, (
-        "word ceiling drifted between the Master Ref and code_assemble.js:\n"
-        "  doc: under %d words\n  js:  MAX_WORDS = %d" % (MAX_WORDS, found_words)
+    found = (_js_int(src, "BODY_TARGET_MIN", "code_assemble.js"),
+             _js_int(src, "BODY_TARGET_MAX", "code_assemble.js"),
+             _js_int(src, "BODY_CEILING", "code_assemble.js"))
+    assert found == LENGTH, (
+        "the body length drifted between the drafting skill and code_assemble.js:\n"
+        "  skill: %d-%d words, never more than %d\n  js:    %r" % (LENGTH + (found,))
     )
 
     banned = [a.lower() for a in _js_string_array(src, "BANNED_ADJECTIVES", "code_assemble.js")]
-    missing = [a for a in BANNED_NAMED if a not in banned]
+    missing = [a for a in BANNED_NAMED + SKILL_BANNED if a not in banned]
     assert not missing, (
-        "Section 9 names adjectives that code_assemble.js does not ban: %r\n"
+        "the Master Ref or the drafting skill names adjectives that code_assemble.js does not ban: %r\n"
         "  js bans: %r" % (missing, banned)
     )
 
@@ -545,12 +631,10 @@ def _assert_assemble_matches_spec():
         "  doc: maximum %d\n  js:  MAX_URLS = %d" % (doc_urls, found_urls)
     )
 
-    # Skill section 3. Each is parsed from the skill and compared, so a change
-    # to the skill reaches the checks by rebuilding, never by remembering.
     found = _js_int(src, "LINK_FREE_WEEKS", "code_assemble.js")
     assert found == LINK_FREE_WEEKS, (
-        "the link-free warm-up drifted between the drafting skill and code_assemble.js:\n"
-        "  skill: weeks 1-%d zero links\n  js:    LINK_FREE_WEEKS = %d" % (LINK_FREE_WEEKS, found)
+        "the link-free warm-up drifted between the Master Ref and code_assemble.js:\n"
+        "  doc: weeks 1-%d no links\n  js:  LINK_FREE_WEEKS = %d" % (LINK_FREE_WEEKS, found)
     )
     found = (_js_int(src, "SUBJECT_MIN_CHARS", "code_assemble.js"),
              _js_int(src, "SUBJECT_MAX_CHARS", "code_assemble.js"))
@@ -563,11 +647,10 @@ def _assert_assemble_matches_spec():
         "the fake-reply subject prefixes drifted between the drafting skill and code_assemble.js:\n"
         "  skill: %r\n  js:    %r" % (SUBJECT_RULES["prefixes"], found)
     )
-    found = _js_string_array(src, "SUBJECT_BANNED_WORDS", "code_assemble.js")
-    missing = [w for w in SUBJECT_RULES["banned"] if w not in found]
-    assert not missing, (
-        "the drafting skill bans subject words that code_assemble.js does not: %r\n"
-        "  js bans: %r" % (missing, found)
+    found = (_js_int(src, "PRODUCT_NAME_MAX", "code_assemble.js"), _js_int(src, "AI_MAX", "code_assemble.js"))
+    assert found == (NAME_MAX, AI_MAX), (
+        "the product-name / \"AI\" limits drifted between the drafting skill and code_assemble.js:\n"
+        "  skill: name at most %r, AI at most %r\n  js:    PRODUCT_NAME_MAX, AI_MAX = %r" % (NAME_MAX, AI_MAX, found)
     )
 
 
@@ -576,72 +659,64 @@ _assert_assemble_matches_spec()
 
 
 # ---------------------------------------------------------------------------
-# Ollama drafting call
+# The Claude drafting call
+#
+# Skill v3: the model composes the whole email. Its JSON schema is the email's
+# parts -- subject, body, the one ask -- for both channels, plus the claim codes
+# it used, so Assemble Drafts can check each against what this lead was offered
+# and record them for the learning loop. The ask is a field of its own so
+# "exactly one ask" is checkable: one question there, no request in the body.
+#
+# Request parameters, from the live docs on 2026-10-02 (Sonnet 5.5 overview and
+# migration guide), not carried from older settings: no temperature/top_p/top_k
+# (a non-default value is a 400 on this model); thinking omitted, which runs
+# adaptive thinking; effort set explicitly (default `high`, and the guide says
+# to start at `high` for work that is neither agentic nor latency-sensitive);
+# structured output through output_config.format; max_tokens covers thinking
+# plus text, so it is generous. Section 3 holds the model and effort.
 # ---------------------------------------------------------------------------
 
-# Skill v2: the model writes a subject and two hooks. Nothing else. The problem,
-# outcome, proof and ask are library lines Assemble Drafts inserts -- the model
-# has no field to write them into, so it cannot compose them.
 DRAFT_SCHEMA = {
     "type": "object",
     "properties": {
         "email_subject": {"type": "string"},
-        "email_hook": {"type": "string"},
-        "linkedin_hook": {"type": "string"},
+        "email_body": {"type": "string"},
+        "email_ask": {"type": "string"},
+        "linkedin_body": {"type": "string"},
+        "linkedin_ask": {"type": "string"},
+        "email_claims": {"type": "array", "items": {"type": "string"}},
+        "linkedin_claims": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["email_subject", "email_hook", "linkedin_hook"],
+    "required": ["email_subject", "email_body", "email_ask", "linkedin_body", "linkedin_ask",
+                 "email_claims", "linkedin_claims"],
+    "additionalProperties": False,
 }
 
-# Every schema field must be one of the parts the skill says are generated, and
-# every generated part must have a field. A `body`, `problem` or `ask` field
-# here would be the model composing what the library owns.
-_schema_parts = sorted(set(k.split("_", 1)[1] for k in DRAFT_SCHEMA["properties"]))
-assert _schema_parts == GENERATED_PARTS, (
-    "the model's output schema does not match the drafting skill:\n"
-    "  skill: only the %s are freely generated\n  schema fields: %r\n"
-    "Everything else is selected from the claims library, never composed."
-    % (" and ".join(GENERATED_PARTS), sorted(DRAFT_SCHEMA["properties"]))
+# Composition needs a body; "exactly one ask" needs the ask apart from it.
+assert COMPOSES and {"email_body", "email_ask"} <= set(DRAFT_SCHEMA["properties"]), (
+    "the model's output schema does not match the drafting skill: skill v3 has the model compose "
+    "the whole email, so the schema needs email_body and email_ask"
+)
+# What Assemble Drafts requires must be exactly what the schema promises.
+_assemble_fields = (_js_string_array(js("code_assemble.js"), "FIELDS", "code_assemble.js")
+                    + _js_string_array(js("code_assemble.js"), "CLAIM_LISTS", "code_assemble.js"))
+assert sorted(_assemble_fields) == sorted(DRAFT_SCHEMA["required"]), (
+    "Assemble Drafts' FIELDS do not match the model's output schema:\n  schema: %r\n  js:     %r"
+    % (DRAFT_SCHEMA["required"], _assemble_fields)
 )
 
-# Pretty-printed on purpose: a compact json.dumps emits runs like `"string"}}`,
-# and that `}}` closes the surrounding n8n {{ }} expression early -- the node
-# then fails with a bare "invalid syntax". Indenting puts every closing brace on
-# its own line so `}}` never occurs. Same trap as Workflow 3.
-_schema_js = json.dumps(DRAFT_SCHEMA, indent=2).replace("\n", "\n  ")
+CLAUDE_REQUEST = {
+    "model": DRAFT_MODEL,
+    "max_tokens": 16000,
+    "output_config": {
+        "effort": DRAFT_EFFORT,
+        "format": {"type": "json_schema", "schema": DRAFT_SCHEMA},
+    },
+}
 
-OLLAMA_BODY = (
-    "={{ JSON.stringify({\n"
-    "  model: 'qwen3.5:9b',\n"
-    "  system: $json.system_prompt,\n"
-    "  prompt: $json.prompt,\n"
-    "  stream: false,\n"
-    "  think: false,\n"
-    "  format: " + _schema_js + ",\n"
-    "  options: { temperature: " + repr(DRAFT_TEMPERATURE) +
-    ", presence_penalty: " + repr(DRAFT_PRESENCE_PENALTY) +
-    ", num_ctx: 16384, num_predict: 500 }\n"
-    "}) }}"
-)
-
-assert OLLAMA_BODY.count("}}") == 1 and OLLAMA_BODY.endswith("}}"), \
-    "schema JSON reintroduced a `}}` that would truncate the n8n expression"
-assert "{{" not in OLLAMA_BODY[2:], "unexpected `{{` inside the expression body"
-
-# Every `$json.X` the Ollama body reads must be a field the immediately upstream
-# Code node actually emits.
-#
-# This guard exists because of a real, silent failure. The system prompt was
-# originally assigned on the Config node, and `$json.system_prompt` resolved to
-# nothing by the time it reached Ollama -- a Postgres node replaces the items,
-# so Config's assignments do not survive it. n8n does not error on a missing
-# expression field; it sends an empty string. The model got no instructions,
-# summarised the fact sheet back, and the execution reported success with four
-# drafts in the database that mentioned neither the product nor the case study.
-#
-# A missing field here is unobservable at runtime, so it has to be caught at
-# build time.
-_ollama_reads = set(re.findall(r"\$json\.(\w+)", OLLAMA_BODY))
-assert _ollama_reads, "the Ollama body reads no $json fields -- did the expression change shape?"
+# The fields the HTTP node's body reads from the item.
+CLAUDE_BODY = "={{ JSON.stringify($json.request) }}"
+_claude_reads = set(re.findall(r"\$json\.(\w+)", CLAUDE_BODY))
 
 
 def _assert_emitted_upstream(js_src, fields, node_name):
@@ -652,123 +727,117 @@ def _assert_emitted_upstream(js_src, fields, node_name):
     missing = [f for f in sorted(fields)
                if not re.search(r"^[ \t]*%s:" % re.escape(f), js_src, re.M)]
     assert not missing, (
-        "the Ollama node reads $json.%s, but %s does not emit %r. A field the "
+        "the Claude node reads $json.%s, but %s does not emit %r. A field the "
         "upstream node does not set resolves to an empty string at runtime with "
         "no error." % ("/$json.".join(sorted(fields)), node_name, missing)
     )
 
 
 # ---------------------------------------------------------------------------
-# System prompt -- drafting skill v2
+# System prompt -- drafting skill v3
 #
-# The model writes three short things: a subject and two hooks. It is not told
-# what Nova is, who the customers are, or what the offer is, because it writes
-# none of the sentences that say so -- those are claims-library lines inserted
-# after the call. A model cannot misstate a claim it was never given.
+# The model now writes the whole message, so it is told what Section 3 of the
+# skill says, in the skill's own numbers (parsed above). What we sell is NOT in
+# here: every product sentence must come from the per-lead APPROVED CLAIMS list
+# Assess Grounding builds from the live claims_library, so an operator's edit to
+# the table reaches the next draft with no rebuild. The grounding rules that
+# fixed v1's joining failures are kept, because they are about the prospect
+# facts, which have not changed.
 #
-# The subject gets worked examples rather than only rules: it is generated, not
-# selected, and a 9B model follows an example more reliably than a rule list.
-# The examples carry other companies' facts (INM004, 40, oncology); Assemble
-# Drafts tags any of them that lands on the wrong lead.
+# The one worked example is the skill's own section 5 email, parsed. It carries
+# another lead's facts (oncology and immunology); Assemble Drafts tags a draft
+# that names an area its lead does not have.
 # ---------------------------------------------------------------------------
 
-_subject_banned = ", ".join(SUBJECT_RULES["banned"][:-1]) + " or " + SUBJECT_RULES["banned"][-1]
-_subject_prefixes = " or ".join('"%s:"' % p.capitalize() for p in SUBJECT_RULES["prefixes"])
+_adjectives = ", ".join(SKILL_BANNED)
 
 SYSTEM_PROMPT = "\n".join([
-    "You write three short pieces of one cold email to a contract research",
-    "organisation (CRO), sent by " + SENDER_NAME + ": the subject line, the email's first",
-    "sentence (the hook), and the first sentence of a LinkedIn DM (also a hook).",
-    "Nothing else. Everything after the hook -- a question about lost sponsor leads,",
-    "what we built, where it runs, and the one request -- is written by a person and",
-    "added afterwards, word for word. Do not write any of it.",
+    "You write one cold first-touch email and one LinkedIn DM to a small contract",
+    "research organisation (CRO), sent by " + SENDER_NAME + ". A person reviews both before",
+    "anything is sent.",
     "",
-    "THE ONE RULE THAT MATTERS MOST: one sentence, one fact.",
+    "Each message gives you two lists. VERIFIED FACTS are the only facts about the",
+    "prospect that exist. APPROVED CLAIMS are the only things you may say about what we",
+    "built, the problem it solves, and who uses it. You may rephrase a claim. You may",
+    "never widen what it means.",
     "",
-    "Each hook is ONE sentence built from ONE numbered fact -- the fact you are told",
-    "to open that message with -- and nothing else. Never build a sentence out of",
-    "two facts. If fact 2 gives you a trial and fact 3 gives you a city, \"your trial",
-    "in that city\" is a claim neither fact makes and you must not write it. The same",
-    "goes for a person and a trial, an area and a trial, a person and a city. Each",
-    "numbered fact ends with a sentence telling you what it does not establish. Obey",
-    "it literally.",
-    "",
-    "Everything not in the numbered facts does not exist. No headcount, no client,",
-    "no growth, no plans, no praise of their website, no trial you were not given.",
-    "",
-    "A HOOK IS ABOUT THEM, NOT ABOUT THE SOURCE.",
-    "- Write to them as \"you\": \"You're sponsoring ...\", \"Your site lists ...\".",
-    "  Never begin with \"ClinicalTrials.gov\" or \"According to\" -- the sentence is",
-    "  about them, not about where the fact came from.",
-    "  Never write the company's name -- not once. You will spell it wrong and it",
-    "  will read like a mail merge.",
-    "- Name ONE trial at most. Given two or three titles, pick one: \"You're",
-    "  sponsoring two recruiting trials, including <one title>.\"",
-    "- A list of therapeutic areas is what their website SAYS THEY WORK IN, not a",
-    "  list of trials. \"Your site lists oncology and respiratory work.\" Never \"you",
-    "  run trials in oncology\".",
-    "- State the fact and stop. Never add a consequence, a guess or a judgement",
-    "  (\"so sponsors ...\", \"which means ...\", \"you must be busy\"). The question",
-    "  that follows is added for you.",
-    "- No question mark. No request, no offer, no call, no reply, no demo -- the one",
-    "  request is added for you.",
-    "- Never mention Nova, AI, assistants, chatbots or anything we sell.",
-    "- Never start with a person's name or a city.",
+    "THE PROSPECT -- one sentence, one fact.",
+    "- Open each message from the fact you are told to open it with: exactly one",
+    "  prospect fact, stated, about them (\"Your site lists ...\", \"Your recruiting",
+    "  trial ...\").",
+    "- Never build a sentence out of two facts. If fact 2 gives you a trial and fact 3",
+    "  a city, \"your trial in that city\" is a claim neither fact makes. Each fact ends",
+    "  with a sentence saying what it does not establish. Obey it literally.",
+    "- Everything not in the facts does not exist: no headcount, no clients, no growth,",
+    "  no plans, no praise of their website, no trial you were not given.",
+    "- Never describe them as sponsoring anything. In these emails \"sponsor\" means the",
+    "  biotech, pharma, device or academic company that hires a CRO -- their client.",
+    "  Say \"running\", \"recruiting\" or \"your trial\".",
     "- A trial is on ClinicalTrials.gov, not on their site: never write \"your site",
-    "  lists\" about a trial. Their site is where the therapeutic areas come from.",
-    "- When both hooks open from the same fact, the LinkedIn hook may say it in the",
-    "  same words. Never change what a fact says to make the two hooks differ.",
+    "  lists\" about a trial. Name one trial at most. Their site is where the",
+    "  therapeutic areas come from, and a list of areas is what they work in, not a",
+    "  list of trials.",
+    "- Never open on a person's name or a city. Never write the company's name.",
     "",
-    "Hook examples. Copy the shape; the facts must come from your own numbered list.",
-    "  fact: a recruiting trial they sponsor, \"Efficacy of INM004 in Children With STEC-HUS\"",
-    "  hook: You're sponsoring a recruiting trial — Efficacy of INM004 in Children With STEC-HUS.",
-    "  fact: their site lists Dermatology and Rheumatology",
-    "  hook: Your site lists dermatology and rheumatology work.",
+    "THE EMAIL, in about this order:",
+    "  1. Hook -- the one prospect fact.",
+    "  2. Pain and stakes -- ONE angle from the approved list. Do not stack them.",
+    "  3. What it does -- a description from the list the first time you mention it,",
+    "     then one or two benefits. Not more.",
+    "  4. Proof -- the proof line you were given, matched to their country.",
+    "  5. Ask -- exactly one, answerable with one word. It goes in the ask field; the",
+    "     body before it asks for nothing.",
     "",
-    "THE SUBJECT LINE: one line, sentence case, %d to %d characters."
+    "LENGTH: the body plus the ask is %d-%d words and never more than %d. Shorter is"
+    % LENGTH,
+    "fine if nothing useful is lost. Say one thing well.",
+    "",
+    "SUBJECT: %d-%d characters, sentence case, no capitals except a name the facts"
     % (SUBJECT_RULES["min"], SUBJECT_RULES["max"]),
-    "- Build it from what the message below tells you to. Only facts from the",
-    "  numbered list -- or the headcount, when you are given one -- may appear in it.",
-    "- A trial goes in a subject by its short name: the drug or study code if the",
-    "  title has one (like INM004), otherwise two or three words of the title.",
-    "  Never the whole title -- it will not fit.",
-    "- Never the product name: the word Nova never appears in a subject.",
-    "- Never " + _subject_prefixes + ". No capital-letter shouting. Never the words",
-    "  " + _subject_banned + ".",
+    "spell that way. Build it from the fact the email opens with, or from the pain",
+    "when you are told to. Never the product name. Never \"AI\". No \"Re:\", no \"Fwd:\".",
     "",
-    "Subject worked examples. The left side says what the subject was built from,",
-    "the right side is the subject. Copy the shape. Use a fact from an example only",
-    "if the same fact is in your own numbered list.",
-    "  named trial fact (INM004)            ->  INM004 trial — a quick question",
-    "  small confirmed employee count (40)  ->  A question for a 40-person team",
-    "  oncology focus only                  ->  Your oncology work — one question",
-    "  only geography known                 ->  Pharma-team inquiries after hours",
+    "NAMING THE PRODUCT:",
+    "- Describe it first, using a description line. The name appears at most once, in",
+    "  brackets: \"(we call it Nova)\". Never \"Nova\" anywhere else.",
+    "- Never call it a chatbot or a Q&A bot. It qualifies the inquiry, captures the",
+    "  details, and passes the lead on.",
+    "- The word \"AI\" appears at most once, inside the description. Never \"AI-powered\".",
     "",
-    "FORMAT:",
-    "- Plain text. No links of any kind, no bullets, no brackets, no placeholders,",
-    "  no merge tags.",
-    "- Write NO greeting and NO sign-off. Do not begin with \"Hi\" or \"Hello\" or a",
-    "  name. The greeting and signature are added for you afterwards.",
-    '- Banned words: revolutionary, cutting-edge, innovative, world-class,',
-    '  seamless, game-changing, leverage, unlock, streamline, empower, transform.',
-    '  Banned openings: "I hope this finds you well", "I came across", "I noticed".',
-    "- No flattery, no exclamation marks, no sales voice.",
+    "CLAIMS -- forbidden, all of them:",
+    "- guarantees (\"you'll never lose a sponsor\")",
+    "- any number, percentage or multiplier that is not in the approved claims or the",
+    "  facts",
+    "- claiming to identify anonymous website visitors",
+    "- naming any CRM, tool or integration",
+    "- supported languages",
+    "- any count of clients beyond the two named deployments",
+    "The stakes line is about the industry, not about us: \"a single sponsor inquiry",
+    "can be a multi-million-dollar study\" is allowed; \"we will win you millions\" is not.",
     "",
-    "Return JSON with exactly these keys: email_subject, email_hook, linkedin_hook.",
+    "THE ASK: one question. No links, no scheduling link, no call length, no second",
+    "question.",
+    "",
+    "EVERYWHERE: plain text. No links of any kind, no bullets, no placeholders, no",
+    "merge tags. No greeting and no sign-off -- both are added afterwards. Never these",
+    "words: " + _adjectives + ". No invented urgency, no flattery, no",
+    "exclamation marks.",
+    "",
+    "THE LINKEDIN DM follows the same rules. It has no subject and may be shorter.",
+    "",
+    "One example, for another company. Copy the shape and the restraint, never its",
+    "facts -- your facts are only the ones in your own numbered list.",
+    "  Subject: " + EXAMPLE_SUBJECT,
+] + ["  " + ln if ln else "" for ln in EXAMPLE_BODY.split("\n")] + [
+    "",
+    "Return JSON: email_subject; email_body (everything before the ask, paragraphs",
+    "separated by a blank line); email_ask; linkedin_body; linkedin_ask; email_claims and",
+    "linkedin_claims (the code of every approved claim each message used).",
 ])
 
-# The four worked examples are the user's (2026-09-19) and are asserted present
-# rather than trusted: a later prompt edit that drops one removes the anchoring
-# the subject line was given, with nothing else to show for it.
-#
-# The last one was reworded 2026-09-21 from "Sponsor leads after hours" to say
-# "pharma team", the word the claims library uses for the pharma-side party
-# (Master Ref Section 9, Workflow 4, Terminology). It is the example a lead whose
-# subject source is `problem` is steered to, so it decides a real subject line.
-# It is also 33 characters, inside the 30-50 the prompt teaches; the old one was 25.
-for _example in ("INM004 trial — a quick question", "A question for a 40-person team",
-                 "Your oncology work — one question", "Pharma-team inquiries after hours"):
-    assert _example in SYSTEM_PROMPT, "subject worked example %r missing from the system prompt" % _example
+# The skill's example is shown to the model as written, not paraphrased.
+assert EXAMPLE_SUBJECT in SYSTEM_PROMPT and EXAMPLE_BODY.split("\n\n")[0] in SYSTEM_PROMPT, \
+    "the skill's worked example did not reach the system prompt"
 
 
 # ---------------------------------------------------------------------------
@@ -789,7 +858,7 @@ BATCH_SQL = """-- The queue for this stage: Section 9 Workflow 4's "batch where
 -- column of their own; city is one of Section 9's four grounding facts, so it
 -- is pulled out here rather than in the Code node.
 --
--- library: the ACTIVE rows of the claims library (migration 010), on every row.
+-- library: the ACTIVE rows of the claims library (migrations 010, 012), on every row.
 -- Read here, per run, so an operator's edit reaches the next draft without a
 -- rebuild -- and read in this query rather than a node of its own, because a
 -- Postgres node replaces the items, and a field set upstream of this one would
@@ -798,7 +867,7 @@ BATCH_SQL = """-- The queue for this stage: Section 9 Workflow 4's "batch where
 -- warmup_week: the same derivation as Workflow 6's Load Send State -- week 1
 -- starts on the sender-day (Asia/Karachi) of the mailbox's first external send,
 -- counting the Sent-folder mirror and unconfirmed claims. NULL = none yet, i.e.
--- the first send will be week 1. It decides the skill's link rule.
+-- the first send will be week 1. It decides the link rule (Section 9, Links).
 WITH counted AS (
   SELECT m.sent_at AS at FROM mailbox_sent m WHERE m.external
   UNION ALL
@@ -961,10 +1030,14 @@ assert "__SIGNATURE__" not in _assemble_js, "signature placeholder was not subst
 # sheet back. Nothing errored; the workflow reported success.
 _assess_js = js("code_assess.js").replace(
     "__SYSTEM_PROMPT__", json.dumps(SYSTEM_PROMPT, ensure_ascii=False)
+).replace(
+    "__CLAUDE_REQUEST__", json.dumps(CLAUDE_REQUEST, ensure_ascii=False, indent=2).replace("\n", "\n  ")
 )
 assert "__SYSTEM_PROMPT__" not in _assess_js, "system prompt placeholder was not substituted"
+assert "__CLAUDE_REQUEST__" not in _assess_js, "Claude request placeholder was not substituted"
+assert '"model": "%s"' % DRAFT_MODEL in _assess_js, "the shipped request does not name %s" % DRAFT_MODEL
 
-_assert_emitted_upstream(_assess_js, _ollama_reads, "code_assess.js")
+_assert_emitted_upstream(_assess_js, _claude_reads, "code_assess.js")
 
 # The same class of bug one node earlier: every `lead.X` Assess Grounding reads
 # off the batch row must be a column Get Draft Batch returns. A missing one is
@@ -1011,8 +1084,8 @@ nodes = [
         "position": [-660, 130],
         "notes": (
             "Bounded batch (build rule 5). 10, matching Workflow 2 rather than Workflow 3's 25: "
-            "every surviving lead here costs a GPU call, and Section 3 puts real drafting volume "
-            "at 10-20/day anyway.\n\n"
+            "every surviving lead here costs a paid Claude call (Section 4), and Section 3 puts real "
+            "drafting volume at 10-20/day anyway.\n\n"
             "The system prompt is NOT set here. It was, and it silently never reached the model: "
             "a Postgres node replaces the items, so anything assigned on this node is gone "
             "downstream. The first live run produced four drafts mentioning neither Nova nor "
@@ -1102,9 +1175,9 @@ nodes = [
             "Also decides addressing per channel. Section 9 Workflow 3b, LOCKED: a role inbox is "
             "not a person. hello@klixar.com is not greeted as Enrique Gaubeca even though the "
             "record names him -- he is greeted by name on LinkedIn, where the URL really is his.\n\n"
-            "Drafting skill v2: resolves the claims-library lines for this lead (proof by its "
-            "country), decides what the subject is built from, and holds back a groundable lead "
-            "the library cannot complete (ok=false, stays 'contact_found') -- before any GPU time."
+            "Drafting skill v3: resolves the approved claims for this lead (proof by its country), "
+            "builds the per-lead prompt and the Anthropic request, and holds back a groundable lead "
+            "the library cannot complete (ok=false, stays 'contact_found') -- before any API call."
         ),
     },
     {
@@ -1146,36 +1219,43 @@ nodes = [
     {
         "parameters": {
             "method": "POST",
-            "url": "http://host.docker.internal:11434/api/generate",
+            "url": "https://api.anthropic.com/v1/messages",
+            "authentication": "predefinedCredentialType",
+            "nodeCredentialType": "anthropicApi",
+            "sendHeaders": True,
+            "headerParameters": {"parameters": [{"name": "anthropic-version", "value": "2023-06-01"}]},
             "sendBody": True,
             "specifyBody": "json",
-            "jsonBody": OLLAMA_BODY,
-            "options": {
-                "timeout": 300000,
-                "batching": {"batch": {"batchSize": 1, "batchInterval": 0}},
-            },
+            "jsonBody": CLAUDE_BODY,
+            "options": {"timeout": 300000},
         },
-        "name": "Ollama Draft",
+        "name": "Claude Draft",
         "type": "n8n-nodes-base.httpRequest",
         "typeVersion": 4.2,
         "position": [660, 20],
+        "credentials": ANTHROPIC_CRED,
         "onError": "continueRegularOutput",
         "retryOnFail": True,
         "maxTries": 2,
-        "waitBetweenTries": 2000,
+        "waitBetweenTries": 5000,
         "notes": (
-            "/api/generate, NOT /api/chat -- on /api/chat, think:false silently disables `format` "
-            "grammar enforcement and the model answers in prose (Section 3).\n\n"
-            "temperature %s / presence_penalty %s come from Section 3's drafting line, parsed out "
-            "of the doc at build time. Section 3 marks them UNVERIFIED and says to test them "
-            "rather than assume the extraction settings transfer -- parsing them means a retest "
-            "that changes the doc lands here on the next rebuild.\n\n"
-            "Drafting skill v2: the model returns a subject and two hooks -- the schema has no "
-            "other field, and the build refuses a schema that disagrees with the skill's 'only the "
-            "hook and subject are freely generated'. One call for both channels: two would double "
-            "the serial GPU time for hooks that must cite the same fact sheet.\n\n"
-            "batchSize 1 keeps calls serial to match OLLAMA_NUM_PARALLEL=1."
-        ) % (repr(DRAFT_TEMPERATURE), repr(DRAFT_PRESENCE_PENALTY)),
+            "Drafting skill v3: %s through the Anthropic Messages API, drafting node only "
+            "(Section 3). Enrichment and scoring stay on local qwen3.5:9b.\n\n"
+            "The body is $json.request, built per lead by Assess Grounding: model, max_tokens, "
+            "effort %s, the JSON schema (output_config.format), the system prompt and the "
+            "lead's facts plus its approved claims. No temperature/top_p: a non-default value is a "
+            "400 on this model. Thinking is left at the model default (adaptive).\n\n"
+            "The API key is the n8n credential %s, made from ANTHROPIC_API_KEY in .env by "
+            "provision_anthropic_credential.py. It is never in this JSON.\n\n"
+            "Skill section 6: if the call fails the lead stays queued and the next run retries. "
+            "There is NO fallback to the local model. Errors continue as items so Assemble Drafts "
+            "can drop them; it also drops a refusal, a max_tokens cut-off, or text that is not the "
+            "schema.\n\n"
+            "One call per lead, all of a run's calls in flight at once (at most Config's batch_size). "
+            "This node dispatches every item's request before awaiting any, which is also why the "
+            "system prompt is not marked for prompt caching: measured, four calls wrote the cache "
+            "four times and read it never."
+        ) % (DRAFT_MODEL, DRAFT_EFFORT, ANTHROPIC_CRED["anthropicApi"]["id"]),
     },
     {
         "parameters": {"mode": "runOnceForEachItem", "jsCode": _assemble_js},
@@ -1184,17 +1264,16 @@ nodes = [
         "typeVersion": 2,
         "position": [880, 20],
         "notes": (
-            "Drafting skill v2: builds each message as hook + problem, outcome + proof, ask -- the "
-            "last four VERBATIM from the claims library, rotated on lead_id and fitted to the word "
-            "ceiling. Exactly one ask. Then enforces every rule a string match can: word ceiling, "
-            "banned adjectives, merge-tag tells, the link rule (none in warm-up weeks 1-2, then only "
-            "the library's link line; never LinkedIn or a PDF), subject length and wording, hook "
-            "grounding (numbers and therapeutic areas the lead does not have -- what a copied worked "
-            "example looks like), and unconfirmed library lines.\n\n"
+            "Drafting skill v3: parses Claude's composed email and DM and enforces skill section 3 "
+            "in code -- body length (70-110 target, tagged above 125), exactly one ask, the link rule "
+            "(none in warm-up weeks 1-2, then only the library's link line), the product name at most "
+            "once and in brackets, \"AI\" at most once, never \"You're sponsoring\", no guarantee, "
+            "no number the claims and facts do not hold, no visitor identification, no named CRM or "
+            "tool, no languages, the geography-matched proof, subject rules, grounding, and every "
+            "claim code checked against what the lead was offered.\n\n"
             "The opt-out sentence and the signature are appended HERE, not generated. Section 5 "
             "locks the opt-out verbatim and makes it the basis of the GDPR/KVKK legitimate-"
-            "interest position -- asking a 9B model to reproduce a compliance string exactly, "
-            "every time, is a bet with no upside (build rule 3).\n\n"
+            "interest position.\n\n"
             "A violation tags the draft's `variant` instead of discarding it. The reviewer sees "
             "the tag next to the text; a silently-dropped draft teaches nobody anything."
         ),
@@ -1209,8 +1288,8 @@ nodes = [
         "typeVersion": 2.2,
         "position": [1100, 20],
         "notes": (
-            "An Ollama outage must not mark a lead low-context either. Nothing is written, the "
-            "lead stays 'contact_found', the next run redrafts it."
+            "A failed Claude call must not mark a lead low-context either. Nothing is written, the "
+            "lead stays 'contact_found', the next run redrafts it (skill section 6: no fallback)."
         ),
     },
     {
@@ -1270,11 +1349,11 @@ connections = {
     "Drop Failed Lookups": {"main": [[{"node": "Groundable?", "type": "main", "index": 0}]]},
     "Groundable?": {
         "main": [
-            [{"node": "Ollama Draft", "type": "main", "index": 0}],
+            [{"node": "Claude Draft", "type": "main", "index": 0}],
             [{"node": "Build Low-Context Drafts", "type": "main", "index": 0}],
         ]
     },
-    "Ollama Draft": {"main": [[{"node": "Assemble Drafts", "type": "main", "index": 0}]]},
+    "Claude Draft": {"main": [[{"node": "Assemble Drafts", "type": "main", "index": 0}]]},
     "Assemble Drafts": {
         "main": [[{"node": "Drop Failed Generations", "type": "main", "index": 0}]]
     },
@@ -1303,13 +1382,12 @@ with io.open(OUT, "w", encoding="utf-8", newline="\n") as fh:
 
 print("wrote", os.path.abspath(OUT))
 print("  min facts: %d, fact kinds: %r" % (MIN_FACTS, FACT_KINDS))
-print("  max words: %d, url cap parsed, banned adjectives named in doc: %r" % (MAX_WORDS, BANNED_NAMED))
-print("  drafting inference: temperature=%s presence_penalty=%s" % (DRAFT_TEMPERATURE, DRAFT_PRESENCE_PENALTY))
+print("  body: %d-%d words, never more than %d; url cap parsed; link-free weeks 1-%d" % (LENGTH + (LINK_FREE_WEEKS,)))
+print("  drafting model: %s, effort %s, credential %s" % (DRAFT_MODEL, DRAFT_EFFORT, ANTHROPIC_CRED["anthropicApi"]["id"]))
 print("  opt-out: %r" % OPT_OUT)
 print("  signature: %r (from %s)" % (SIGNATURE, SENDER_SOURCE))
-print("  skill: generated parts %r, subject %d-%d chars, no %r, banned %r, link-free weeks 1-%d"
-      % (GENERATED_PARTS, SUBJECT_RULES["min"], SUBJECT_RULES["max"], SUBJECT_RULES["prefixes"],
-         SUBJECT_RULES["banned"], LINK_FREE_WEEKS))
+print("  skill: subject %d-%d chars, no %r; name at most %d, AI at most %d; banned %r"
+      % (SUBJECT_RULES["min"], SUBJECT_RULES["max"], SUBJECT_RULES["prefixes"], NAME_MAX, AI_MAX, SKILL_BANNED))
 print("  small team: %d-%d employees; claims library countries = Section 12's %d geographies"
       % (SMALL_TEAM + (len(GEOGRAPHIES),)))
 

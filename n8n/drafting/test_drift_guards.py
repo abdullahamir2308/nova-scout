@@ -28,6 +28,7 @@ REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 MASTER_REF = os.path.join(REPO, "NovaScout_MasterRef.md")
 SKILL = os.path.join(REPO, "NovaScout_DraftingSkill.md")
 CLAIMS_MIGRATION = os.path.join(REPO, "postgres", "migrations", "010_claims_library.sql")
+CLAIMS_V3_MIGRATION = os.path.join(REPO, "postgres", "migrations", "012_claims_library_v3.sql")
 
 PASSED = []
 FAILED = []
@@ -50,12 +51,14 @@ def write(p, s):
 FIXTURE_SENDER = "Drift Test Sender"
 
 
-def stage_companions(workdir, mutate_skill=None, mutate_migration=None):
-    """The drafting skill and migration 010 are parsed by the build too. Every
-    case gets its own copy, so a case can mutate one without touching the repo."""
+def stage_companions(workdir, mutate_skill=None, mutate_migration=None, mutate_v3_migration=None):
+    """The drafting skill and migrations 010 and 012 are parsed by the build too.
+    Every case gets its own copy, so a case can mutate one without touching the repo."""
     for label, src, name, mutate in (("skill", SKILL, "DraftingSkill.md", mutate_skill),
                                      ("migration", CLAIMS_MIGRATION, "010_claims_library.sql",
-                                      mutate_migration)):
+                                      mutate_migration),
+                                     ("v3 migration", CLAIMS_V3_MIGRATION, "012_claims_library_v3.sql",
+                                      mutate_v3_migration)):
         text = read(src)
         if mutate:
             new = mutate(text)
@@ -69,6 +72,7 @@ def run_build(workdir, doc_path, env_overrides=None):
     env["NOVASCOUT_MASTER_REF"] = doc_path
     env["NOVASCOUT_DRAFTING_SKILL"] = os.path.join(workdir, "DraftingSkill.md")
     env["NOVASCOUT_CLAIMS_MIGRATION"] = os.path.join(workdir, "010_claims_library.sql")
+    env["NOVASCOUT_CLAIMS_V3_MIGRATION"] = os.path.join(workdir, "012_claims_library_v3.sql")
     env["DRAFTING_OUT"] = os.path.join(workdir, "out", "drafting.json")
     env["NOVASCOUT_ENV_FILE"] = os.path.join(workdir, "no-such.env")
     env["NOVASCOUT_SENDER_NAME"] = FIXTURE_SENDER
@@ -89,11 +93,11 @@ def run_build(workdir, doc_path, env_overrides=None):
 
 
 def case(label, mutate_doc=None, mutate_js=None, js_file="code_assess.js", expect_in="",
-         env_overrides=None, mutate_skill=None, mutate_migration=None):
+         env_overrides=None, mutate_skill=None, mutate_migration=None, mutate_v3_migration=None):
     tmp = tempfile.mkdtemp(prefix="novascout-drift-")
     try:
         shutil.copytree(HERE, os.path.join(tmp, "drafting"))
-        stage_companions(tmp, mutate_skill, mutate_migration)
+        stage_companions(tmp, mutate_skill, mutate_migration, mutate_v3_migration)
         doc_path = os.path.join(tmp, "MasterRef.md")
         doc = read(MASTER_REF)
         if mutate_doc:
@@ -220,29 +224,42 @@ case(
     expect_in="missing-fact report",
 )
 
-# --- the word ceiling -------------------------------------------------------
+# --- the body length (skill v3: 70-110 words, never more than 125) -----------
+#
+# Stated in the skill and twice in the Master Ref (Section 5, Section 9). All
+# three must agree and the assembler must enforce exactly that.
 case(
-    "doc raises the word ceiling -> build refuses",
-    mutate_doc=lambda d: d.replace("Under 80 words for first touch.",
-                                   "Under 120 words for first touch.", 1),
-    expect_in="more than one word ceiling",
+    "Section 5 raises the ceiling alone -> build refuses",
+    mutate_doc=lambda d: d.replace("First touch: body 70–110 words, never more than 125",
+                                   "First touch: body 70–110 words, never more than 150", 1),
+    expect_in="more than one body length rule",
 )
 case(
-    "doc's two statements of the ceiling disagree -> build refuses rather than guessing",
-    mutate_doc=lambda d: d.replace("**Prompt constraints:** under 80 words",
-                                   "**Prompt constraints:** under 100 words", 1),
-    expect_in="more than one word ceiling",
+    "both Master Ref statements move together, the skill does not -> build refuses",
+    mutate_doc=lambda d: d.replace("70–110 words, never more than 125", "70–120 words, never more than 140"),
+    expect_in="disagree on the body length",
 )
 case(
-    "JS raises MAX_WORDS above the doc -> build refuses",
-    mutate_js=lambda s: s.replace("const MAX_WORDS = 80;", "const MAX_WORDS = 150;", 1),
-    expect_in="word ceiling",
+    "the skill raises the ceiling, the Master Ref does not -> build refuses",
+    mutate_skill=lambda s: s.replace("70–110 words and never more than 125", "70–110 words and never more than 150", 1),
+    expect_in="disagree on the body length",
 )
 case(
-    "the assembler's ceiling drifts from the doc -> build refuses",
-    mutate_js=lambda s: s.replace("const MAX_WORDS = 80;", "const MAX_WORDS = 150;", 1),
+    "the assembler raises its ceiling above the skill -> build refuses",
+    mutate_js=lambda s: s.replace("const BODY_CEILING = 125;", "const BODY_CEILING = 150;", 1),
     js_file="code_assemble.js",
-    expect_in="word ceiling",
+    expect_in="body length drifted",
+)
+case(
+    "the assembler moves its target range -> build refuses",
+    mutate_js=lambda s: s.replace("const BODY_TARGET_MAX = 110;", "const BODY_TARGET_MAX = 120;", 1),
+    js_file="code_assemble.js",
+    expect_in="body length drifted",
+)
+case(
+    "the skill's length sentence is reworded past recognition -> build refuses loudly",
+    mutate_skill=lambda s: s.replace("should be 70–110 words and never more than 125", "should be short", 1),
+    expect_in="body length rule not found",
 )
 
 # --- the opt-out sentence: Section 5's compliance mechanism ------------------
@@ -318,19 +335,24 @@ case(
     expect_in="taxonomy section not found",
 )
 
-# --- Section 3's drafting inference settings --------------------------------
+# --- Section 3's drafting model ----------------------------------------------
 #
-# Section 3 marks these UNVERIFIED and says to test them in Sprint 4. Parsing
-# them is what makes a retest that changes the doc land in the workflow on the
-# next rebuild instead of being remembered -- or not.
+# The model id is in Section 3 and in skill section 6. The request ships exactly
+# that id; a change in one place alone refuses.
 case(
-    "the drafting inference line is renamed -> build refuses loudly",
-    # NOTE: this anchor hardcodes the doc's CURRENT temperature. Retuning the
-    # drafting settings changes that literal and breaks this case until it is
-    # bumped -- expected maintenance on every retune, not a real drift failure.
-    mutate_doc=lambda d: d.replace("For drafting, `temperature: 0.45`",
-                                   "When drafting use `temperature: 0.45`", 1),
-    expect_in="drafting inference settings not found",
+    "Section 3 names another drafting model -> build refuses",
+    mutate_doc=lambda d: d.replace("**Drafting model: `claude-sonnet-5-5`**", "**Drafting model: `claude-sonnet-5`**", 1),
+    expect_in="different drafting models",
+)
+case(
+    "the skill names another drafting model -> build refuses",
+    mutate_skill=lambda s: s.replace("- Drafting node: `claude-sonnet-5-5`", "- Drafting node: `claude-opus-5-5`", 1),
+    expect_in="different drafting models",
+)
+case(
+    "the Section 3 model line is renamed -> build refuses loudly",
+    mutate_doc=lambda d: d.replace("**Drafting model: `claude-sonnet-5-5`**", "**Model for drafting: `claude-sonnet-5-5`**", 1),
+    expect_in="drafting model not found",
 )
 
 # --- the wiring guard -------------------------------------------------------
@@ -341,13 +363,14 @@ case(
 # that look fine, an execution that reports success, and no signal anywhere.
 # This happened for real on the first live run.
 case(
-    "the Code node stops emitting a field the Ollama body reads -> build refuses",
-    mutate_js=lambda s: s.replace("    system_prompt: SYSTEM_PROMPT,\n", "", 1),
+    "the Code node stops emitting the request the Claude body reads -> build refuses",
+    mutate_js=lambda s: s.replace("    request: request,\n", "", 1),
     expect_in="does not emit",
 )
 case(
-    "the same guard covers the fact-sheet prompt, not just the system prompt",
-    mutate_js=lambda s: s.replace("    prompt: prompt,\n", "", 1),
+    "the Claude body reads a field Assess Grounding never emits -> build refuses",
+    mutate_js=lambda s: s.replace("JSON.stringify($json.request)", "JSON.stringify($json.claude_request)", 1),
+    js_file="build_workflow.py",
     expect_in="does not emit",
 )
 
@@ -372,35 +395,34 @@ case(
     expect_in="NOVASCOUT_SENDER_NAME is not set",
 )
 
-# --- drafting skill v2 --------------------------------------------------------
+# --- drafting skill v3 --------------------------------------------------------
 #
-# The one to read twice is the first pair. The skill's whole design is "only the
-# hook and subject are freely generated; everything else is selected from the
-# library". The model's JSON schema is that rule made physical -- a field it
-# does not have is a part it cannot compose. Either side moving alone refuses.
+# The one to read twice is the first pair. v3's whole design is "the model
+# composes the whole email from the hook fact plus approved claims". The schema
+# is that rule made physical: it needs a body and an ask of its own, or "exactly
+# one ask" cannot be checked. Either side moving alone refuses.
 case(
-    "the skill lets the model write another part -> build refuses",
-    mutate_skill=lambda s: s.replace("**Only the hook and subject are freely generated**",
-                                     "**Only the hook, subject and problem are freely generated**", 1),
-    expect_in="does not match the drafting skill",
+    "the skill goes back to line-picking -> build refuses",
+    mutate_skill=lambda s: s.replace("model composes the whole email from the hook fact plus approved claims",
+                                     "model writes the hook; library lines pasted in verbatim", 1),
+    expect_in="composition rule not found",
 )
 case(
-    "the model schema gains a body field the skill does not license -> build refuses",
-    mutate_js=lambda s: s.replace('        "linkedin_hook": {"type": "string"},\n',
-                                  '        "linkedin_hook": {"type": "string"},\n'
-                                  '        "email_body": {"type": "string"},\n', 1),
+    "the model schema loses the ask field -> build refuses",
+    mutate_js=lambda s: s.replace('        "email_ask": {"type": "string"},\n', "", 1),
     js_file="build_workflow.py",
     expect_in="does not match the drafting skill",
 )
 case(
-    "the generated-parts sentence is reworded past recognition -> build refuses loudly",
-    mutate_skill=lambda s: s.replace("**Only the hook and subject are freely generated**",
-                                     "**The hook and subject get generated**", 1),
-    expect_in="generated-parts rule not found",
+    "Assemble Drafts stops requiring a field the schema promises -> build refuses",
+    mutate_js=lambda s: s.replace("const FIELDS = ['email_subject', 'email_body', 'email_ask', 'linkedin_body', 'linkedin_ask'];",
+                                  "const FIELDS = ['email_subject', 'email_body', 'email_ask', 'linkedin_body'];", 1),
+    js_file="code_assemble.js",
+    expect_in="FIELDS do not match",
 )
 case(
     "the skill changes the subject length -> build refuses",
-    mutate_skill=lambda s: s.replace("- 30–50 characters.", "- 25–50 characters.", 1),
+    mutate_skill=lambda s: s.replace("**Subject.** 30–55 characters.", "**Subject.** 30–60 characters.", 1),
     expect_in="subject length drifted",
 )
 case(
@@ -410,26 +432,46 @@ case(
     expect_in="subject length drifted",
 )
 case(
-    "the skill bans a subject word the JS does not -> build refuses",
-    mutate_skill=lambda s: s.replace('No "free," "demo," "offer," "opportunity."',
-                                     'No "free," "demo," "offer," "urgent," "opportunity."', 1),
-    expect_in="bans subject words",
-)
-case(
-    "the JS stops banning a subject word the skill bans -> build refuses",
-    mutate_js=lambda s: s.replace("['free', 'demo', 'offer', 'opportunity']",
-                                  "['free', 'offer', 'opportunity']", 1),
-    js_file="code_assemble.js",
-    expect_in="bans subject words",
-)
-case(
     "the skill stops forbidding fake-reply subjects the JS checks -> build refuses",
-    mutate_skill=lambda s: s.replace('No "Re:" or "Fwd:"', 'No "Re:" or "Fw:"', 1),
+    mutate_skill=lambda s: s.replace('no "Fwd:"', 'no "Fw:"', 1),
     expect_in="fake-reply subject prefixes drifted",
 )
 case(
-    "the skill extends the link-free warm-up -> build refuses",
-    mutate_skill=lambda s: s.replace("Warm-up weeks 1–2: zero links", "Warm-up weeks 1–3: zero links", 1),
+    "the skill drops the subject's product-name / AI rule -> build refuses loudly",
+    mutate_skill=lambda s: s.replace('Never the product name. Never "AI". No "Re:"', 'No "Re:"', 1),
+    expect_in="no longer say",
+)
+case(
+    "the skill bans an adjective the JS does not -> build refuses",
+    mutate_skill=lambda s: s.replace("No banned adjectives (revolutionary,", "No banned adjectives (disruptive, revolutionary,", 1),
+    expect_in="does not ban",
+)
+case(
+    "the JS stops banning an adjective the skill names -> build refuses",
+    mutate_js=lambda s: s.replace("  'seamless',\n", "", 1),
+    js_file="code_assemble.js",
+    expect_in="does not ban",
+)
+case(
+    "the skill allows the product name twice -> build refuses",
+    mutate_skill=lambda s: s.replace("The name appears at most once, in brackets", "The name appears at most twice, in brackets", 1),
+    expect_in="limits drifted",
+)
+case(
+    "the JS allows \"AI\" twice -> build refuses",
+    mutate_js=lambda s: s.replace("const AI_MAX = 1;", "const AI_MAX = 2;", 1),
+    js_file="code_assemble.js",
+    expect_in="limits drifted",
+)
+case(
+    "the skill's fixed opt-out is paraphrased -> build refuses",
+    mutate_skill=lambda s: s.replace("""- Opt-out: "If this isn't relevant, reply 'no' and I won't follow up.\"""",
+                                     """- Opt-out: "If this isn't relevant, just reply 'no'.\"""", 1),
+    expect_in="fixed opt-out is not Section 5's",
+)
+case(
+    "the Master Ref extends the link-free warm-up -> build refuses",
+    mutate_doc=lambda d: d.replace("**Links:** none in warm-up weeks 1–2", "**Links:** none in warm-up weeks 1–3", 1),
     expect_in="link-free warm-up drifted",
 )
 case(
@@ -439,9 +481,26 @@ case(
     expect_in="link-free warm-up drifted",
 )
 case(
-    "the skill's body budget disagrees with the Master Ref -> build refuses",
-    mutate_skill=lambda s: s.replace("stays **under 80 words**", "stays **under 90 words**", 1),
-    expect_in="disagree on the word ceiling",
+    "migration 012 allows a slot Assess Grounding never offers -> build refuses",
+    mutate_v3_migration=lambda s: s.replace("CHECK (slot IN ('description', 'angle', 'benefit', 'proof', 'ask', 'link'))",
+                                            "CHECK (slot IN ('description', 'angle', 'benefit', 'proof', 'ask', 'link', 'stat'))", 1),
+    expect_in="claims-library slots drifted",
+)
+case(
+    "Assess Grounding stops resolving a v3 slot -> build refuses",
+    mutate_js=lambda s: s.replace("const LIBRARY_SLOTS = ['description', 'angle', 'benefit', 'proof', 'ask'];",
+                                  "const LIBRARY_SLOTS = ['description', 'angle', 'proof', 'ask'];", 1),
+    expect_in="claims-library slots drifted",
+)
+case(
+    "the skill's worked example is reworded so a narrowing no longer applies -> build refuses",
+    mutate_skill=lambda s: s.replace("collects their study brief", "gathers their study brief", 1),
+    expect_in="EXAMPLE_NARROWINGS",
+)
+case(
+    "the skill's worked example disappears -> build refuses loudly",
+    mutate_skill=lambda s: s.replace("**v3 (same facts, nothing invented):**", "**v3:**", 1),
+    expect_in="worked example not found",
 )
 case(
     "Section 12's company-size band changes -> build refuses",
@@ -452,12 +511,6 @@ case(
     "migration 010's countries CHECK loses a Section 12 geography -> build refuses",
     mutate_migration=lambda s: s.replace("'South Africa', 'Brazil', 'Argentina']", "'South Africa', 'Brazil']", 1),
     expect_in="claims_countries_are_geographies",
-)
-case(
-    "a subject worked example is dropped from the system prompt -> build refuses",
-    mutate_js=lambda s: s.replace('->  Pharma-team inquiries after hours",', '->  Pharma-team leads after hours",', 1),
-    js_file="build_workflow.py",
-    expect_in="worked example",
 )
 
 # --- the batch row -> Assess Grounding wiring ---------------------------------
