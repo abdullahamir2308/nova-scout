@@ -467,7 +467,13 @@ run = execute("followup0001dry")
 show("Find Due Follow-Ups", [{k: r[k] for k in ("lead_id", "action", "next_follow_up")} for r in out_items(run, "Find Due Follow-Ups")])
 show("Write Follow-Up", out_items(run, "Write Follow-Up"))
 fu = psql_json(DRY, "SELECT lead_id, variant, status, subject, body FROM drafts WHERE variant LIKE 'follow-up-%' AND status = 'pending'")
-expect("lead 91 got follow-up-1 as a PENDING draft (the review queue)", [(r["lead_id"], r["variant"]) for r in fu] == [(91, "follow-up-1")])
+# Since 2026-10-02 (drafting skill v3 section 8) the follow-up is composed by the
+# drafting model -- a real Anthropic API call, the one thing in this dry run that
+# leaves the machine (it reaches no inbox) -- and its variant carries the claim
+# codes it used: 'follow-up-1/BEN-DECK.A1+...'.
+expect("lead 91 got follow-up-1 as a PENDING draft (the review queue)",
+       [(r["lead_id"], r["variant"].split("/")[0].split("+")[0]) for r in fu] == [(91, "follow-up-1")],
+       str([(r["lead_id"], r["variant"]) for r in fu]))
 expect("lead 7 (replied) got nothing", not any(r["lead_id"] == 7 for r in fu))
 expect("lead 104 (two follow-ups used) marked lost", psql(DRY, "SELECT status FROM leads WHERE id = 104;").strip() == "lost")
 if fu:

@@ -19,7 +19,9 @@
 //   sponsor       the prospect is never the one sponsoring ("You're sponsoring")
 //   claims        no guarantee, no number the library and facts do not hold, no
 //                 visitor identification, no named CRM or tool, no languages,
-//                 never "chatbot"
+//                 never "chatbot", never that Nova books a call, never SOPs or
+//                 client documents as its source; no two claim lines that
+//                 repeat a capability
 //   proof         the geography-matched deployment is named; no other one is
 //   grounding     no therapeutic area the lead lacks; no founder or city opener;
 //                 a trial is never credited to their website
@@ -127,6 +129,12 @@ const VISITOR_ID = /\b(?:identif\w*|reveal\w*|unmask\w*|de-?anonymi\w*|track\w*)
 const LANGUAGES = /\bmulti-?lingual\b|\blanguages?\b|\b(?:turkish|spanish|arabic|german|french|portuguese|english|polish|romanian|hungarian|czech|hindi|urdu)\b/i;
 const CHATBOT = /\bchat ?bots?\b|\bQ ?& ?A bots?\b/i;
 const AI_POWERED = /\bAI[- ]?(?:powered|driven|based)\b/i;
+// Settled 2026-10-02 against the Nova Agent Kit code (migration 013): Nova does
+// not book -- it sends the booking link and the sponsor books through it -- and
+// it answers from the CRO's website, never from SOPs or documents a client
+// provides. "So they can book a call" is fine; Nova "books the call" is not.
+const NOVA_BOOKS = /\bbooks\s+(?:the\s+|a\s+|qualified\s+|sponsor\s+)?(?:calls?|meetings?|demos?)\b|\b(?:into|onto|straight into)\s+your\s+(?:calendar|diary)\b|\bschedules\s+(?:the\s+|a\s+)?(?:calls?|meetings?)\b/i;
+const SOP_SOURCE = /\bSOPs?\b|\bstandard operating procedures?\b|\b(?:your|their)\s+(?:own\s+)?(?:documents|documentation)\b/i;
 
 // Skill v3 section 3, Claims: "any number, percentage or multiplier that is not
 // in section 4". Digit tokens are checked against the library and the facts;
@@ -352,6 +360,27 @@ function claimFlags(text, corpus) {
   }
   if (LANGUAGES.test(text)) flags.push('claim-language');
   if (CHATBOT.test(text)) flags.push('claim-chatbot');
+  if (NOVA_BOOKS.test(text)) flags.push('claim-books');
+  if (SOP_SOURCE.test(text)) flags.push('claim-sop');
+  return flags;
+}
+
+// Skill v3 section 3, No repeats: "The description and the benefits must not
+// repeat the same capability." Each description and benefit line names its
+// capabilities (claims_library.capabilities, migration 013); two codes one
+// message used that share one say the same thing twice. `capsOf(code)` returns
+// a code's capabilities (none for an angle, proof or ask).
+function repeatFlags(codes, capsOf) {
+  const flags = [];
+  const seen = {};
+  let repeated = false;
+  for (const code of codes || []) {
+    for (const cap of capsOf(code) || []) {
+      if (seen[cap] && seen[cap] !== code) repeated = true;
+      seen[cap] = code;
+    }
+  }
+  if (repeated) flags.push('claim-repeat');
   return flags;
 }
 
@@ -450,6 +479,22 @@ function unique(list) {
   return list.filter(function (v, i) { return list.indexOf(v) === i; });
 }
 
+// Word-set overlap, for attributing an ask the model did not code to the library
+// line it paraphrased. Also used by the follow-ups (Workflow 6), which embed
+// everything above "Node body" verbatim.
+function wordSet(v) {
+  const set = {};
+  fold(v).replace(/[^a-z0-9]+/g, ' ').split(' ').filter(Boolean).forEach(function (w) { set[w] = true; });
+  return set;
+}
+function jaccard(a, b) {
+  const A = wordSet(a);
+  const B = wordSet(b);
+  const keys = unique(Object.keys(A).concat(Object.keys(B)));
+  const both = keys.filter(function (k) { return A[k] && B[k]; }).length;
+  return keys.length ? both / keys.length : 0;
+}
+
 // ---------------------------------------------------------------------------
 // Node body
 // ---------------------------------------------------------------------------
@@ -525,7 +570,9 @@ const pools = src.library_pools || {};
 // message's `variant`.
 const offered = {};
 SLOT_ORDER.forEach(function (slot) {
-  (pools[slot] || []).forEach(function (l) { offered[l.code] = { slot: slot, confirmed: l.confirmed }; });
+  (pools[slot] || []).forEach(function (l) {
+    offered[l.code] = { slot: slot, confirmed: l.confirmed, capabilities: l.capabilities || [] };
+  });
 });
 // The ask and the proof are also attributed in code, from the text, when the
 // model leaves their code out. Measured on the 2026-10-02 run: three of eight
@@ -535,18 +582,6 @@ SLOT_ORDER.forEach(function (slot) {
 // the thing, then match it deterministically. The ask is the library line whose
 // words it shares most (at least half, by Jaccard on word sets); the proof is
 // the line whose deployment it names, or PR-BOTH's "two CROs".
-function wordSet(v) {
-  const set = {};
-  fold(v).replace(/[^a-z0-9]+/g, ' ').split(' ').filter(Boolean).forEach(function (w) { set[w] = true; });
-  return set;
-}
-function jaccard(a, b) {
-  const A = wordSet(a);
-  const B = wordSet(b);
-  const keys = unique(Object.keys(A).concat(Object.keys(B)));
-  const both = keys.filter(function (k) { return A[k] && B[k]; }).length;
-  return keys.length ? both / keys.length : 0;
-}
 function inferAsk(askText) {
   let best = null;
   (pools.ask || []).forEach(function (l) {
@@ -630,8 +665,9 @@ function message(body, ask, core) {
 }
 
 function claimTags(claims, withLink) {
-  const flags = [];
+  let flags = [];
   if (claims.unknown.length || !claims.reported.length) flags.push('claim-code');
+  flags = flags.concat(repeatFlags(claims.used, function (c) { return offered[c].capabilities; }));
   const anyUnconfirmed = claims.used.some(function (c) { return !offered[c].confirmed; }) ||
     (withLink && !withLink.confirmed);
   if (anyUnconfirmed) flags.push('unconfirmed-claim');

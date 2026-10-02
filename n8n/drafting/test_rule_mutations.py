@@ -37,6 +37,8 @@ V3_TAGS = {
     "subject-product", "ai-repeat", "subject-ai", "ai-powered", "prospect-sponsor", "claim-guarantee",
     "claim-number", "claim-visitor-id", "claim-named-tool", "claim-language", "claim-chatbot",
     "proof-missing", "proof-geo", "claim-code", "ungrounded-area",
+    # Added 2026-10-02 with migration 013: the no-repeat rule and the two settled claims.
+    "claim-repeat", "claim-books", "claim-sop",
 }
 
 TESTS = {"code_assemble.js": "test_assemble.js", "code_assess.js": "test_grounding.js"}
@@ -96,6 +98,12 @@ STRUCTURAL = [
     ("[v3] only the lead's own proof line is offered", "code_assess.js",
      "proof: lines(forCountry(bySlot('proof'), lead.country)),",
      "proof: lines(bySlot('proof')),"),
+    ("[v3] the prompt names every claim pair that repeats a capability", "code_assess.js",
+     "const pairs = repeatPairs(pools.description.concat(pools.benefit));",
+     "const pairs = [];"),
+    ("[v3] a description or benefit line shows the model its capabilities", "code_assess.js",
+     "? '  (about: ' + l.capabilities.join(', ') + ')' : '';",
+     "? '' : '';"),
     ("[v3] a lead missing a v3 slot is held back before any API call", "code_assess.js",
      "const libraryHolds = groundable && libraryGap !== null;",
      "const libraryHolds = false;"),

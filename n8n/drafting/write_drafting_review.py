@@ -8,6 +8,9 @@ Reads, read-only:
     constant and tag in Assemble Drafts, the Claude node's settings;
   * one real execution of it (the latest, or the id given) -- the per-lead
     prompt exactly as it was sent;
+  * workflow `followup0001` (Workflow 6's follow-ups, composed by the same
+    model under the same claim rules since 2026-10-02, skill section 8) and its
+    latest execution that called the model;
   * the novascout database -- the live claims_library and its CHECKs.
 
 Every tag the deployed Assemble Drafts can put on a draft must have a
@@ -147,6 +150,12 @@ TAG_DOCS = {
     "claim-code": ("Claims only from the approved list", "the message reported a claim code this lead was not "
                    "offered, or reported none"),
     "unconfirmed-claim": ("Every claim confirmed by a human", "the message used a claims_library line with confirmed=false"),
+    "claim-books": ("Forbidden: saying it books calls (settled 2026-10-02)", "NOVA_BOOKS: \"books the call\", \"into "
+                    "your calendar\", \"schedules the call\" -- Nova sends the booking link and the sponsor books"),
+    "claim-sop": ("Forbidden: SOPs or client documents as its source (settled 2026-10-02)", "SOP_SOURCE: \"SOPs\", "
+                  "\"standard operating procedures\", \"your documents/documentation\" -- it answers from their website"),
+    "claim-repeat": ("No repeats: the description and benefits never share a capability", "two claim codes the message "
+                     "used share a capability (claims_library.capabilities, migration 013)"),
 }
 undocumented = [t for t in TAGS if t not in TAG_DOCS]
 stale = [t for t in TAG_DOCS if t not in TAGS]
@@ -167,7 +176,7 @@ used = [it["json"] for r in run["Assemble Drafts"] for br in r["data"]["main"] f
 
 # ---- live claims library ------------------------------------------------------------------------------
 lib = json.loads(psql("novascout", "SELECT json_agg(t ORDER BY array_position(ARRAY['description','angle','benefit','proof','ask','link'], t.slot), t.code) "
-                                   "FROM (SELECT code, slot, body, countries, measured, active, confirmed, note, updated_at FROM claims_library) t;"))
+                                   "FROM (SELECT code, slot, body, countries, measured, active, confirmed, capabilities, note, updated_at FROM claims_library) t;"))
 checks = psql("novascout", "SELECT conname || ' | ' || pg_get_constraintdef(oid) FROM pg_constraint "
                            "WHERE conrelid = 'claims_library'::regclass AND contype = 'c' ORDER BY conname;").splitlines()
 
@@ -272,7 +281,8 @@ L.append("")
 consts = ["BODY_TARGET_MIN", "BODY_TARGET_MAX", "BODY_CEILING", "MAX_URLS", "LINK_FREE_WEEKS", "SUBJECT_MIN_CHARS",
           "SUBJECT_MAX_CHARS", "SUBJECT_REPLY_PREFIXES", "PRODUCT_NAME", "PRODUCT_NAME_MAX", "AI_MAX", "BANNED_ADJECTIVES",
           "DEPLOYMENTS", "NAMED_TOOLS", "NUMBER_WORDS", "PROSPECT_SPONSOR", "GUARANTEE", "VISITOR_ID", "LANGUAGES",
-          "CHATBOT", "AI_POWERED", "REQUEST_IN_BODY", "ASK_SCHEDULING", "HOOK_SOURCE_OPENING", "SUBJECT_ACRONYMS"]
+          "CHATBOT", "AI_POWERED", "NOVA_BOOKS", "SOP_SOURCE", "REQUEST_IN_BODY", "ASK_SCHEDULING", "HOOK_SOURCE_OPENING",
+          "SUBJECT_ACRONYMS"]
 L.append(fence("\n".join("%s = %s" % (c, re.sub(r"\s*\n\s*", " ", js_const(c))) for c in consts), "js"))
 L.append("")
 L.append("Attribution: each message's `variant` records the claim codes **that message** reported, in slot order. When "
@@ -294,12 +304,18 @@ L.append("Only **active** rows reach the model; every row is `confirmed=false` u
          "draft built from an unconfirmed line is tagged `unconfirmed-claim`. Read the `note` before confirming: it "
          "records what the Nova Agent Kit code showed.")
 L.append("")
-L.append("| Code | Slot | Active | Confirmed | Countries | Body | Note |")
-L.append("|---|---|---|---|---|---|---|")
+L.append("`Capabilities` is what a description or benefit line asserts (migration 013). Two lines in one message that "
+         "share one say the same thing twice: the prompt names every such pair, and Assemble Drafts tags a message that "
+         "uses one (`claim-repeat`).")
+L.append("")
+L.append("| Code | Slot | Active | Confirmed | Countries | Capabilities | Body | Note |")
+L.append("|---|---|---|---|---|---|---|---|")
 for r in lib:
-    L.append("| `%s` | %s | %s | %s | %s | %s | %s |" % (
+    L.append("| `%s` | %s | %s | %s | %s | %s | %s | %s |" % (
         r["code"], r["slot"], "yes" if r["active"] else "no", "yes" if r["confirmed"] else "no",
-        md_cell(", ".join(r["countries"]) if r["countries"] else "—"), md_cell(r["body"] or "*(empty)*"), md_cell(r["note"] or "")))
+        md_cell(", ".join(r["countries"]) if r["countries"] else "—"),
+        md_cell(", ".join(r["capabilities"]) if r.get("capabilities") else "—"),
+        md_cell(r["body"] or "*(empty)*"), md_cell(r["note"] or "")))
 L.append("")
 
 L.append("## 6. What the sample execution produced")
@@ -320,7 +336,114 @@ L.append("API cost of that execution at $2 / $10 per MTok: **$%.4f** for %d lead
          % ((tin * 2 + tout * 10) / 1e6, len(used), tin, tout))
 L.append("")
 
+# ---- 7. follow-ups (Workflow 6, skill section 8) ----------------------------------------------------------
+FU = "followup0001"
+fu_row = json.loads(psql("n8n", "SELECT row_to_json(t) FROM (SELECT \"versionId\", active, \"activeVersionId\", \"updatedAt\", nodes "
+                                 "FROM workflow_entity WHERE id = '%s') t;" % FU))
+fu_nodes = {n["name"]: n for n in fu_row["nodes"]}
+fu_build = fu_nodes["Build Follow-Up"]["parameters"]["jsCode"]
+fu_assemble = fu_nodes["Assemble Follow-Up"]["parameters"]["jsCode"]
+fu_trigger = [n for n in fu_row["nodes"] if n["type"] == "n8n-nodes-base.scheduleTrigger"][0]
+FU_SYSTEM = json.loads(re.search(r"^const SYSTEM_PROMPT = (\".*\");$", fu_build, re.M).group(1))
+FU_REQUEST = json.loads(re.search(r"^const CLAUDE_REQUEST = (\{.*\});$", fu_build, re.M).group(1))
+fu_body = fu_assemble[fu_assemble.index("// Assemble Follow-Up -- n8n Code node"):]
+FU_TAGS = []
+for t in re.findall(r"flags\.push\('([a-z-]+)'\)", fu_body):
+    if t not in FU_TAGS:
+        FU_TAGS.append(t)
+FU_TAG_DOCS = {
+    "short": "follow-up #1 under FOLLOW_UP_1_MIN words (note + ask)",
+    "long": "follow-up #1 over FOLLOW_UP_1_MAX, or #2 over FOLLOW_UP_2_MAX words (note + ask)",
+    "fu-no-new-claim": "#1 did not add exactly one angle or benefit from the lines it was offered",
+    "fu-repeat": "#1's added claim is one the first email used (its codes) or made in other words (the model's first_email_covers)",
+    "fu-new-claim": "#2, the final note, added an angle or benefit",
+}
+fu_undoc = [t for t in FU_TAGS if t not in FU_TAG_DOCS and t not in TAG_DOCS]
+if fu_undoc:
+    sys.exit("the deployed Assemble Follow-Up pushes undocumented tags: %r -- add them to FU_TAG_DOCS" % fu_undoc)
+fu_ex = None
+for (eid,) in [(int(x),) for x in psql("n8n", "SELECT id FROM execution_entity WHERE \"workflowId\" = '%s' AND status = 'success' "
+                                               "ORDER BY id DESC LIMIT 20;" % FU).split()]:
+    e = json.loads(psql("n8n", "SELECT row_to_json(t) FROM (SELECT e.id, e.mode, e.\"startedAt\", e.\"workflowVersionId\", d.data "
+                               "FROM execution_entity e JOIN execution_data d ON d.\"executionId\" = e.id WHERE e.id = %d) t;" % eid))
+    rd = unflat(e["data"])["resultData"]["runData"]
+    if "Claude Follow-Up" in rd:
+        fu_ex, fu_run = e, rd
+        break
+fu_rules_ok = fu_assemble.find(assemble[:assemble.index("// Node body")]) != -1
+
+L.append("## 7. Follow-ups — Workflow 6, composed under the same rules")
+L.append("")
+L.append("Drafting skill v3 §8 (2026-10-02): a follow-up is no longer a template. Workflow `%s` (versionId `%s`, %s) "
+         "asks the same model for it, with the same request parameters, and checks it with the same rule functions."
+         % (FU, fu_row["versionId"], "published" if fu_row["active"] else "**not published** — publish it in the n8n UI"))
+L.append("")
+L.append("| | |")
+L.append("|---|---|")
+L.append("| Schedule | `%s` — %s |" % (fu_trigger["name"], json.dumps(fu_trigger["parameters"]["rule"]["interval"])))
+L.append("| Due | no reply %s days after the last send or follow-up; at most two follow-ups, then the lead is marked lost |"
+         % re.search(r'"name": "follow_up_days", "value": (\d+)', json.dumps(fu_nodes["Config"]["parameters"])).group(1))
+L.append("| Lengths (note + ask) | #1 %s–%s words; #2, the short final note, at most %s |" % (
+    js_const("FOLLOW_UP_1_MIN", fu_body), js_const("FOLLOW_UP_1_MAX", fu_body), js_const("FOLLOW_UP_2_MAX", fu_body)))
+L.append("| Claim rules | Assemble Follow-Up embeds the deployed Assemble Drafts' rule section verbatim: **%s** |"
+         % ("identical to drafting0001's" if fu_rules_ok else "DIFFERS from drafting0001's — rebuild and re-import both"))
+L.append("| Assemble Follow-Up code | sha256 `%s…` |" % sha(fu_assemble))
+L.append("")
+L.append("What it is offered: the first email exactly as sent (no greeting, opt-out or signature), the asks, the "
+         "country's proof line, and for #1 only the angles and benefits that email did not use — a benefit that shares a "
+         "capability with one it used is withheld too. Nothing else about the prospect reaches the model. A first email "
+         "written under an older claims list (leads 7, 91 and 104 were emailed under v2) cannot be read off its codes, so "
+         "the model reports which approved lines it already made (`first_email_covers`) and the added line is checked "
+         "against that.")
+L.append("")
+L.append("The fixed request part:")
+L.append("")
+L.append(fence(json.dumps(FU_REQUEST, indent=2, ensure_ascii=False), "json"))
+L.append("")
+L.append("The system prompt, exactly:")
+L.append("")
+L.append(fence(FU_SYSTEM))
+L.append("")
+L.append("Tags Assemble Follow-Up adds on top of the inherited ones (§4b: the ask, product-name, \"AI\", sponsor, claim, "
+         "area, link, repeat and unconfirmed rules all apply; `proof-missing` does not — a follow-up need not prove "
+         "anything again, but a deployment it names must be the lead's):")
+L.append("")
+L.append("| Tag | Fires when |")
+L.append("|---|---|")
+for t in FU_TAGS:
+    L.append("| `%s` | %s |" % (t, md_cell(FU_TAG_DOCS.get(t) or TAG_DOCS[t][1])))
+L.append("")
+if fu_ex:
+    fu_sent = [it["json"] for r in fu_run["Build Follow-Up"] for br in r["data"]["main"] for it in (br or []) if it["json"].get("request")]
+    fu_used = [it["json"] for r in fu_run["Assemble Follow-Up"] for br in r["data"]["main"] for it in (br or [])]
+    L.append("A real per-lead prompt, as sent — lead %s, follow-up #%s, from execution #%s (%s, %s, workflow version `%s`%s):"
+             % (fu_sent[0]["lead_id"], fu_sent[0]["follow_up"], fu_ex["id"], fu_ex["mode"], fu_ex["startedAt"],
+                fu_ex["workflowVersionId"], "" if fu_ex["workflowVersionId"] == fu_row["versionId"]
+                else " — an earlier version than the one described above; the system prompt and rules above are the "
+                     "deployed ones"))
+    L.append("")
+    L.append(fence(fu_sent[0]["request"]["messages"][0]["content"]))
+    L.append("")
+    L.append("| Lead | # | Words | Claims | First email covers (model) | Tags | Input tok | Output tok (thinking) |")
+    L.append("|---|---|---|---|---|---|---|---|")
+    for a in fu_used:
+        u = a.get("usage") or {}
+        L.append("| %s | %s | %s | %s | %s | %s | %s | %s (%s) |" % (
+            a["lead_id"], a.get("follow_up"), a.get("words"), ".".join(a.get("claims") or []),
+            ", ".join(a.get("first_email_covers") or []) or "—", ", ".join(a.get("flags") or []) or "—",
+            u.get("input_tokens"), u.get("output_tokens"), (u.get("output_tokens_details") or {}).get("thinking_tokens")))
+    fin = sum((a.get("usage") or {}).get("input_tokens") or 0 for a in fu_used)
+    fout = sum((a.get("usage") or {}).get("output_tokens") or 0 for a in fu_used)
+    L.append("")
+    L.append("API cost of that execution at $2 / $10 per MTok: **$%.4f** for %d follow-ups (%d input + %d output tokens)."
+             % ((fin * 2 + fout * 10) / 1e6, len(fu_used), fin, fout))
+else:
+    L.append("*No execution of `%s` has called the model yet.*" % FU)
+L.append("")
+
 with io.open(OUT, "w", encoding="utf-8", newline="\n") as fh:
     fh.write("\n".join(L) + "\n")
-print("wrote %s (%d lines) from %s version %s and execution #%s; %d tags documented; %d library rows"
-      % (OUT, len(L), WF, row["versionId"], ex["id"], len(TAGS), len(lib)))
+print("wrote %s (%d lines) from %s version %s and execution #%s; %d tags documented; %d library rows; "
+      "follow-ups from %s version %s%s"
+      % (OUT, len(L), WF, row["versionId"], ex["id"], len(TAGS), len(lib), FU, fu_row["versionId"],
+         (" and execution #%s" % fu_ex["id"]) if fu_ex else " (no model execution yet)"))

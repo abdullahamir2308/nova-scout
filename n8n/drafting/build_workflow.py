@@ -784,6 +784,9 @@ SYSTEM_PROMPT = "\n".join([
     "  2. Pain and stakes -- ONE angle from the approved list. Do not stack them.",
     "  3. What it does -- a description from the list the first time you mention it,",
     "     then one or two benefits. Not more.",
+    "     NO REPEATS: the description and the benefits must not repeat the same",
+    "     capability. Each line says what it is about; never use two lines that share",
+    "     one, and never restate in your own words what the description already said.",
     "  4. Proof -- the proof line you were given, matched to their country.",
     "  5. Ask -- exactly one, answerable with one word. It goes in the ask field; the",
     "     body before it asks for nothing.",
@@ -812,6 +815,9 @@ SYSTEM_PROMPT = "\n".join([
     "- naming any CRM, tool or integration",
     "- supported languages",
     "- any count of clients beyond the two named deployments",
+    "- saying it books calls or fills a calendar -- it sends the sponsor your booking",
+    "  link, and the sponsor books",
+    "- saying it answers from SOPs or from documents -- it answers from their website",
     "The stakes line is about the industry, not about us: \"a single sponsor inquiry",
     "can be a multi-million-dollar study\" is allowed; \"we will win you millions\" is not.",
     "",
@@ -894,7 +900,8 @@ SELECT l.id            AS lead_id,
        (SELECT coalesce(jsonb_agg(jsonb_build_object(
                   'code', k.code, 'slot', k.slot, 'body', btrim(k.body),
                   'countries', to_jsonb(k.countries), 'measured', k.measured,
-                  'confirmed', k.confirmed) ORDER BY k.code), '[]'::jsonb)
+                  'confirmed', k.confirmed, 'capabilities', to_jsonb(k.capabilities))
+                  ORDER BY k.code), '[]'::jsonb)
           FROM claims_library k
          WHERE k.active)                  AS library,
        (SELECT (((now() AT TIME ZONE 'Asia/Karachi')::date
@@ -1269,7 +1276,8 @@ nodes = [
             "(none in warm-up weeks 1-2, then only the library's link line), the product name at most "
             "once and in brackets, \"AI\" at most once, never \"You're sponsoring\", no guarantee, "
             "no number the claims and facts do not hold, no visitor identification, no named CRM or "
-            "tool, no languages, the geography-matched proof, subject rules, grounding, and every "
+            "tool, no languages, never that it books a call or answers from SOPs, no two claim lines "
+            "that repeat a capability, the geography-matched proof, subject rules, grounding, and every "
             "claim code checked against what the lead was offered.\n\n"
             "The opt-out sentence and the signature are appended HERE, not generated. Section 5 "
             "locks the opt-out verbatim and makes it the basis of the GDPR/KVKK legitimate-"

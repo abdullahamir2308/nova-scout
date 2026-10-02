@@ -21,14 +21,21 @@ calls the PROSPECT a sponsor, and any leftover "pharma team".
 
 What it checks
   A  the one-pager: no placeholders or internal notes; "sponsor" for the client,
-     no "pharma team", nothing calling the reader a sponsor
+     no "pharma team", nothing calling the reader a sponsor; and the three claims
+     settled on 2026-10-02 (migration 013): no SOPs or client documents as the
+     knowledge source, Nova never books a call itself, no "new dashboard" line
   B  the library: v3 slots only; no active line calls the prospect a sponsor,
-     says "pharma team", or makes a seconds-level claim
+     says "pharma team", makes a seconds-level claim, or breaks a settled claim;
+     every description and benefit line names its capabilities
   C  every active line's claims against the one-pager text (CLAIMS, below)
-  D  each live draft: never calls the prospect a sponsor, no "pharma team", the
-     claim codes it records are live library lines, the word ceiling
+  D  each live draft: never calls the prospect a sponsor, no "pharma team", no
+     settled claim broken, the claim codes it records are live library lines,
+     no two of them repeat a capability, the word ceiling
   E  each lead's live drafts against the drafts they replaced
   F  queue integrity
+  G  each live follow-up draft (skill section 8): the same text checks as D, its
+     codes live, no repeated capability, and its length (#1 40-70, #2 <= 40,
+     read from code_followup_assemble.js)
 
 Keeping the claim map current. CLAIMS maps each active library line to pairs of
 (phrase in the line, evidence in the one-pager). It is validated against the
@@ -92,6 +99,39 @@ PROSPECT_SPONSOR = [
     re.compile(r"\byour (?:own )?(?:sponsored|sponsorship)\b", re.I),
 ]
 PHARMA_TEAM = re.compile(r'\bpharma[- ]teams?\b', re.I)
+# The claims settled on 2026-10-02 against the Nova Agent Kit code (migration 013): Nova
+# answers from the CRO's website, never from SOPs or documents a client provides; it sends
+# the booking link and the sponsor books; and it has its own dashboard. The same patterns
+# code_assemble.js tags `claim-sop` / `claim-books` with, plus the dropped BEN-ROUTE clause.
+SETTLED = [
+    ('SOPs or client documents as the source', re.compile(
+        r"\bSOPs?\b|\bstandard operating procedures?\b|\b(?:your|their)\s+(?:own\s+)?(?:documents|documentation)\b", re.I)),
+    ('Nova booking a call itself', re.compile(
+        r"\bbooks\s+(?:the\s+|a\s+|qualified\s+|sponsor\s+)?(?:calls?|meetings?|demos?)\b|"
+        r"\b(?:into|onto|straight into)\s+your\s+(?:calendar|diary)\b|\bschedules\s+(?:the\s+|a\s+)?(?:calls?|meetings?)\b", re.I)),
+    ('"not in another dashboard" / "new dashboard"', re.compile(
+        r"\b(?:not|n't)\s+(?:in|force)\s+(?:another|a new)\s+dashboard\b|\bno new dashboard\b", re.I)),
+]
+
+
+def settled_breaks(text):
+    return [label for label, pat in SETTLED if pat.search(text or '')]
+
+
+def followup_limits():
+    """The follow-up lengths Assemble Follow-Up enforces, read from the shipped source."""
+    with io.open(os.path.join(HERE, '..', 'sendtrack', 'code_followup_assemble.js'), encoding='utf-8') as fh:
+        src = fh.read()
+    vals = {}
+    for name in ('FOLLOW_UP_1_MIN', 'FOLLOW_UP_1_MAX', 'FOLLOW_UP_2_MAX'):
+        m = re.search(r'const %s = (\d+);' % name, src)
+        if not m:
+            raise SystemExit('const %s not found in code_followup_assemble.js -- this script needs updating' % name)
+        vals[name] = int(m.group(1))
+    return vals
+
+
+FU_LIMITS = followup_limits()
 
 
 def calls_prospect_sponsor(text):
@@ -162,7 +202,7 @@ OP_PARAS = [''.join((e.text or '') for e in p.iter(W + 't')) for p in root.iter(
 OP_PARAS = [p for p in OP_PARAS if p.strip()]
 OP = '\n'.join(OP_PARAS)
 OPN = norm(OP)
-lib = {r['code']: r for r in psql("SELECT row_to_json(t) FROM (SELECT code, slot, body, active, confirmed FROM claims_library) t;")}
+lib = {r['code']: r for r in psql("SELECT row_to_json(t) FROM (SELECT code, slot, body, active, confirmed, capabilities FROM claims_library) t;")}
 active = {c: r for c, r in lib.items() if r['active']}
 FIRST_TOUCH = "coalesce(d.variant,'') NOT LIKE 'follow-up-%' AND coalesce(d.variant,'') NOT LIKE 'low-context%'"
 LIVE_SQL = ("SELECT row_to_json(t) FROM (SELECT d.id, d.lead_id, l.country, d.channel, d.status, d.variant, d.subject, d.body, d.edited_body "
@@ -171,6 +211,10 @@ HISTORY_SQL = ("SELECT row_to_json(t) FROM (SELECT d.id, d.lead_id, d.channel, d
                "WHERE " + FIRST_TOUCH + " ORDER BY d.id) t;")
 live = psql(LIVE_SQL)
 history = psql(HISTORY_SQL)
+FOLLOWUP_SQL = ("SELECT row_to_json(t) FROM (SELECT d.id, d.lead_id, l.country, d.status, d.variant, d.subject, d.body, d.edited_body "
+                "FROM drafts d JOIN leads l ON l.id = d.lead_id WHERE d.status IN ('pending','approved') "
+                "AND d.variant LIKE 'follow-up-%' ORDER BY d.lead_id, d.id) t;")
+followups = psql(FOLLOWUP_SQL)
 for d in live:
     d['sendable'] = d['edited_body'] or d['body']      # what Workflow 6 would send
     d['human_edited'] = bool(d['edited_body'])
@@ -193,6 +237,9 @@ pharma_op = PHARMA_TEAM.findall(OP)
 check('no "pharma team" left in the one-pager (v3: the client is a "sponsor")', not pharma_op,
       '%d occurrence(s)' % len(pharma_op) if pharma_op else '0 occurrences')
 check('the one-pager never calls the reader a sponsor', not calls_prospect_sponsor(OP), str(calls_prospect_sponsor(OP)))
+for label, pat in SETTLED:
+    hits = [m.group(0) for m in pat.finditer(OP)]
+    check('the one-pager makes no settled-wrong claim: %s' % label, not hits, str(hits) if hits else '')
 print('       "sponsor" (the client) in the one-pager: %d occurrence(s)' % len(re.findall(r'\bsponsor\w*', OP, re.I)))
 
 # ============================================================================================================
@@ -208,6 +255,12 @@ for code in sorted(active):
 check('no ACTIVE line calls the prospect a sponsor', not any(calls_prospect_sponsor(r['body']) for r in active.values()))
 check('no ACTIVE line says "pharma team"', not any(PHARMA_TEAM.search(r['body'] or '') for r in active.values()))
 check('no ACTIVE line makes a seconds-level claim ("second(s)")', not any(re.search(r'\bseconds?\b', r['body'] or '', re.I) for r in active.values()))
+broken = sorted((c, settled_breaks(r['body'])) for c, r in active.items() if settled_breaks(r['body']))
+check('no ACTIVE line breaks a claim settled on 2026-10-02 (SOPs, Nova booking, "another dashboard")', not broken,
+      str(broken) if broken else '')
+nocaps = sorted(c for c, r in active.items() if r['slot'] in ('description', 'benefit') and not r.get('capabilities'))
+check('every active description and benefit line names its capabilities (migration 013)', not nocaps,
+      str(nocaps) if nocaps else '%d lines' % len([1 for r in active.values() if r['slot'] in ('description', 'benefit')]))
 unconf = sorted(c for c, r in active.items() if not r['confirmed'])
 print('       active lines not yet confirmed by a human: %d of %d%s' % (len(unconf), len(active), (' (%s)' % ', '.join(unconf)) if unconf else ''))
 
@@ -219,21 +272,21 @@ print('=' * 92)
 CLAIMS = {
     'D1': [('ai assistant for your website', 'ai agent for your website'), ('qualified leads', 'qualified leads')],
     'D2': [('for your website', 'for your website'), ('answers sponsors', 'it answers sponsor questions'),
-           ('qualifies them', 'qualifies the inquiry'), ('books the call', 'book a call')],
+           ('qualifies them', 'qualifies the inquiry'), ('sends them your booking link', 'a link to book a call')],
     'ANG-HOURS': [('11pm', '11pm'), ('until morning', 'the next morning'), ('next cro', 'next cro on their list')],
     'ANG-SILENT': [],    # a question; asserts nothing about Nova
     'ANG-STAKES': [],    # an industry fact, not a Nova result (skill section 4)
     'ANG-SPEED': [],     # an industry observation
     'ANG-TIME': [('bd time', 'bd time goes to sponsors'), ('not to sorting every inquiry', 'to their own flows')],
-    'BEN-247': [('your own sops and service pages', 'your own sops service pages'), ('in real time', 'in real time'),
+    'BEN-247': [('from your own website', 'trained on your own website'), ('in real time', 'in real time'),
                 ('at any hour', 'at any hour')],
     'BEN-CAPTURE': [('named lead', 'captured lead'),
                     ('company contact therapeutic area and study phase', 'company contact therapeutic area and study phase')],
     'BEN-BRIEF': [('therapeutic area and study phase', 'therapeutic area and study phase'),
                   ('before your first call', 'your first call starts with the basics')],
-    'BEN-BOOK': [('book a call', 'book a call')],
-    'BEN-ROUTE': [('where your team already works', 'wherever your team already works'),
-                  ('not in another dashboard', "doesn't force a new dashboard")],
+    'BEN-BOOK': [('sends qualified sponsors your booking link', 'offers a qualified sponsor a link to book a call'),
+                 ('book a call with your team', 'book a call with your team')],
+    'BEN-ROUTE': [('where your team already works', 'wherever your team already works')],
     'BEN-SEE': [('every sponsor lead it captured', 'every captured lead'),
                 ('any question it passed to your team', 'every question it passed to your team')],
     'BEN-DECK': [('capabilities deck', 'capabilities deck'), ('the moment a sponsor asks for it', 'any visitor who asks for it')],
@@ -247,12 +300,10 @@ CLAIMS = {
 # Semantic caveats the phrase table cannot settle -- each a judgement about one line, from the
 # 2026-10-02 code reading. Prune an entry when its line changes.
 CAVEATS = {
-    'D2': '"books the call": Nova offers a booking link (CALENDLY_BOOKING_URL) after capture; it does not book.',
-    'BEN-BOOK': '"straight into your calendar": the one-pager says "a link to book a call"; the code offers the link only when set.',
-    'BEN-247': '"SOPs": the one-pager says SOPs too, but the only live knowledge base is the crawled website.',
-    'BEN-ROUTE': '"not in another dashboard": Nova also has its own leads dashboard (BEN-SEE).',
+    'D2': '"sends them your booking link": only when the deployment sets CALENDLY_BOOKING_URL.',
+    'BEN-BOOK': '"your booking link": only when the deployment sets CALENDLY_BOOKING_URL.',
     'BEN-DECK': '"the moment a sponsor asks": the deck goes out once the visitor gives an email address.',
-    'A2': '"Reply yes and I\'ll set it up" skips the one-pager\'s step "You share your site URL and any service documentation".',
+    'A2': '"Reply yes and I\'ll set it up" skips the one-pager\'s step "You share your site URL".',
 }
 unmapped = sorted(c for c, r in active.items() if r['slot'] in ('description', 'angle', 'benefit', 'proof', 'ask') and c not in CLAIMS)
 check('every active line has a claim-map entry (else this table is stale)', not unmapped, str(unmapped) if unmapped else '%d lines mapped' % len([c for c in CLAIMS if c in active]))
@@ -299,6 +350,19 @@ over_list = []
 prospect_sponsor_drafts = []
 pharma_drafts = []
 dead_codes = []
+settled_drafts = []
+repeat_drafts = []
+
+
+def repeats(codes):
+    """Two claim codes that share a capability (skill v3 section 3, No repeats)."""
+    seen, out = {}, []
+    for c in codes:
+        for cap in (lib.get(c, {}).get('capabilities') or []):
+            if cap in seen and seen[cap] != c:
+                out.append('%s+%s:%s' % (seen[cap], c, cap))
+            seen[cap] = c
+    return out
 if not live:
     print('       no live first-touch drafts in the queue -- sections D and E have nothing to audit')
 else:
@@ -317,6 +381,10 @@ for d in live:
     gone = [c for c in used if c not in active]
     if gone:
         dead_codes.append((d['id'], gone))
+    if settled_breaks(text):
+        settled_drafts.append((d['id'], settled_breaks(text)))
+    if repeats(used):
+        repeat_drafts.append((d['id'], repeats(used)))
     if wc > CEILING:
         over_list.append(d)
     print(hdr % (d['id'], d['lead_id'], d['channel'], d['status'], '.'.join(used), wc, 'OVER' if wc > CEILING else 'ok',
@@ -328,6 +396,10 @@ if live:
     check('every claim code a draft records is an active library line', not dead_codes,
           str(dead_codes) if dead_codes else '')
     check('no draft mentions the recording', not any(re.search(r'recording|90-second', d['sendable'], re.I) for d in live))
+    check('no draft breaks a claim settled on 2026-10-02 (SOPs, Nova booking, "another dashboard")', not settled_drafts,
+          str(settled_drafts) if settled_drafts else '0 of %d drafts' % len(live))
+    check('no draft\'s claim codes repeat a capability (skill v3 section 3)', not repeat_drafts,
+          str(repeat_drafts) if repeat_drafts else '0 of %d drafts' % len(live))
     check('every draft is within the %d-word ceiling' % CEILING, not over_list,
           '; '.join('draft %s = %d words' % (d['id'], d['words']) for d in over_list) if over_list else '%d of %d within' % (len(live), len(live)))
 
@@ -364,6 +436,52 @@ for d in live:
     dupes.setdefault((d['lead_id'], d['channel']), []).append(d['id'])
 dupes = {k: v for k, v in dupes.items() if len(v) > 1}
 check('at most one live (pending or approved) first-touch draft per lead and channel', not dupes, str(dupes) if dupes else '')
+
+# ============================================================================================================
+print('\n' + '=' * 92)
+print('G. THE LIVE FOLLOW-UP DRAFTS  (skill v3 section 8; the new note only -- the quoted first email was already sent)')
+print('=' * 92)
+
+
+def followup_note(body):
+    """The new text: after the greeting, before the opt-out (the quoted first email comes after the signature)."""
+    paras = (body or '').replace('\r\n', '\n').split('\n\n')[1:]
+    out = []
+    for p in paras:
+        if p.startswith("If this isn't relevant"):
+            break
+        out.append(p)
+    return ' '.join(out)
+
+
+fu_bad = []
+if not followups:
+    print('       no live follow-up drafts in the queue')
+else:
+    print('  %-4s %-4s %-8s %-28s %-5s %s' % ('id', 'lead', 'status', 'claims recorded in variant', 'words', 'tags'))
+for d in followups:
+    note = followup_note(d['edited_body'] or d['body'])
+    n = int(re.match(r'follow-up-(\d+)', d['variant']).group(1))
+    used = [c for c in (d['variant'].split('/', 1)[1].split('+', 1)[0].split('.') if '/' in d['variant'] else []) if c]
+    wc = words(note)
+    lo, hi = (FU_LIMITS['FOLLOW_UP_1_MIN'], FU_LIMITS['FOLLOW_UP_1_MAX']) if n == 1 else (0, FU_LIMITS['FOLLOW_UP_2_MAX'])
+    problems = []
+    if calls_prospect_sponsor(note):
+        problems.append('calls the prospect a sponsor')
+    if PHARMA_TEAM.search(note):
+        problems.append('"pharma team"')
+    problems += settled_breaks(note)
+    problems += ['dead code %s' % c for c in used if c not in active]
+    problems += ['repeat %s' % r for r in repeats(used)]
+    if not lo <= wc <= hi:
+        problems.append('%d words, outside %d-%d' % (wc, lo, hi))
+    if problems:
+        fu_bad.append((d['id'], problems))
+    print('  %-4s %-4s %-8s %-28s %-5s %s' % (d['id'], d['lead_id'], d['status'], '.'.join(used), wc,
+                                             ','.join(tags_of(d['variant'])) or '-'))
+if followups:
+    check('every live follow-up: no prospect-sponsor, no "pharma team", no settled claim broken, live codes, '
+          'no repeated capability, within its length', not fu_bad, str(fu_bad) if fu_bad else '%d of %d' % (len(followups), len(followups)))
 
 print('\n' + '=' * 92)
 print('THE THREE CONFIRMATIONS')

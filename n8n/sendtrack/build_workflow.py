@@ -18,6 +18,9 @@ parsed out of the Master Ref and asserted here rather than retyped:
     Section 5   URL cap                       -> code_decide.js
     Section 5+9 opt-out keywords              -> code_classify_reply.js (both statements must agree)
     Section 9   follow-up delay and maximum   -> follow-up SQL + code_decide.js + code_followup.js
+    Section 3   drafting model and effort     -> the follow-up composition request
+    Skill §8    follow-up lengths             -> code_followup.js + code_followup_assemble.js + the prompt
+    Skill §3    claim rules                   -> Assemble Follow-Up embeds drafting's code_assemble.js rules
     Section 12  geographies                   -> COUNTRY_CLOCKS keys (a country with no clock cannot ship)
     Section 6   LinkedIn is manual            -> every send query filters channel='email'
     Section 8   outreach_log / drafts columns -> what the INSERTs may touch
@@ -48,6 +51,13 @@ MASTER_REF = os.environ.get(
     "NOVASCOUT_MASTER_REF", os.path.join(HERE, "..", "..", "NovaScout_MasterRef.md")
 )
 COMPOSE = os.environ.get("NOVASCOUT_COMPOSE", os.path.join(HERE, "..", "..", "docker-compose.yml"))
+# Drafting skill v3 section 8: follow-ups are composed under the first touch's
+# rules. The skill's section 8 numbers are parsed from here, and the rule
+# functions are drafting's own code_assemble.js, embedded verbatim.
+SKILL = os.environ.get(
+    "NOVASCOUT_DRAFTING_SKILL", os.path.join(HERE, "..", "..", "NovaScout_DraftingSkill.md")
+)
+DRAFTING_DIR = os.environ.get("NOVASCOUT_DRAFTING_DIR", os.path.join(HERE, "..", "drafting"))
 ENV_FILE = os.environ.get("NOVASCOUT_ENV_FILE", os.path.join(HERE, "..", "..", ".env"))
 VARIANTS_OUT = os.environ.get("SENDTRACK_VARIANTS_OUT", "")
 DRYRUN_NOW = os.environ.get("SENDTRACK_DRYRUN_NOW", "")
@@ -221,6 +231,52 @@ def load_follow_up(doc):
     return int(m.group(1)), _number(n.group(1), "follow-up maximum")
 
 
+def load_followup_rules(skill):
+    """Drafting skill v3 section 8: follow-up #1 is N-M words; #2, the short
+    final note, at most K. Parsed, so the prompt and the check say the skill's
+    numbers."""
+    m1 = re.search(r"\*\*Follow-up #1\.\*\* (\d+)[–-](\d+) words", skill)
+    if not m1:
+        raise AssertionError("follow-up #1 length not found in %s -- expected '**Follow-up #1.** N-M words'" % SKILL)
+    m2 = re.search(r"\*\*Follow-up #2[^*]*\*\* At most (\d+) words", skill)
+    if not m2:
+        raise AssertionError("follow-up #2 length not found in %s -- expected '**Follow-up #2 ...** At most N words'"
+                             % SKILL)
+    if not re.search(r"Add one angle or benefit from §4 that the first email did not use", skill):
+        raise AssertionError("follow-up #1's rule 'Add one angle or benefit from §4 that the first email did not use' "
+                             "not found in %s -- the new-claim check depends on it" % SKILL)
+    return int(m1.group(1)), int(m1.group(2)), int(m2.group(1))
+
+
+def load_skill_banned_adjectives(skill):
+    m = re.search(r"No banned adjectives \(([^)]+)\)", skill)
+    if not m:
+        raise AssertionError("banned adjectives not found in %s -- expected 'No banned adjectives (a, b, ...)'" % SKILL)
+    return [a.strip().lower() for a in m.group(1).split(",") if a.strip()]
+
+
+def load_drafting_model(doc):
+    """Section 3: the drafting model and effort. The follow-ups are composed by
+    the drafting model (skill section 8), with the same request parameters."""
+    m = re.search(r"\*\*Drafting model: `([a-z0-9-]+)`\*\*, effort `(low|medium|high|xhigh|max)`", doc)
+    if not m:
+        raise AssertionError("drafting model not found in Section 3 of %s -- expected '**Drafting model: `id`**, "
+                             "effort `level`'" % MASTER_REF)
+    return m.group(1), m.group(2)
+
+
+def load_therapeutic_areas(doc):
+    """Section 9's locked taxonomy. Duplicated from the drafting and scoring
+    generators on purpose: the stages must be able to fail independently."""
+    anchor = re.search(r"\*\*Therapeutic area taxonomy[^\n]*\*\*", doc)
+    if not anchor:
+        raise AssertionError("taxonomy section not found in %s" % MASTER_REF)
+    block = re.search(r"\n```\n(.*?)\n```", doc[anchor.end():], re.S)
+    if not block:
+        raise AssertionError("no fenced list follows the taxonomy heading in %s" % MASTER_REF)
+    return [ln.strip() for ln in block.group(1).splitlines() if ln.strip()]
+
+
 def load_geographies(doc):
     m = re.search(r"\*\*Geographies:\*\*\s*([^\n]+)", doc)
     if not m:
@@ -303,6 +359,11 @@ HEALTH_PROBLEMS = load_health_problems(DOC)
 HEALTH_INTERVAL_MIN = load_health_interval(DOC)
 COMPOSE_TEXT = _read(COMPOSE)
 SENDER_ZONE, SENDER_OFFSET = load_sender_offset(COMPOSE_TEXT)
+SKILL_DOC = _read(SKILL)
+FU1_MIN, FU1_MAX, FU2_MAX = load_followup_rules(SKILL_DOC)
+SKILL_BANNED = load_skill_banned_adjectives(SKILL_DOC)
+DRAFT_MODEL, DRAFT_EFFORT = load_drafting_model(DOC)
+THERAPEUTIC_AREAS = load_therapeutic_areas(DOC)
 
 
 # ---------------------------------------------------------------------------
@@ -374,18 +435,58 @@ def _assert_classify_matches_spec():
         "Every reply quotes it -- if the strip misses, every reply reads as an opt-out.")
 
 
+# Drafting skill v3 section 8: follow-ups are composed "under every rule above".
+# Assemble Follow-Up is drafting's code_assemble.js -- everything above its
+# "Node body" marker, verbatim -- followed by code_followup_assemble.js. The
+# follow-up body calls these; each must be defined there, or the node fails
+# at runtime on the first follow-up.
+RULES_FILE = os.path.join(DRAFTING_DIR, "code_assemble.js")
+RULES_USED = ["str", "fold", "words", "cleanText", "unique", "jaccard", "bannedAdjectivesIn", "askFlags",
+              "productFlags", "aiFlags", "prospectSponsor", "claimFlags", "absentAreasNamed", "proofFlags",
+              "linkFlags", "repeatFlags"]
+RULES_CONSTS = ["OPT_OUT", "MERGE_TAG", "LINK_FREE_WEEKS", "SLOT_ORDER", "DEPLOYMENTS", "BANNED_ADJECTIVES"]
+
+
+def load_rules_js():
+    src = _read(RULES_FILE)
+    at = src.find("// Node body")
+    assert at != -1, "%s has no '// Node body' marker -- the follow-ups embed everything above it" % RULES_FILE
+    rules = src[:at]
+    missing = [f for f in RULES_USED if not re.search(r"^function %s\(" % f, rules, re.M)]
+    missing += [c for c in RULES_CONSTS if not re.search(r"^const %s = " % c, rules, re.M)]
+    assert not missing, (
+        "Assemble Follow-Up calls %r, which drafting's code_assemble.js no longer defines above its "
+        "'Node body' marker. The follow-ups run the first touch's claim rules; restore them there." % missing)
+    assert "$(" not in rules and "$input" not in rules and "__" not in re.sub(r"//.*", "", rules), (
+        "the rules section of %s reads n8n data or holds a build placeholder -- node-body code has moved "
+        "above the 'Node body' marker" % RULES_FILE)
+    return rules
+
+
+RULES_JS = load_rules_js()
+
+
 def _assert_followup_matches_spec():
     src = js("code_followup.js")
     assert _js_string(src, "OPT_OUT", "code_followup.js") == OPT_OUT, (
         "the opt-out sentence in code_followup.js is not Section 5's, VERBATIM.")
+    assert _js_string(RULES_JS, "OPT_OUT", "drafting's code_assemble.js") == OPT_OUT, (
+        "the opt-out sentence Assemble Follow-Up appends (drafting's code_assemble.js) is not Section 5's, "
+        "VERBATIM.")
     found = _js_int(src, "MAX_FOLLOW_UPS", "code_followup.js")
     assert found == MAX_FOLLOW_UPS, (
         "follow-up maximum drifted between Section 9 and code_followup.js:\n  doc: %d\n  js:  %d"
         % (MAX_FOLLOW_UPS, found))
-    lines = re.findall(r"^\s*(\d+): '", _js_block(src, "LINES", "code_followup.js"), re.M)
-    assert [int(n) for n in lines] == list(range(1, MAX_FOLLOW_UPS + 1)), (
-        "code_followup.js has templates for follow-ups %r; Section 9 allows exactly 1..%d"
-        % (lines, MAX_FOLLOW_UPS))
+    for name in ("code_followup.js", "code_followup_assemble.js"):
+        s = js(name)
+        found = (_js_int(s, "FOLLOW_UP_1_MIN", name), _js_int(s, "FOLLOW_UP_1_MAX", name),
+                 _js_int(s, "FOLLOW_UP_2_MAX", name))
+        assert found == (FU1_MIN, FU1_MAX, FU2_MAX), (
+            "the follow-up lengths drifted between the drafting skill (section 8) and %s:\n"
+            "  skill: #1 %d-%d words, #2 at most %d\n  js:    %r" % (name, FU1_MIN, FU1_MAX, FU2_MAX, found))
+    banned = [a.lower() for a in re.findall(r"'([^']+)'", _js_block(RULES_JS, "BANNED_ADJECTIVES", RULES_FILE))]
+    missing = [a for a in SKILL_BANNED if a not in banned]
+    assert not missing, "the drafting skill bans %r, which the embedded rules do not" % missing
 
 
 _assert_decide_matches_spec()
@@ -842,7 +943,15 @@ FOLLOWUP_DUE_SQL = """-- Find Due Follow-Ups -- Section 9: "if no reply after N 
 -- The clock restarts at the later of the last send and the last follow-up
 -- drafted, so a follow-up the reviewer rejected does not spawn the next one the
 -- same afternoon. A rejected follow-up still uses its slot: the reviewer
--- decided against it, and regenerating the same template would ask again.
+-- decided against it, and composing another would ask again.
+--
+-- Drafting skill v3 section 8: the follow-up is composed by the drafting model,
+-- so each due row also carries what Build Follow-Up needs for the request --
+-- the lead's country (its proof line), the first touch's variant (the claim
+-- codes it used, which a follow-up must not repeat), the ACTIVE claims library
+-- (read per run, like Workflow 4's batch query, so an operator's edit reaches
+-- the next follow-up with no rebuild), and the last follow-up that went out
+-- (follow-up #2 must not repeat it).
 WITH clk AS (
   SELECT coalesce(nullif($1, '')::timestamptz, now()) AS now
 ),
@@ -852,11 +961,18 @@ sends AS (
    WHERE o.channel = 'email' AND o.message_id IS NOT NULL
 ),
 first_touch AS (
-  SELECT DISTINCT ON (s.lead_id) s.lead_id, s.sent_at, s.message_body, d.subject
+  SELECT DISTINCT ON (s.lead_id) s.lead_id, s.sent_at, s.message_body, d.subject, d.variant
     FROM sends s
     JOIN drafts d ON d.id = s.draft_id
    WHERE coalesce(d.variant, '') NOT LIKE 'follow-up-%'
    ORDER BY s.lead_id, s.sent_at
+),
+last_follow_up AS (
+  SELECT DISTINCT ON (s.lead_id) s.lead_id, s.message_body
+    FROM sends s
+    JOIN drafts d ON d.id = s.draft_id
+   WHERE d.variant LIKE 'follow-up-%'
+   ORDER BY s.lead_id, s.sent_at DESC
 ),
 last_send AS (
   SELECT lead_id, max(sent_at) AS sent_at FROM sends GROUP BY lead_id
@@ -875,11 +991,22 @@ SELECT l.id                                                             AS lead_
        coalesce(fu.created, 0) + 1                                      AS next_follow_up,
        ft.subject                                                       AS first_subject,
        ft.message_body                                                  AS first_body,
+       ft.variant                                                       AS first_variant,
        __ISO_FIRST__                                                    AS first_sent_at,
-       __ISO_LAST__                                                     AS last_sent_at
+       __ISO_LAST__                                                     AS last_sent_at,
+       l.country                                                        AS country,
+       lf.message_body                                                  AS last_follow_up_body,
+       (SELECT coalesce(jsonb_agg(jsonb_build_object(
+                  'code', k.code, 'slot', k.slot, 'body', btrim(k.body),
+                  'countries', to_jsonb(k.countries), 'measured', k.measured,
+                  'confirmed', k.confirmed, 'capabilities', to_jsonb(k.capabilities))
+                  ORDER BY k.code), '[]'::jsonb)
+          FROM claims_library k
+         WHERE k.active)                                                AS library
   FROM leads l
   JOIN first_touch ft ON ft.lead_id = l.id
   JOIN last_send ls   ON ls.lead_id = l.id
+  LEFT JOIN last_follow_up lf ON lf.lead_id = l.id
   LEFT JOIN fu        ON fu.lead_id = l.id
   CROSS JOIN clk
  WHERE l.status = 'sent'
@@ -900,8 +1027,10 @@ SELECT l.id                                                             AS lead_
 
 FOLLOWUP_WRITE_SQL = """-- Write Follow-Up: insert the follow-up draft as 'pending' (the reviewer's
 -- queue), or mark the lead lost. Both guarded so a repeated run is a no-op: a
--- lead gets each follow-up variant at most once, and only a lead still at
--- 'sent' moves.
+-- lead gets each follow-up NUMBER at most once, and only a lead still at
+-- 'sent' moves. A composed follow-up's variant carries its claim codes and tags
+-- ('follow-up-1/BEN-DECK.A1+unconfirmed-claim'), and a template one from before
+-- 2026-10-02 is the bare 'follow-up-1', so the number is compared, not the variant.
 WITH p AS (
   SELECT $1::jsonb AS p
 ),
@@ -914,7 +1043,8 @@ ins AS (
      AND p.p->'draft'->>'channel' = 'email'
      AND NOT EXISTS (SELECT 1 FROM drafts d
                       WHERE d.lead_id = (p.p->>'lead_id')::bigint
-                        AND d.variant = p.p->'draft'->>'variant')
+                        AND regexp_replace(coalesce(d.variant, ''), '[/+].*$', '')
+                            = regexp_replace(p.p->'draft'->>'variant', '[/+].*$', ''))
      AND EXISTS (SELECT 1 FROM leads l WHERE l.id = (p.p->>'lead_id')::bigint AND l.status = 'sent')
   RETURNING id, variant
 ),
@@ -1200,8 +1330,24 @@ NOTIFY_EMAIL_READS = {"notify_to", "subject", "text"}
 _assert_js_emits("Notify Operator", NOTIFY_EMAIL_READS, _notify, "code_notify.js")
 _followup = js("code_followup.js")
 _assert_wired("Build Follow-Up (r.*)", _reads(_followup, "r"), final_select_aliases(FOLLOWUP_DUE_SQL), "Find Due Follow-Ups")
-_assert_js_emits("Write Follow-Up", _sql_payload_reads(FOLLOWUP_WRITE_SQL) |
-                 set(re.findall(r"p\.p->'draft'->>'(\w+)'", FOLLOWUP_WRITE_SQL)), _followup, "code_followup.js")
+# Skill v3 section 8: Build Follow-Up -> [Needs Model?] -> Claude Follow-Up ->
+# Assemble Follow-Up -> [Drop Failed Generations] -> Write Follow-Up, and the
+# mark-lost rows straight from Build Follow-Up to Write Follow-Up. Every
+# boundary, guarded.
+_fu_assemble = js("code_followup_assemble.js")
+FOLLOWUP_CLAUDE_READS = {"request"}
+FOLLOWUP_IF_READS = {"needs_model"}
+FOLLOWUP_FILTER_READS = {"write"}
+_assert_js_emits("Claude Follow-Up ($json.request) / Needs Model? ($json.needs_model)",
+                 FOLLOWUP_CLAUDE_READS | FOLLOWUP_IF_READS, _followup, "code_followup.js")
+_assert_js_emits("Assemble Follow-Up (src.*)", _reads(_fu_assemble, "src"), _followup, "code_followup.js")
+_assert_js_emits("Drop Failed Generations ($json.write)", FOLLOWUP_FILTER_READS, _fu_assemble,
+                 "code_followup_assemble.js")
+_fu_write_reads = _sql_payload_reads(FOLLOWUP_WRITE_SQL) | set(re.findall(r"p\.p->'draft'->>'(\w+)'", FOLLOWUP_WRITE_SQL))
+_assert_js_emits("Write Follow-Up (a composed follow-up)", _fu_write_reads | {"payload", "draft"}, _fu_assemble,
+                 "code_followup_assemble.js")
+_assert_js_emits("Write Follow-Up (mark-lost)", _sql_payload_reads(FOLLOWUP_WRITE_SQL) | {"payload", "draft"},
+                 _followup, "code_followup.js")
 
 # IMAP Health crosses two process boundaries before it reaches n8n -- the
 # pre-flight writes a JSON file, the checker serves it -- and both are guarded
@@ -1245,13 +1391,119 @@ def bake(name, **subs):
     return src
 
 
+# ---------------------------------------------------------------------------
+# The follow-up composition call -- drafting skill v3 section 8
+#
+# The drafting model (Section 3), with the drafting node's request parameters:
+# no temperature/top_p/top_k (a non-default value is a 400 on this model),
+# adaptive thinking by default, effort from Section 3, JSON through
+# output_config.format with a strict schema, max_tokens covering thinking plus
+# text. No prompt caching, for Workflow 4's measured reason: the HTTP node sends
+# a run's calls concurrently, so none reads another's cache.
+# ---------------------------------------------------------------------------
+
+ANTHROPIC_CRED = {"anthropicApi": {"id": "novascoutAnthropic01", "name": "Anthropic - Nova Scout drafting"}}
+
+FOLLOWUP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "body": {"type": "string"},
+        "ask": {"type": "string"},
+        "added_claim": {"type": "string"},
+        "claims": {"type": "array", "items": {"type": "string"}},
+        "first_email_covers": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["body", "ask", "added_claim", "claims", "first_email_covers"],
+    "additionalProperties": False,
+}
+_fu_fields = (re.findall(r"'(\w+)'", re.search(r"const FU_FIELDS = \[(.*?)\];", _fu_assemble).group(1))
+              + re.findall(r"'(\w+)'", re.search(r"const FU_LISTS = \[(.*?)\];", _fu_assemble).group(1)))
+assert sorted(_fu_fields) == sorted(FOLLOWUP_SCHEMA["required"]), (
+    "Assemble Follow-Up's FU_FIELDS/FU_LISTS do not match the follow-up schema:\n  schema: %r\n  js:     %r"
+    % (FOLLOWUP_SCHEMA["required"], _fu_fields))
+
+FOLLOWUP_REQUEST = {
+    "model": DRAFT_MODEL,
+    "max_tokens": 16000,
+    "output_config": {"effort": DRAFT_EFFORT, "format": {"type": "json_schema", "schema": FOLLOWUP_SCHEMA}},
+}
+
+FOLLOWUP_SYSTEM_PROMPT = "\n".join([
+    "You write one short follow-up email to a small contract research organisation (CRO) that has",
+    "not replied to a cold first email from " + SENDER_NAME + ". A person reviews it before anything is",
+    "sent.",
+    "",
+    "Each message gives you THE FIRST EMAIL exactly as it was sent, and APPROVED CLAIMS: the only",
+    "things you may say about what we built, the problem it solves, and who uses it. You may",
+    "rephrase a claim. You may never widen what it means.",
+    "",
+    "FOLLOW-UP #1:",
+    "- Open by referring back to the first email in a few words (\"Following up on my note about",
+    "  after-hours sponsor inquiries\"). Do not restate it.",
+    "- Add exactly ONE angle or benefit from the approved list that the first email did not use,",
+    "  and build the note around it. Never one whose point the first email already made.",
+    "- Then exactly one ask.",
+    "- The body plus the ask is %d-%d words." % (FU1_MIN, FU1_MAX),
+    "",
+    "FOLLOW-UP #2 -- a short final note:",
+    "- Say this is the last note, and restate the offer as the one ask. Add no new claim.",
+    "- The body plus the ask is at most %d words." % FU2_MAX,
+    "",
+    "THE PROSPECT: no new fact about them. The only facts are the ones the first email already",
+    "states. Never describe them as sponsoring anything -- in these emails \"sponsor\" means the",
+    "biotech, pharma, device or academic company that hires a CRO, their client. Never write the",
+    "company's name or a person's name.",
+    "",
+    "THE PRODUCT: the first email introduced it; refer back to it (\"the assistant\"), do not",
+    "describe it again and do not name it. Never call it a chatbot or a Q&A bot. The word \"AI\"",
+    "at most once. Never \"AI-powered\".",
+    "",
+    "NO REPEATS: the lines you use must not repeat the same capability -- each benefit says what it",
+    "is about -- and never restate in your own words a capability the first email already made.",
+    "",
+    "CLAIMS -- forbidden, all of them:",
+    "- guarantees (\"you'll never lose a sponsor\")",
+    "- any number, percentage or multiplier that is not in the approved claims or the first email",
+    "- claiming to identify anonymous website visitors",
+    "- naming any CRM, tool or integration",
+    "- supported languages",
+    "- any count of clients beyond the two named deployments",
+    "- saying it books calls or fills a calendar -- it sends the sponsor your booking link, and the",
+    "  sponsor books",
+    "- saying it answers from SOPs or from documents -- it answers from their website",
+    "A stakes line is about the industry, not about us.",
+    "",
+    "THE ASK: one question, from the ask lines, rephrased if you like. No links, no scheduling",
+    "link, no call length, no second question. The body before it asks for nothing.",
+    "",
+    "EVERYWHERE: plain text. No links of any kind, no bullets, no placeholders, no merge tags. No",
+    "greeting, no sign-off and no opt-out line -- all three are added afterwards. Never these",
+    "words: " + ", ".join(SKILL_BANNED) + ". No invented urgency, no flattery, no exclamation marks.",
+    "",
+    "Return JSON: body (everything before the ask, paragraphs separated by a blank line); ask;",
+    "added_claim (the code of the one angle or benefit you added, or \"\" for follow-up #2); claims",
+    "(the code of every approved claim the note used, the ask included); first_email_covers (the",
+    "codes of the approved angles and benefits whose point the first email already made).",
+])
+assert "%d-%d words" % (FU1_MIN, FU1_MAX) in FOLLOWUP_SYSTEM_PROMPT and "at most %d words" % FU2_MAX in FOLLOWUP_SYSTEM_PROMPT
+
+
 DECIDE_JS = bake("code_decide.js", SIGNATURE=SIGNATURE)
 CHECK_JS = bake("code_check_smtp.js", OWN_DOMAIN=OWN_DOMAIN)
 MIRROR_JS = bake("code_mirror_sent.js", OWN_DOMAIN=OWN_DOMAIN)
 CLASSIFY_JS = bake("code_classify_reply.js", OWN_DOMAIN=OWN_DOMAIN)
 DETECT_SIGNAL_JS = bake("code_detect_signal.js")
 NOTIFY_JS = bake("code_notify.js")
-FOLLOWUP_JS = bake("code_followup.js", SIGNATURE=SIGNATURE, SENDER_NAME=SENDER_NAME)
+FOLLOWUP_JS = bake("code_followup.js", SENDER_NAME=SENDER_NAME, FOLLOWUP_SYSTEM_PROMPT=FOLLOWUP_SYSTEM_PROMPT,
+                   CLAUDE_REQUEST=FOLLOWUP_REQUEST, THERAPEUTIC_AREAS=THERAPEUTIC_AREAS)
+assert '"model": "%s"' % DRAFT_MODEL in FOLLOWUP_JS, "the shipped follow-up request does not name %s" % DRAFT_MODEL
+# Drafting's rule functions, verbatim, then the follow-up node body.
+FOLLOWUP_ASSEMBLE_JS = (
+    "// Assemble Follow-Up -- generated by n8n/sendtrack/build_workflow.py.\n"
+    "// Part 1, verbatim: n8n/drafting/code_assemble.js above its 'Node body' marker -- the\n"
+    "// first touch's claim rules. Part 2: n8n/sendtrack/code_followup_assemble.js.\n\n"
+    + RULES_JS + "\n" + bake("code_followup_assemble.js", SIGNATURE=SIGNATURE, SENDER_NAME=SENDER_NAME)
+)
 HEALTH_JS = bake("code_health.js")
 
 
@@ -1489,13 +1741,20 @@ mailwatch_connections = {
 # Workflow: Follow-Ups
 # ---------------------------------------------------------------------------
 
+# Every due lead costs a paid Claude call now (skill section 8), so the batch is
+# bounded like Workflow 4's, not Workflow 3's.
 FOLLOWUP_CONFIG = {"now_override": "", "follow_up_days": FOLLOW_UP_DAYS, "max_follow_ups": MAX_FOLLOW_UPS,
-                   "batch_size": 25}
+                   "batch_size": 10}
+FOLLOWUP_TRIGGER = "Every 30 Minutes"
 
 followup_nodes = [
-    {"parameters": {"rule": {"interval": [{"field": "hours", "hoursInterval": 6}]}},
-     "name": "Every 6 Hours", "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2, "position": [-880, 40],
-     "notes": "Queue-driven: a missed run just means the next one finds more due (Section 7)."},
+    {"parameters": {"rule": {"interval": [{"field": "minutes", "minutesInterval": 30}]}},
+     "name": FOLLOWUP_TRIGGER, "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2, "position": [-880, 40],
+     "notes": ("Queue-driven: a missed run just means the next one finds more due (Section 7). Every 30 minutes, "
+               "not every 6 hours: the host is often up for only a few hours, and n8n's schedule trigger skips an "
+               "N-hour tick whose clock hour is less than N hours after the last run's clock hour -- it compares "
+               "hours of the day, not elapsed time. On 2026-10-02 that skipped the only tick in 9 days that found "
+               "follow-ups due. A 30-minute interval never enters that check (build guard below).")},
     {"parameters": {}, "name": "Manual Trigger", "type": "n8n-nodes-base.manualTrigger", "typeVersion": 1,
      "position": [-880, 220]},
     {
@@ -1515,18 +1774,59 @@ followup_nodes = [
             "Leads at 'sent', no reply, no bounce, not blocklisted, quiet for %d days: the next follow-up, or "
             "'lost' once %d have been used." % (FOLLOW_UP_DAYS, MAX_FOLLOW_UPS)),
     code_node("Build Follow-Up", FOLLOWUP_JS, "runOnceForAllItems", [-220, 130],
-              "A template, not a model call: a follow-up adds no fact about the lead. It carries the Section 5 "
-              "footer, so the send path accepts it once a human approves it."),
-    pg_node("Write Follow-Up", FOLLOWUP_WRITE_SQL, "={{ [JSON.stringify($json.payload)] }}", [0, 130],
+              "Drafting skill v3 section 8: a follow-up is composed by the drafting model under the first touch's "
+              "claim rules. This builds the request -- the first email as sent, and the approved claims it did not "
+              "use (a benefit sharing a capability with one it used is not offered either). No fact about the lead "
+              "reaches the model except the first email, so build rule 6 holds by construction. A mark-lost row "
+              "needs no model and goes straight to Write Follow-Up."),
+    if_node("Needs Model?", "needsmodel", "={{ $json.needs_model }}", [0, 130],
+            "true: a follow-up to compose. false: mark-lost, no model call."),
+    {
+        "parameters": {
+            "method": "POST",
+            "url": "https://api.anthropic.com/v1/messages",
+            "authentication": "predefinedCredentialType",
+            "nodeCredentialType": "anthropicApi",
+            "sendHeaders": True,
+            "headerParameters": {"parameters": [{"name": "anthropic-version", "value": "2023-06-01"}]},
+            "sendBody": True,
+            "specifyBody": "json",
+            "jsonBody": "={{ JSON.stringify($json.request) }}",
+            "options": {"timeout": 300000},
+        },
+        "name": "Claude Follow-Up", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [220, 30],
+        "credentials": ANTHROPIC_CRED, "onError": "continueRegularOutput", "retryOnFail": True, "maxTries": 2,
+        "waitBetweenTries": 5000,
+        "notes": ("%s through the Anthropic Messages API, effort %s (Section 3) -- the drafting model, with the "
+                  "drafting node's request parameters. The key is the n8n credential %s, never in this JSON. If "
+                  "the call fails nothing is written and the lead is due again next run: no fallback to the local "
+                  "model (skill section 6)." % (DRAFT_MODEL, DRAFT_EFFORT, ANTHROPIC_CRED["anthropicApi"]["id"])),
+    },
+    code_node("Assemble Follow-Up", FOLLOWUP_ASSEMBLE_JS, "runOnceForEachItem", [440, 30],
+              "Drafting's own claim rules (code_assemble.js above its 'Node body' marker, embedded verbatim) plus "
+              "skill section 8's: #1 is %d-%d words and adds exactly one angle or benefit the first email did not "
+              "use; #2 is at most %d words and adds none. Violations tag the variant. The greeting, the Section 5 "
+              "opt-out, the signature and the quoted first email are appended here, never generated -- the frame "
+              "the send path checks for." % (FU1_MIN, FU1_MAX, FU2_MAX)),
+    {
+        "parameters": {"conditions": boolean_condition("writable", "={{ $json.write }}"), "options": {}},
+        "name": "Drop Failed Generations", "type": "n8n-nodes-base.filter", "typeVersion": 2.2, "position": [660, 30],
+        "notes": "A failed Claude call writes nothing; the lead is due again on the next run.",
+    },
+    pg_node("Write Follow-Up", FOLLOWUP_WRITE_SQL, "={{ [JSON.stringify($json.payload)] }}", [880, 130],
             "Into drafts as 'pending' -- the review queue. Nothing follows up without a human."),
 ]
 
 followup_connections = {
-    "Every 6 Hours": edge("Config"),
+    FOLLOWUP_TRIGGER: edge("Config"),
     "Manual Trigger": edge("Config"),
     "Config": edge("Find Due Follow-Ups"),
     "Find Due Follow-Ups": edge("Build Follow-Up"),
-    "Build Follow-Up": edge("Write Follow-Up"),
+    "Build Follow-Up": edge("Needs Model?"),
+    "Needs Model?": branch("Claude Follow-Up", "Write Follow-Up"),
+    "Claude Follow-Up": edge("Assemble Follow-Up"),
+    "Assemble Follow-Up": edge("Drop Failed Generations"),
+    "Drop Failed Generations": edge("Write Follow-Up"),
 }
 
 # ---------------------------------------------------------------------------
@@ -1645,6 +1945,23 @@ for _nodes in (send_nodes, mailwatch_nodes, followup_nodes, health_nodes):
         if _n["type"] == "n8n-nodes-base.emailReadImap":
             assert _n["parameters"]["postProcessAction"] == "nothing", (
                 "%s would change the mailbox the operator reads." % _n["name"])
+        # n8n 2.35.7's Schedule Trigger (GenericFunctions.js recurrenceCheck) gates
+        # an hours, days or weeks interval > 1 on the CLOCK VALUE of the last run
+        # -- (hour - lastHour + 24) % 24 >= N -- not on elapsed time, and keeps
+        # that value across restarts in staticData. On a host that is up a few
+        # hours at a time, a tick that lands on the same clock hour as a run days
+        # earlier reads as "0 hours since" and is skipped: Follow-Ups' "Every 6
+        # Hours" stored hour 0 on 2026-09-23 and skipped its only tick in 9 days,
+        # at 00:00 PKT on 2026-10-02, with leads due. (Minutes and months are
+        # counted absolutely in that function, so they are safe.)
+        if _n["type"] == "n8n-nodes-base.scheduleTrigger":
+            for _iv in _n["parameters"]["rule"]["interval"]:
+                _field = _iv.get("field")
+                _ok = not (_field in ("hours", "days", "weeks") and int(_iv.get(_field + "Interval", 1)) > 1)
+                assert _ok, (
+                    "%s: schedule %r enters n8n's recurrenceCheck on a clock value (hour of day, day of year), "
+                    "not elapsed time -- on a host that sleeps, a due tick is silently skipped (Follow-Ups, "
+                    "2026-10-02). Use a minutes interval, or an interval of 1." % (_n["name"], _iv))
 
 _cfg = _config_values(send_nodes)
 assert _cfg["now_override"] == "", "the shipped Send workflow has a clock override set"
@@ -1728,6 +2045,10 @@ for _file, _wf in SHIPPED:
 # ---------------------------------------------------------------------------
 
 _DRY_CREDS = {"postgres": PG_DRY, "smtp": SMTP_DRY}
+# The Claude call has no side effect outside this machine but its cost: it reaches
+# no inbox, so a dry run keeps the real credential (a follow-up composed in a
+# dry run is a real API call).
+_DRY_KEEPS = {"anthropicApi"}
 
 
 def dry_variant(wf, wid, name, config_overrides, drop_nodes):
@@ -1740,6 +2061,8 @@ def dry_variant(wf, wid, name, config_overrides, drop_nodes):
         for kind in list(n.get("credentials", {})):
             if kind == "imap":
                 raise AssertionError("a dry-run variant must never carry the real IMAP credential")
+            if kind in _DRY_KEEPS:
+                continue
             n["credentials"] = dict(_DRY_CREDS[kind])
         if n["name"] == "Config":
             for a in n["parameters"]["assignments"]["assignments"]:
@@ -1809,9 +2132,9 @@ if VARIANTS_OUT:
 
     fu_wf = SHIPPED[2][1]
     dry_fu = dry_variant(fu_wf, "followup0001dry", "DRY RUN - Follow-Ups (scratch DB)",
-                         {"now_override": DRYRUN_NOW}, {"Every 6 Hours"})
+                         {"now_override": DRYRUN_NOW}, {FOLLOWUP_TRIGGER})
     got = _node_diff(fu_wf, dry_fu)
-    want = sorted([("Every 6 Hours", "removed"), ("Config", "config:now_override"),
+    want = sorted([(FOLLOWUP_TRIGGER, "removed"), ("Config", "config:now_override"),
                    ("Find Due Follow-Ups", "credentials"), ("Write Follow-Up", "credentials")])
     assert sorted(got) == want, "the dry-run Follow-Ups variant drifted: %r" % sorted(got)
     VARIANTS.append(("followups-dryrun.json", dry_fu))
@@ -1871,7 +2194,9 @@ print("  warm-up (Section 5): %s" % ", ".join("week %d%s=%d/day" % (w, "+" if i 
 print("  sender clock: %s (%+d min) -- the day the ceiling counts" % (SENDER_ZONE, SENDER_OFFSET))
 print("  geographies with a business-hours clock: %d (Section 12)" % len(GEOGRAPHIES))
 print("  opt-out keywords (Sections 5+9): %r" % OPT_OUT_KEYWORDS)
-print("  follow-ups (Section 9): after %d days, maximum %d" % (FOLLOW_UP_DAYS, MAX_FOLLOW_UPS))
+print("  follow-ups (Section 9): after %d days, maximum %d; composed by %s (effort %s) under drafting's rules, "
+      "#1 %d-%d words, #2 at most %d (skill section 8)" % (FOLLOW_UP_DAYS, MAX_FOLLOW_UPS, DRAFT_MODEL, DRAFT_EFFORT,
+                                                          FU1_MIN, FU1_MAX, FU2_MAX))
 print("  From: %s    own domain: %s" % (FROM_HEADER, OWN_DOMAIN))
 print("  signature checked on every body: %r" % SIGNATURE)
 print("  operator notification address: read at runtime from settings.operator_email "

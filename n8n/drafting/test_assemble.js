@@ -26,18 +26,27 @@ const withSignature = function (src) {
 
 const OPT_OUT = "If this isn't relevant, reply 'no' and I won't follow up.";
 
-// Claims as Assess Grounding hands them over: migration 012's seed, confirmed
-// here so a clean draft carries no tag at all, with the proof already resolved
-// for a Poland lead (NoblePath).
-function line(code, body, confirmed) {
-  return { code: code, body: body, confirmed: confirmed !== false };
+// Claims as Assess Grounding hands them over: migration 012's seed as migration
+// 013 left it (wording and capabilities), confirmed here so a clean draft
+// carries no tag at all, with the proof already resolved for a Poland lead
+// (NoblePath).
+function line(code, body, confirmed, capabilities) {
+  return { code: code, body: body, confirmed: confirmed !== false, capabilities: capabilities || [] };
 }
-const D1 = line('D1', 'an AI assistant for your website that turns sponsor inquiries into qualified leads');
+const D1 = line('D1', 'an AI assistant for your website that turns sponsor inquiries into qualified leads', true,
+  ['qualifies', 'captures-lead']);
+const D2 = line('D2', 'an AI intake assistant for your website that answers sponsors, qualifies them, and sends them your booking link',
+  true, ['answers', 'qualifies', 'booking-link']);
 const ANG_HOURS = line('ANG-HOURS', 'Sponsors often research CROs outside your working hours, frequently from another time zone. An inquiry sent at 11pm waits until morning, and by then they may have moved on to the next CRO.');
 const ANG_STAKES = line('ANG-STAKES', 'A single sponsor inquiry can be a multi-million-dollar study.');
 const ANG_SILENT = line('ANG-SILENT', 'How many sponsors visit your site and leave without ever contacting you?');
-const BEN_247 = line('BEN-247', 'It answers sponsors from your own SOPs and service pages, in real time, at any hour.');
-const BEN_FIT = line('BEN-FIT', "It's configured around your services and your process, not a template.");
+const BEN_247 = line('BEN-247', 'It answers sponsors from your own website, in real time, at any hour.', true, ['answers']);
+const BEN_FIT = line('BEN-FIT', "It's configured around your services and your process, not a template.", true, ['configured']);
+const BEN_BOOK = line('BEN-BOOK', 'It sends qualified sponsors your booking link, so they can book a call with your team.', true,
+  ['booking-link']);
+const BEN_CAPTURE = line('BEN-CAPTURE', 'A sponsor who shares their details becomes a named lead: company, contact, therapeutic area and study phase.',
+  true, ['captures-lead', 'study-details']);
+const BEN_BRIEF = line('BEN-BRIEF', 'It collects the therapeutic area and study phase before your first call.', true, ['study-details']);
 const PR_TR = line('PR-TR', "It's live at NoblePath, an oncology CRO in Türkiye.");
 const PR_BOTH = line('PR-BOTH', "It's live at two CROs, in Türkiye and Mexico.");
 const A1 = line('A1', 'Would a 48-hour demo built on your own material be worth a look? One word back is enough.');
@@ -407,6 +416,20 @@ t.check('"multilingual" is `claim-language`',
   has(emailFlags({ email_body: bodyWith('It is multilingual.') }), 'claim-language'), true);
 t.check('"chatbot" is `claim-chatbot`',
   has(emailFlags({ email_body: bodyWith('It is a chatbot for your site.') }), 'claim-chatbot'), true);
+// Settled 2026-10-02 (migration 013): Nova sends the booking link, the sponsor
+// books; and it answers from the website, never from SOPs or client documents.
+t.check('Nova booking the call is `claim-books`',
+  has(emailFlags({ email_body: bodyWith('It answers sponsors at any hour and books the call.') }), 'claim-books'), true);
+t.check('Nova filling a calendar is `claim-books`',
+  has(emailFlags({ email_body: bodyWith('Qualified sponsors land straight into your calendar.') }), 'claim-books'), true);
+t.check('BEN-BOOK as settled -- the sponsor books through the link -- is fine',
+  has(emailFlags({ email_body: bodyWith('It sends qualified sponsors your booking link, so they can book a call with your team.') }),
+    'claim-books'), false);
+t.check('SOPs as its source is `claim-sop`',
+  has(emailFlags({ email_body: bodyWith('It answers sponsors from your own SOPs and service pages at any hour.') }), 'claim-sop'), true);
+t.check('client documentation as its source is `claim-sop`',
+  has(emailFlags({ email_body: bodyWith('It answers sponsors from your own documentation at any hour.') }), 'claim-sop'), true);
+t.check('their website as its source is fine', has(CLEAN.email_flags, 'claim-sop'), false);
 t.check('banned adjectives from the skill are `adjective`',
   ['revolutionary', 'cutting-edge', 'innovative', 'game-changing', 'seamless'].map(function (a) {
     return has(emailFlags({ email_body: bodyWith('It is a ' + a + ' fit.') }), 'adjective');
@@ -496,8 +519,25 @@ t.check('a reported ask code is kept, not second-guessed',
 t.check('each message is judged on its own list -- a bad DM code does not tag the email',
   [has(emailFlags({ linkedin_claims: ['XX-1'] }), 'claim-code'), has(linkedinFlags({ linkedin_claims: ['XX-1'] }), 'claim-code')],
   [false, true]);
-const UNCONF = Object.assign({}, POOLS, { benefit: [line('BEN-247', BEN_247.body, false), BEN_FIT] });
+const UNCONF = Object.assign({}, POOLS, { benefit: [line('BEN-247', BEN_247.body, false, BEN_247.capabilities), BEN_FIT] });
 t.check('using an unconfirmed claim is `unconfirmed-claim`', has(emailFlags({}, { library_pools: UNCONF }), 'unconfirmed-claim'), true);
+// Skill v3 section 3, No repeats: the description and the benefits must not
+// repeat the same capability (claims_library.capabilities, migration 013).
+const BOTH_D = Object.assign({}, POOLS, { description: [D1, D2], benefit: [BEN_247, BEN_FIT, BEN_BOOK, BEN_CAPTURE, BEN_BRIEF] });
+t.check('D2 with BEN-247 repeats "answers": `claim-repeat`',
+  has(emailFlags({ email_claims: ['D2', 'ANG-HOURS', 'BEN-247', 'PR-TR', 'A1'] }, { library_pools: BOTH_D }), 'claim-repeat'), true);
+t.check('D2 with BEN-BOOK repeats "booking-link": `claim-repeat`',
+  has(emailFlags({ email_claims: ['D2', 'ANG-HOURS', 'BEN-BOOK', 'PR-TR', 'A1'] }, { library_pools: BOTH_D }), 'claim-repeat'), true);
+t.check('two benefits that share a capability are a repeat too (BEN-CAPTURE, BEN-BRIEF)',
+  has(emailFlags({ email_claims: ['D2', 'ANG-HOURS', 'BEN-CAPTURE', 'BEN-BRIEF', 'PR-TR', 'A1'] }, { library_pools: BOTH_D }), 'claim-repeat'), true);
+t.check('D2 with BEN-FIT says two different things: no tag',
+  has(emailFlags({ email_claims: ['D2', 'ANG-HOURS', 'BEN-FIT', 'PR-TR', 'A1'] }, { library_pools: BOTH_D }), 'claim-repeat'), false);
+t.check('D1 with BEN-247 and BEN-BOOK: no shared capability, no tag',
+  has(emailFlags({ email_claims: ['D1', 'ANG-HOURS', 'BEN-247', 'BEN-BOOK', 'PR-TR', 'A1'] }, { library_pools: BOTH_D }), 'claim-repeat'), false);
+t.check('judged per message: a DM that repeats tags the DM, not the email',
+  [has(emailFlags({ linkedin_claims: ['D2', 'BEN-247', 'PR-TR', 'A2'] }, { library_pools: BOTH_D }), 'claim-repeat'),
+   has(linkedinFlags({ linkedin_claims: ['D2', 'BEN-247', 'PR-TR', 'A2'] }, { library_pools: BOTH_D }), 'claim-repeat')],
+  [false, true]);
 t.check('an unconfirmed claim the model did not use is not',
   has(emailFlags({ email_claims: ['D1', 'ANG-HOURS', 'BEN-FIT', 'PR-TR', 'A1'] }, { library_pools: UNCONF }), 'unconfirmed-claim'), false);
 

@@ -11,8 +11,8 @@ the code and the docs disagree.
 
 ```
 python build_workflow.py        # regenerate the workflow JSON
-node   test_grounding.js        # 134 cases -- the grounding guard (v1's 75) + the v3 library, prompt and request
-node   test_assemble.js         # 130 cases -- response handling, assembly, every skill v3 section 3 rule
+node   test_grounding.js        # 140 cases -- the grounding guard (v1's 75) + the v3 library, prompt and request
+node   test_assemble.js         # 142 cases -- response handling, assembly, every skill v3 section 3 rule
 python test_drift_guards.py     # 55 cases -- each guard is made to fire
 python test_rule_mutations.py   # breaks every rule in turn; the unit suites must fail each time
 python audit_drafts_vs_onepager.py   # read-only: the live queue and library vs nova-one-pager.docx
@@ -53,6 +53,18 @@ policy, the product name at most once and in brackets, "AI" at most once, no
 "You're sponsoring", the forbidden claims (guarantees, numbers the library does
 not hold, visitor identification, named CRMs and tools, languages, "chatbot"),
 the geography-matched proof, the subject rules, and v2's grounding checks.
+Since 2026-10-02 (migration 013) also: never that Nova books a call (`claim-books`
+-- it sends the booking link, the sponsor books), never SOPs or client documents
+as its source (`claim-sop` -- it answers from the website), and **no repeats**:
+each description and benefit line names its `capabilities`, Assess Grounding
+tells the model which pairs share one (D2 with BEN-247 or BEN-BOOK), and a
+message whose claim codes repeat a capability is tagged `claim-repeat`.
+
+**The rules section is shared.** Workflow 6's follow-ups (`../sendtrack/`,
+skill section 8) embed everything in `code_assemble.js` above its `// Node body`
+marker, verbatim, so they run these same rule functions. Keep that section pure
+-- no `$(...)`, no `$input`, no build placeholder -- or the sendtrack build
+refuses.
 `DRAFTING_REVIEW.md` (repo root, generated from the deployed workflow) lists
 every tag and its pattern. `test_rule_mutations.py` breaks each rule in the
 source in turn and proves the unit suite fails.
@@ -202,10 +214,15 @@ nothing is invented to fill the gap.
 - **Every claim is unconfirmed.** Migration 012 seeded the v3 library with
   `confirmed=false`, so every draft carries `unconfirmed-claim` until a human
   confirms the lines. Read each row's `note` first: BEN-CAPTURE, BEN-BRIEF and
-  BEN-SEE were narrowed to the Nova Agent Kit code. D2, BEN-BOOK, BEN-247 and
-  BEN-ROUTE were seeded as written, with the question the code raised.
-- **The model favours D2** ("... and books the call"): 7 of 8 drafts on
-  2026-10-02. That is one of the lines the code reading questioned.
+  BEN-SEE were narrowed to the Nova Agent Kit code; D2, BEN-BOOK, BEN-247 and
+  BEN-ROUTE were settled by the operator on 2026-10-02 (migration 013: Nova sends
+  a booking link and does not book; it answers from the website, no SOPs; "not
+  in another dashboard" dropped).
+- **Drafts written before migration 013 still carry the old wording.** The
+  pending first-touch drafts of leads 7, 91 and 104 (89, 90, 93, 94, 95) say
+  "SOPs" / "books the call" and pair D2 with BEN-247; the audit fails on them.
+  Their emails can never send (`already-contacted`), but LinkedIn drafts 90 and
+  94 are sent by hand -- do not send them as they stand.
 - **A pattern check is a pattern check.** The claim rules catch the phrasings
   their patterns name (`DRAFTING_REVIEW.md` lists them). A forbidden claim worded
   some other way gets past them, and the human review is the backstop.
@@ -243,6 +260,13 @@ note.
    capabilities deck, the booking link, the dashboard. Each is worded to what
    the Nova Agent Kit code does, and several active claims cite them as
    evidence (`audit_drafts_vs_onepager.py`, section C).
+5. **The website is the only knowledge source** (settled 2026-10-02, migration
+   013): "Nova is trained on your own website", no SOPs, protocols or "service
+   documentation"; the 48-hour demo step is "You share your site URL" and "We
+   configure Nova specifically on your site content and service pages". The
+   Nova Agent Kit has no code path for documents a client provides.
+6. **No "new dashboard" line.** "Nova doesn't force a new dashboard into that"
+   was dropped with BEN-ROUTE's clause: Nova has its own leads dashboard.
 
 After regenerating, run `python audit_drafts_vs_onepager.py` before the file is
 served. It fails on a placeholder, on leftover "pharma team" wording, on anything calling

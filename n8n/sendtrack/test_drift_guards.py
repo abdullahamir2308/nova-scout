@@ -25,6 +25,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 MASTER_REF = os.path.join(REPO, "NovaScout_MasterRef.md")
 COMPOSE = os.path.join(REPO, "docker-compose.yml")
+# The follow-ups are composed under drafting skill v3 (section 8): the build
+# parses the skill and embeds drafting's code_assemble.js rules, so each case
+# gets its own copy of both.
+SKILL = os.path.join(REPO, "NovaScout_DraftingSkill.md")
+RULES = os.path.join(REPO, "n8n", "drafting", "code_assemble.js")
 
 PASSED = []
 FAILED = []
@@ -47,6 +52,8 @@ def run_build(tmp, env_overrides=None):
     env = dict(os.environ)
     env["NOVASCOUT_MASTER_REF"] = os.path.join(tmp, "MasterRef.md")
     env["NOVASCOUT_COMPOSE"] = os.path.join(tmp, "docker-compose.yml")
+    env["NOVASCOUT_DRAFTING_SKILL"] = os.path.join(tmp, "DraftingSkill.md")
+    env["NOVASCOUT_DRAFTING_DIR"] = os.path.join(tmp, "drafting")
     env["SENDTRACK_OUT"] = os.path.join(tmp, "out")
     # The real .env is out of every case unless a case brings its own file.
     env["NOVASCOUT_ENV_FILE"] = os.path.join(tmp, "no-such.env")
@@ -66,8 +73,17 @@ def run_build(tmp, env_overrides=None):
     return p.returncode, p.stderr.decode("utf-8", "replace")
 
 
-def setup(mutate_doc=None, mutate_compose=None, mutate_file=None):
+def setup(mutate_doc=None, mutate_compose=None, mutate_file=None, mutate_skill=None, mutate_rules=None):
     tmp = tempfile.mkdtemp(prefix="novascout-sendtrack-drift-")
+    for src, dst, fn, label in ((SKILL, "DraftingSkill.md", mutate_skill, "the skill"),
+                                (RULES, os.path.join("drafting", "code_assemble.js"), mutate_rules, "code_assemble.js")):
+        text = read(src)
+        if fn:
+            new = fn(text)
+            assert new != text, "mutation did not change %s" % label
+            text = new
+        os.makedirs(os.path.dirname(os.path.join(tmp, dst)), exist_ok=True)
+        write(os.path.join(tmp, dst), text)
     shutil.copytree(HERE, os.path.join(tmp, "sendtrack"),
                     ignore=shutil.ignore_patterns("__pycache__"))
     doc = read(MASTER_REF)
@@ -92,8 +108,9 @@ def setup(mutate_doc=None, mutate_compose=None, mutate_file=None):
     return tmp
 
 
-def case(label, expect_in, mutate_doc=None, mutate_compose=None, mutate_file=None, env_overrides=None):
-    tmp = setup(mutate_doc, mutate_compose, mutate_file)
+def case(label, expect_in, mutate_doc=None, mutate_compose=None, mutate_file=None, env_overrides=None,
+         mutate_skill=None, mutate_rules=None):
+    tmp = setup(mutate_doc, mutate_compose, mutate_file, mutate_skill, mutate_rules)
     try:
         rc, err = run_build(tmp, env_overrides)
         if rc == 0:
@@ -106,8 +123,8 @@ def case(label, expect_in, mutate_doc=None, mutate_compose=None, mutate_file=Non
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def positive(label, check, mutate_doc=None, env_overrides=None, files=None):
-    tmp = setup(mutate_doc)
+def positive(label, check, mutate_doc=None, env_overrides=None, files=None, mutate_skill=None):
+    tmp = setup(mutate_doc, mutate_skill=mutate_skill)
     try:
         for name, content in (files or {}).items():
             write(os.path.join(tmp, name), content)
@@ -188,8 +205,10 @@ case("the send path's opt-out sentence is paraphrased -> refuses", "VERBATIM",
      mutate_file=("code_decide.js", lambda s: s.replace("I won't follow up.", "I will not follow up.", 1)))
 case("the reply classifier strips a different sentence -> refuses", "strips out of replies",
      mutate_file=("code_classify_reply.js", lambda s: s.replace("I won't follow up.", "I will not follow up.", 1)))
-case("the follow-up template carries a different sentence -> refuses", "VERBATIM",
+case("Build Follow-Up carries a different opt-out sentence -> refuses", "VERBATIM",
      mutate_file=("code_followup.js", lambda s: s.replace("I won't follow up.", "I will not follow up.", 1)))
+case("the opt-out Assemble Follow-Up appends (drafting's rules) is paraphrased -> refuses", "VERBATIM",
+     mutate_rules=lambda s: s.replace("I won't follow up.", "I will not follow up.", 1))
 case("the doc changes the opt-out sentence and the code does not follow -> refuses", "VERBATIM",
      mutate_doc=lambda d: d.replace("If this isn't relevant, reply 'no' and I won't follow up.",
                                     "Reply 'stop' and you will not hear from me again.", 1))
@@ -209,9 +228,62 @@ case("the doc changes the URL cap -> refuses", "URL cap drifted",
 # --- Section 9: follow-ups --------------------------------------------------
 case("the doc allows three follow-ups -> refuses", "follow-up maximum drifted",
      mutate_doc=lambda d: d.replace("Maximum two follow-ups", "Maximum three follow-ups", 1))
-case("the follow-up node grows a third template -> refuses", "templates for follow-ups",
-     mutate_file=("code_followup.js", lambda s: s.replace(
-         "  2: 'One last note", "  3: 'Really the last one.',\n  2: 'One last note", 1)))
+case("Build Follow-Up allows a third follow-up -> refuses", "follow-up maximum drifted",
+     mutate_file=("code_followup.js", lambda s: s.replace("const MAX_FOLLOW_UPS = 2;", "const MAX_FOLLOW_UPS = 3;", 1)))
+
+# --- drafting skill v3 section 8: composed follow-ups ------------------------
+case("the skill moves follow-up #1 to 50-80 words and the JS does not follow -> refuses", "follow-up lengths drifted",
+     mutate_skill=lambda k: k.replace("**Follow-up #1.** 40–70 words", "**Follow-up #1.** 50–80 words", 1))
+case("the skill lowers follow-up #2 to 30 words and the JS does not follow -> refuses", "follow-up lengths drifted",
+     mutate_skill=lambda k: k.replace("short final note.** At most 40 words", "short final note.** At most 30 words", 1))
+case("Assemble Follow-Up's ceiling drifts from the skill -> refuses", "follow-up lengths drifted",
+     mutate_file=("code_followup_assemble.js", lambda s: s.replace("const FOLLOW_UP_1_MAX = 70;", "const FOLLOW_UP_1_MAX = 90;", 1)))
+case("the skill's follow-up rules disappear -> refuses loudly", "follow-up #1 length not found",
+     mutate_skill=lambda k: k.replace("**Follow-up #1.**", "**First follow-up.**", 1))
+case("the skill drops 'add one angle or benefit the first email did not use' -> refuses", "new-claim check depends on it",
+     mutate_skill=lambda k: k.replace("Add one angle or benefit from §4 that the first email did not use",
+                                      "Add something new", 1))
+case("drafting's code_assemble.js loses a rule function the follow-ups call -> refuses", "no longer defines",
+     mutate_rules=lambda s: s.replace("function repeatFlags(", "function repeatFlagz(", 1))
+case("node-body code moves above drafting's 'Node body' marker -> refuses", "node-body code has moved",
+     mutate_rules=lambda s: s.replace("function unique(list) {", "const leaked = $input.item;\nfunction unique(list) {", 1))
+case("the skill bans an adjective the embedded rules do not -> refuses", "which the embedded rules do not",
+     mutate_skill=lambda k: k.replace("No banned adjectives (revolutionary,", "No banned adjectives (groundbreaking, revolutionary,", 1))
+case("Follow-Ups goes back to 'Every 6 Hours' -> refuses (n8n's clock-hour recurrence check)", "recurrenceCheck",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         '{"field": "minutes", "minutesInterval": 30}', '{"field": "hours", "hoursInterval": 6}', 1)))
+case("Follow-Ups on 'every 2 days' -> refuses (same clock-value check, day of year)", "recurrenceCheck",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         '{"field": "minutes", "minutesInterval": 30}', '{"field": "days", "daysInterval": 2}', 1)))
+case("the follow-up schema loses a field Assemble Follow-Up requires -> refuses", "do not match the follow-up schema",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         '"required": ["body", "ask", "added_claim", "claims", "first_email_covers"],',
+         '"required": ["body", "ask", "claims", "first_email_covers"],', 1)))
+case("Section 3 loses the drafting model line -> refuses", "drafting model not found",
+     mutate_doc=lambda d: d.replace("**Drafting model: `claude-sonnet-5-5`**", "**Drafting: `claude-sonnet-5-5`**", 1))
+
+
+def _fu_code(tmp, name):
+    return node(load(tmp, "follow-ups.json"), name)["parameters"]["jsCode"]
+
+
+positive(
+    "Section 3's drafting model flows straight into the follow-up request",
+    lambda tmp: None if '"model": "claude-test-9"' in _fu_code(tmp, "Build Follow-Up")
+    else "the follow-up request does not name the doc's model",
+    mutate_doc=lambda d: d.replace("**Drafting model: `claude-sonnet-5-5`**", "**Drafting model: `claude-test-9`**", 1),
+)
+positive(
+    "the skill's follow-up numbers reach the prompt the model sees",
+    lambda tmp: None if "40-70 words" in _fu_code(tmp, "Build Follow-Up") and "at most 40 words" in _fu_code(tmp, "Build Follow-Up")
+    else "the follow-up prompt does not state the skill's numbers",
+)
+positive(
+    "Assemble Follow-Up ships drafting's rules verbatim, then the follow-up body",
+    lambda tmp: None if _fu_code(tmp, "Assemble Follow-Up").find(read(RULES)[:read(RULES).index("// Node body")]) != -1
+    and "const src = $('Build Follow-Up').item.json;" in _fu_code(tmp, "Assemble Follow-Up")
+    else "the shipped Assemble Follow-Up is not drafting's rules + the follow-up body",
+)
 
 # --- Section 12 and the sender clock ----------------------------------------
 case("Section 12 adds a country with no business-hours clock -> refuses", "geography list",
@@ -256,6 +328,20 @@ case("Check SMTP Result stops emitting the Message-ID Confirm writes -> refuses"
 case("the classifier stops emitting a field Record Inbound reads -> refuses", "never emits",
      mutate_file=("code_classify_reply.js", lambda s: s.replace(
          "    freemail: FREEMAIL.indexOf(fromDomain) !== -1,\n", "", 1)))
+case("Build Follow-Up reads a field Find Due Follow-Ups does not return -> refuses", "does not produce",
+     mutate_file=("code_followup.js", lambda s: s.replace("r.first_variant", "r.first_touch_variant", 1)))
+case("Find Due Follow-Ups stops returning the claims library -> refuses", "does not produce",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "         WHERE k.active)                                                AS library",
+         "         WHERE k.active)                                                AS claims", 1)))
+case("Assemble Follow-Up reads a field Build Follow-Up never emits -> refuses", "never emits",
+     mutate_file=("code_followup_assemble.js", lambda s: s.replace("src.absent_areas", "src.missing_areas", 1)))
+case("Build Follow-Up stops emitting the request the Claude node sends -> refuses", "never emits",
+     mutate_file=("code_followup.js", lambda s: s.replace(
+         "      request: Object.assign({}, CLAUDE_REQUEST, {", "      req: Object.assign({}, CLAUDE_REQUEST, {", 1)))
+case("Assemble Follow-Up stops emitting `write` (Drop Failed Generations reads it) -> refuses", "never emits",
+     mutate_file=("code_followup_assemble.js", lambda s: s.replace("      write: false,", "      written: false,", 1)
+                  .replace("    write: true,", "    written: true,", 1)))
 case("the notification reads a field Record Inbound does not return -> refuses", "does not produce",
      mutate_file=("code_notify.js", lambda s: s.replace("r.fit_score === null", "r.score === null", 1)))
 case("a Code node keeps an unsubstituted build placeholder -> refuses", "unsubstituted placeholders",

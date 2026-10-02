@@ -8,7 +8,7 @@ watch is still listening. Four workflows:
 |---|---|---|
 | `../workflows/send.json` | `send0001` | cron every 10 min → guard → claim → SMTP → log. At most one message per tick. |
 | `../workflows/mailbox-watch.json` | `mailwatch0001` | IMAP on **Sent** (mirror for the ceiling) and on **INBOX** (reply / opt-out / bounce / out-of-office). |
-| `../workflows/follow-ups.json` | `followup0001` | cron every 6 h → follow-up drafts into the review queue, or mark lost. |
+| `../workflows/follow-ups.json` | `followup0001` | cron every 30 min → follow-up composed by the drafting model, checked by the drafting rules, into the review queue as `pending`; or mark lost. |
 | `../workflows/imap-health.json` | `imaphealth0001` | cron every 20 min → IMAP checker → has Mailbox Watch missed anything? → alert the operator. |
 
 Same generated-not-hand-edited pattern as the other stages: the `.js` files are
@@ -20,10 +20,11 @@ python build_workflow.py          # regenerate the four workflow JSONs
 node   test_decide.js             # 74 cases -- the send decision and every guard in it
 node   test_send_result.js        # 21 cases -- what happens after the SMTP call
 node   test_mailbox.js            # 71 cases -- Sent mirror, reply classification, positive-signal flag, notification
-node   test_followup.js           # 13 cases -- follow-up drafts (cross-checked against the send path)
+node   test_followup.js           # 69 cases -- composed follow-ups: the request, every section 8 rule, the frame (cross-checked against the send path)
+python test_followup_mutations.py # breaks each follow-up rule in turn; test_followup.js must fail every time
 node   test_health.js             # 33 cases -- IMAP Health: problems, when it alerts, what it says
 python test_imap_health.py        # 21 cases -- the checker's answer; Message-ID parity with Mailbox Watch
-python test_drift_guards.py       # 60 cases -- each spec/wiring guard is made to fire
+python test_drift_guards.py       # 81 cases -- each spec/wiring guard is made to fire
 python provision_credentials.py   # n8n SMTP/IMAP credentials from .env (+ the two dry-run ones)
 python sync_settings.py           # the operator's notification address, .env -> the settings table
 python imap_preflight.py          # read-only: IMAP works, and the warm-up state from the real Sent folder
@@ -162,12 +163,54 @@ more entry in that list, not a template rebuild.
 
 ## Follow-ups
 
-A template, not a model call — a follow-up adds no fact about the lead, so
-there is nothing to ground. It quotes the first touch, carries the Section 5
-footer (so the send path accepts it) and lands as `pending`: nothing follows up
-without a human. The clock restarts at the later of the last send and the last
-follow-up drafted. A rejected follow-up uses its slot. Two used and six quiet
-days → `lost`.
+**Composed since 2026-10-02 (drafting skill v3 §8), not a template.** Due: six
+quiet days after the last send or follow-up; at most two, then `lost`. A
+rejected follow-up uses its slot.
+
+```
+Find Due Follow-Ups -> Build Follow-Up -> Needs Model? -> Claude Follow-Up -> Assemble Follow-Up -> Drop Failed Generations -> Write Follow-Up
+                                                      \-> (mark-lost) ------------------------------------------------------------> Write Follow-Up
+```
+
+- **Build Follow-Up** (`code_followup.js`) sends the drafting model (Master Ref
+  §3, same request parameters) the first email exactly as sent — minus greeting,
+  opt-out and signature — plus the approved claims: for #1, only the angles and
+  benefits the first email did not use, and no benefit sharing a capability with
+  one it used; for #2, only the asks. Nothing else about the lead reaches the
+  model, so build rule 6 holds by construction. An email written under an older
+  claims list (leads 7, 91, 104 were emailed under v2) cannot be read off its
+  codes, so the model reports `first_email_covers` and the added line is checked
+  against it.
+- **Assemble Follow-Up** is drafting's `code_assemble.js` — everything above its
+  `// Node body` marker, verbatim — followed by `code_followup_assemble.js`. So a
+  follow-up runs the first touch's own rule functions (ask, product name, "AI",
+  sponsor, every forbidden claim, `claim-repeat`, links, areas, unconfirmed
+  claims), plus section 8's: #1 40–70 words and exactly one new angle or benefit
+  (`short`, `long`, `fu-no-new-claim`, `fu-repeat`), #2 at most 40 words and no
+  new claim (`fu-new-claim`). The build refuses if drafting stops defining a
+  function this body calls, or if node-body code moves above the marker. **Keep
+  `code_assemble.js`'s rules section free of n8n reads (`$(`, `$input`).**
+- The greeting, the Section 5 opt-out, the signature and the quoted first email
+  are appended, never generated; the subject is `Re:` + the first subject.
+  `test_followup.js` runs every composed follow-up through Send's real
+  `ineligibility()`.
+- A failed call writes nothing; the lead is due again next run. Write Follow-Up
+  dedupes on the follow-up **number** (`follow-up-1/BEN-DECK.A1+...` and a
+  pre-2026-10-02 bare `follow-up-1` are the same slot).
+
+**Why every 30 minutes, not every 6 hours.** On 2026-10-02 leads 7, 91 and 104
+had gone 10 days without a follow-up against a 6-day rule. Two causes, both
+measured: (1) the stack was down — Docker Desktop has `AutoStart: false`, and
+between 2026-09-23 02:40 and 2026-10-01 23:05 PKT n8n executed nothing at all,
+although Windows was up 2026-09-27 15:03 → 09-28 03:06 and 09-28 23:21 → 10-01
+12:00; (2) the one 6-hour tick n8n was up for after the due date, 2026-10-02
+00:00:29 PKT, was **skipped by n8n itself**: the Schedule Trigger's
+`recurrenceCheck` (n8n 2.35.7, `GenericFunctions.js`) compares the **clock hour**
+of the last run, persisted in `staticData` (`recurrenceRules: [0]` from 09-23
+00:00 PKT), with `(hour - last + 24) % 24 >= 6` — and 0 − 0 is 0. Replaying the
+installed function with that state gives SKIPPED at 00:00:29 and FIRES at 06/12/18.
+Minutes intervals are counted on elapsed time there, so they are safe; the build
+now refuses any hours/days/weeks interval above 1 in any Workflow 6 schedule.
 
 ## Is Mailbox Watch still listening?
 

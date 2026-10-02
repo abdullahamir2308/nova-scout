@@ -1,14 +1,14 @@
 # Drafting review — Workflow 4, skill v3, as deployed
 
-Generated 2026-10-01 19:54 UTC by `n8n/drafting/write_drafting_review.py`, read-only, from the live n8n and novascout databases — not from the repo.
+Generated 2026-10-02 11:19 UTC by `n8n/drafting/write_drafting_review.py`, read-only, from the live n8n and novascout databases — not from the repo.
 
 | Source | Value |
 |---|---|
-| n8n workflow | `drafting0001`, versionId `d5e3857e-6900-49f1-9d47-ed10a1161731`, updated 2026-10-01T19:49:52.773+00:00 |
+| n8n workflow | `drafting0001`, versionId `364fa8d7-c3c7-48e4-9041-704d8f6d44b1`, updated 2026-10-02T11:13:21.102+00:00 |
 | Published | **no** — publish it in the n8n UI; this document describes the saved version |
-| Assess Grounding code | sha256 `b5ae18fbe613ad81…` |
-| Assemble Drafts code | sha256 `09dae0c6a45e6ebc…` |
-| Sample execution | #789 (cli, 2026-10-01T19:49:57.259+00:00, workflow version `d5e3857e-6900-49f1-9d47-ed10a1161731`) |
+| Assess Grounding code | sha256 `424935635ae969c5…` |
+| Assemble Drafts code | sha256 `469d081ad2e5fe6b…` |
+| Sample execution | #845 (cli, 2026-10-02T11:13:34.297+00:00, workflow version `364fa8d7-c3c7-48e4-9041-704d8f6d44b1`) |
 | claims_library | 23 rows, 20 active, 0 confirmed |
 
 A human approves every draft before it can send. Nothing below changes that gate.
@@ -109,6 +109,9 @@ THE EMAIL, in about this order:
   2. Pain and stakes -- ONE angle from the approved list. Do not stack them.
   3. What it does -- a description from the list the first time you mention it,
      then one or two benefits. Not more.
+     NO REPEATS: the description and the benefits must not repeat the same
+     capability. Each line says what it is about; never use two lines that share
+     one, and never restate in your own words what the description already said.
   4. Proof -- the proof line you were given, matched to their country.
   5. Ask -- exactly one, answerable with one word. It goes in the ask field; the
      body before it asks for nothing.
@@ -135,6 +138,9 @@ CLAIMS -- forbidden, all of them:
 - naming any CRM, tool or integration
 - supported languages
 - any count of clients beyond the two named deployments
+- saying it books calls or fills a calendar -- it sends the sponsor your booking
+  link, and the sponsor books
+- saying it answers from SOPs or from documents -- it answers from their website
 The stakes line is about the industry, not about us: "a single sponsor inquiry
 can be a multi-million-dollar study" is allowed; "we will win you millions" is not.
 
@@ -153,7 +159,7 @@ facts -- your facts are only the ones in your own numbered list.
   Subject: Oncology sponsor inquiries after hours
   Your site lists oncology and immunology. In those areas, a single sponsor inquiry can be a multi-million-dollar study, and sponsors often write outside your working hours, so that inquiry waits until morning while they contact the next CRO.
 
-  We built an AI assistant for CRO websites that answers sponsors from your own service pages at any hour, collects their therapeutic area and study phase, and books qualified calls into your calendar (we call it Nova). It's live at NoblePath, an oncology CRO in Türkiye.
+  We built an AI assistant for CRO websites that answers sponsors from your own service pages at any hour, collects their therapeutic area and study phase, and sends qualified sponsors your booking link (we call it Nova). It's live at NoblePath, an oncology CRO in Türkiye.
 
   Would a 48-hour demo built on your own material be worth a look? One word back is enough.
 
@@ -164,21 +170,21 @@ linkedin_claims (the code of every approved claim each message used).
 
 ## 3. The per-lead prompt — a real one, as sent
 
-Built per lead by Assess Grounding: the numbered facts (each with what it does not establish), which fact opens each message, what the subject is built from, and the approved claims for this lead — every active description, angle, benefit and ask, and only the proof line matched to its country. This is lead 104 (Atlant Clinical, Turkey) from execution #789:
+Built per lead by Assess Grounding: the numbered facts (each with what it does not establish), which fact opens each message, what the subject is built from, and the approved claims for this lead — every active description, angle, benefit and ask, and only the proof line matched to its country. This is lead 50 (Innovate Research, India) from execution #845:
 
 ```
-Company: Atlant Clinical
-Country: Turkey
+Company: Innovate Research
+Country: India
 
 VERIFIED FACTS. These are the only facts about this company that exist.
 Each one is numbered. Read the whole bullet, including the sentence saying
 what it does NOT establish:
-1. Therapeutic areas listed on their own website: Oncology and Cardiovascular. This says nothing about which area any particular trial belongs to.
-2. ClinicalTrials.gov lists 1 recruiting trial registered under your company. The only one named is: "Safety and Efficacy of RPH-104 Used to Prevent Recurrent Fever Attacks in Adult Patients With Colchicine Resistant or Colchicine Intolerant Familial Mediterranean Fever". Nothing else about them is known -- not their phase, their therapeutic area, nor where they run.
-3. The company is based in Istanbul. This says nothing about where any trial runs or where any staff sit.
+1. ClinicalTrials.gov lists 2 recruiting trials registered under your company. The ones named are: "Registry of Minimally Invasive Cancer Treatment Using Spectral Angio-CT Image Guidance"; "Hyperbaric Oxygen Brain Injury Treatment Trial". Nothing else about them is known -- not their phase, their therapeutic area, nor where they run.
+2. The company is based in Noida. This says nothing about where any trial runs or where any staff sit.
 
-Open the email from fact 1. Open the LinkedIn DM from fact 2.
+Open the email from fact 1. Open the LinkedIn DM from fact 1.
 Build the email subject from fact 1 too -- the same fact the email opens with.
+In the subject, call the trial "Minimally Invasive".
 A hook built from the trial fact says "Your recruiting trial ..." or "You're
 running ..." -- about them, not about ClinicalTrials.gov, and never "sponsoring".
 
@@ -186,8 +192,8 @@ APPROVED CLAIMS FOR THIS EMAIL. Nothing about the product, the problem or the
 proof may come from anywhere else. Rephrase freely; never widen what a line says.
 
 DESCRIPTION -- introduce what we built with one of these, the first time you mention it:
-  [D1] an AI assistant for your website that turns sponsor inquiries into qualified leads
-  [D2] an AI intake assistant for your website that answers sponsors, qualifies them, and books the call
+  [D1] an AI assistant for your website that turns sponsor inquiries into qualified leads  (about: qualifies, captures-lead)
+  [D2] an AI intake assistant for your website that answers sponsors, qualifies them, and sends them your booking link  (about: answers, qualifies, booking-link)
 
 PAIN AND STAKES ANGLES -- build the email around ONE:
   [ANG-HOURS] Sponsors often research CROs outside your working hours, frequently from another time zone. An inquiry sent at 11pm waits until morning, and by then they may have moved on to the next CRO.
@@ -197,21 +203,29 @@ PAIN AND STAKES ANGLES -- build the email around ONE:
   [ANG-TIME] Your BD time should go to qualified sponsors, not to sorting every inquiry that arrives.
 
 BENEFITS -- use one or two:
-  [BEN-247] It answers sponsors from your own SOPs and service pages, in real time, at any hour.
-  [BEN-BOOK] Qualified sponsors book a call straight into your calendar.
-  [BEN-BRIEF] It collects the therapeutic area and study phase before your first call.
-  [BEN-CAPTURE] A sponsor who shares their details becomes a named lead: company, contact, therapeutic area and study phase.
-  [BEN-DECK] It sends your capabilities deck the moment a sponsor asks for it.
-  [BEN-FIT] It's configured around your services and your process, not a template.
-  [BEN-ROUTE] Leads land where your team already works, not in another dashboard.
-  [BEN-SEE] You can see every sponsor lead it captured, and any question it passed to your team.
+  [BEN-247] It answers sponsors from your own website, in real time, at any hour.  (about: answers)
+  [BEN-BOOK] It sends qualified sponsors your booking link, so they can book a call with your team.  (about: booking-link)
+  [BEN-BRIEF] It collects the therapeutic area and study phase before your first call.  (about: study-details)
+  [BEN-CAPTURE] A sponsor who shares their details becomes a named lead: company, contact, therapeutic area and study phase.  (about: captures-lead, study-details)
+  [BEN-DECK] It sends your capabilities deck the moment a sponsor asks for it.  (about: deck)
+  [BEN-FIT] It's configured around your services and your process, not a template.  (about: configured)
+  [BEN-ROUTE] Leads land where your team already works.  (about: routes-leads)
+  [BEN-SEE] You can see every sponsor lead it captured, and any question it passed to your team.  (about: dashboard)
 
 PROOF -- use this; it is matched to their country:
-  [PR-TR] It's live at NoblePath, an oncology CRO in Türkiye.
+  [PR-BOTH] It's live at two CROs, in Türkiye and Mexico.
 
 ASK -- end each message with ONE of these, rephrased if you like:
   [A1] Would a 48-hour demo built on your own material be worth a look? One word back is enough.
   [A2] Worth a 48-hour demo on your own material? Reply yes and I'll set it up.
+
+NO REPEATS -- the description and the benefits must not repeat the same capability. These
+pairs say the same thing twice, so never use both lines of a pair in one message:
+  D1 with D2 (both: qualifies)
+  D1 with BEN-CAPTURE (both: captures-lead)
+  D2 with BEN-247 (both: answers)
+  D2 with BEN-BOOK (both: booking-link)
+  BEN-BRIEF with BEN-CAPTURE (both: study-details)
 
 Write the email subject, the email (body and ask) and the LinkedIn DM (body and ask).
 Write no greeting and no sign-off -- those are added afterwards. In email_claims
@@ -253,6 +267,9 @@ A violation **tags** the draft's `variant` (`addressing/claim codes+tag,tag`); t
 | `claim-named-tool` | Forbidden: named CRMs and tools | any name in NAMED_TOOLS (generic "your CRM" is fine) |
 | `claim-language` | Forbidden: supported languages | LANGUAGES: "multilingual", "language(s)", a named language |
 | `claim-chatbot` | Never a chatbot | "chatbot" or "Q&A bot" |
+| `claim-books` | Forbidden: saying it books calls (settled 2026-10-02) | NOVA_BOOKS: "books the call", "into your calendar", "schedules the call" -- Nova sends the booking link and the sponsor books |
+| `claim-sop` | Forbidden: SOPs or client documents as its source (settled 2026-10-02) | SOP_SOURCE: "SOPs", "standard operating procedures", "your documents/documentation" -- it answers from their website |
+| `claim-repeat` | No repeats: the description and benefits never share a capability | two claim codes the message used share a capability (claims_library.capabilities, migration 013) |
 | `proof-geo` | Proof: no other deployment | a deployment this lead's proof line does not name |
 | `proof-missing` | Proof: the geography-matched deployment | no deployment from this lead's proof line is named (or, for PR-BOTH, no "two CROs") |
 | `hook-opener` | Never open on the founder's name or the city | the first sentence starts with either |
@@ -301,6 +318,8 @@ VISITOR_ID = /\b(?:identif\w*|reveal\w*|unmask\w*|de-?anonymi\w*|track\w*)\b[^.?
 LANGUAGES = /\bmulti-?lingual\b|\blanguages?\b|\b(?:turkish|spanish|arabic|german|french|portuguese|english|polish|romanian|hungarian|czech|hindi|urdu)\b/i
 CHATBOT = /\bchat ?bots?\b|\bQ ?& ?A bots?\b/i
 AI_POWERED = /\bAI[- ]?(?:powered|driven|based)\b/i
+NOVA_BOOKS = /\bbooks\s+(?:the\s+|a\s+|qualified\s+|sponsor\s+)?(?:calls?|meetings?|demos?)\b|\b(?:into|onto|straight into)\s+your\s+(?:calendar|diary)\b|\bschedules\s+(?:the\s+|a\s+)?(?:calls?|meetings?)\b/i
+SOP_SOURCE = /\bSOPs?\b|\bstandard operating procedures?\b|\b(?:your|their)\s+(?:own\s+)?(?:documents|documentation)\b/i
 REQUEST_IN_BODY = /\b(?:would you|could you|are you open|worth a (?:look|chat|call|try|conversation)|let me know|reply (?:yes|no|with|to)|one word back|shall i|should i|want me to|happy to (?:set|send|show|share|walk)|interested in (?:a|seeing|trying|hearing)|open to a|up for a|free for a)\b/i
 ASK_SCHEDULING = /\b\d+[- ]?min(?:ute)?s?\b|\b(?:fifteen|twenty|thirty)[- ]minutes?\b|\bcalendly\b|\bschedul\w*|\bbook (?:a |some )?(?:time|slot|call|meeting)\b|\b(?:time|slot)s? (?:that )?works?\b/i
 HOOK_SOURCE_OPENING = /^\s*(clinicaltrials\.gov|according to)\b/i
@@ -317,6 +336,12 @@ Attribution: each message's `variant` records the claim codes **that message** r
 claims_active_has_body | CHECK (((NOT active) OR (COALESCE(btrim(body), ''::text) <> ''::text)))
 claims_ai_only_in_description | CHECK (((body IS NULL) OR ((slot = 'description'::text) AND (regexp_count(body, '\mAI\M'::text, 1, 'i'::text) <= 1)) OR ((slot <> 'description'::text) AND (body !~* '\mAI\M'::text))))
 claims_ask_one_question | CHECK (((slot <> 'ask'::text) OR (body IS NULL) OR (regexp_count(body, '\?'::text) = 1)))
+claims_capabilities_vocabulary | CHECK (((capabilities IS NULL) OR (capabilities <@ ARRAY['answers'::text, 'qualifies'::text, 'captures-lead'::text, 'study-details'::text, 'booking-link'::text, 'deck'::text, 'routes-leads'::text, 'dashboard'::text, 'configured'::text])))
+claims_capabilities_where_needed | CHECK (
+CASE
+    WHEN (slot = ANY (ARRAY['description'::text, 'benefit'::text])) THEN ((body IS NULL) OR (COALESCE(cardinality(capabilities), 0) >= 1))
+    ELSE (capabilities IS NULL)
+END)
 claims_countries_are_geographies | CHECK (((countries IS NULL) OR ((cardinality(countries) > 0) AND (countries <@ ARRAY['Turkey'::text, 'Mexico'::text, 'India'::text, 'Pakistan'::text, 'Egypt'::text, 'Poland'::text, 'Romania'::text, 'Hungary'::text, 'Czech Republic'::text, 'UAE'::text, 'South Africa'::text, 'Brazil'::text, 'Argentina'::text]))))
 claims_countries_only_geo | CHECK (((countries IS NULL) OR (slot = ANY (ARRAY['proof'::text, 'link'::text]))))
 claims_library_code_check | CHECK ((code ~ '^[A-Z][A-Z0-9]*(-[A-Z0-9]+)*$'::text))
@@ -325,7 +350,9 @@ claims_measured_only_proof | CHECK (((NOT measured) OR (slot = 'proof'::text)))
 claims_no_ai_powered_no_chatbot | CHECK (((body IS NULL) OR (body !~* '(\mAI[- ]?powered\M|\mchat ?bots?\M|\mQ ?& ?A bot\M)'::text)))
 claims_no_guarantee | CHECK (((body IS NULL) OR (body !~* '\mguarantee'::text)))
 claims_no_product_name | CHECK (((body IS NULL) OR (body !~* '\mnova\M'::text)))
+claims_no_sops | CHECK (((body IS NULL) OR (body !~* '(\mSOPs?\M|standard operating procedure)'::text)))
 claims_no_url_outside_link | CHECK (((slot = 'link'::text) OR (body IS NULL) OR (body !~* '(https?://|www\.)'::text)))
+claims_nova_does_not_book | CHECK (((body IS NULL) OR (body !~* '(\mbooks (the |a |qualified )?(calls?|meetings?)\M|\minto your calendar\M)'::text)))
 claims_prospect_never_sponsor | CHECK (((body IS NULL) OR (body !~* '\myou(''re| are) sponsoring\M'::text)))
 claims_slot_v3 | CHECK ((slot = ANY (ARRAY['description'::text, 'angle'::text, 'benefit'::text, 'proof'::text, 'ask'::text, 'link'::text])))
 ```
@@ -336,40 +363,241 @@ claims_slot_v3 | CHECK ((slot = ANY (ARRAY['description'::text, 'angle'::text, '
 
 Only **active** rows reach the model; every row is `confirmed=false` until a human confirms it, and every draft built from an unconfirmed line is tagged `unconfirmed-claim`. Read the `note` before confirming: it records what the Nova Agent Kit code showed.
 
-| Code | Slot | Active | Confirmed | Countries | Body | Note |
-|---|---|---|---|---|---|---|
-| `D1` | description | yes | no | — | an AI assistant for your website that turns sponsor inquiries into qualified leads |  |
-| `D2` | description | yes | no | — | an AI intake assistant for your website that answers sponsors, qualifies them, and books the call | Code reading 2026-10-02 (not a [verify] line): Nova does not book calls itself. After capture_sponsor_lead succeeds it offers the booking link from CALENDLY_BOOKING_URL (lib/tenants/loader.ts), only if that is set. Confirm or narrow "books the call". |
-| `ANG-HOURS` | angle | yes | no | — | Sponsors often research CROs outside your working hours, frequently from another time zone. An inquiry sent at 11pm waits until morning, and by then they may have moved on to the next CRO. |  |
-| `ANG-SILENT` | angle | yes | no | — | How many sponsors visit your site and leave without ever contacting you? |  |
-| `ANG-SPEED` | angle | yes | no | — | Sponsors choosing a CRO notice how quickly you respond, and a small CRO can't staff a BD desk around the clock. |  |
-| `ANG-STAKES` | angle | yes | no | — | A single sponsor inquiry can be a multi-million-dollar study. | Industry fact, not a Nova result (skill section 4). |
-| `ANG-TIME` | angle | yes | no | — | Your BD time should go to qualified sponsors, not to sorting every inquiry that arrives. | [verify] SUPPORTED 2026-10-02: Nova routes non-sponsor visitors to their own flows -- investigators and sites to capture_investigator_registration, trainees to capture_course_enrollment (lib/agent/tools/; system prompt "Distinguishing Sponsor Intent from Investigator Intent"). Seeded verbatim. |
-| `BEN-247` | benefit | yes | no | — | It answers sponsors from your own SOPs and service pages, in real time, at any hour. | Code reading 2026-10-02 (not a [verify] line): the NoblePath knowledge base is the crawled website (tenants/noblepath/scripts/scraper.py); no SOP content is in it. The loader accepts any knowledge-base text, so SOPs are possible per tenant, but none is live. Confirm or narrow "SOPs". |
-| `BEN-BOOK` | benefit | yes | no | — | Qualified sponsors book a call straight into your calendar. | Code reading 2026-10-02 (not a [verify] line): booking is a link (CALENDLY_BOOKING_URL) offered in the confirmation after a lead is captured, only when the variable is set. Confirm before use. |
-| `BEN-BRIEF` | benefit | yes | no | — | It collects the therapeutic area and study phase before your first call. | [verify] NARROWED 2026-10-02. Was: "It collects the study brief before your first call." The RFP intake (capture_sponsor_lead) records therapeutic area and study phase, plus free-text notes; there are no fields for protocol, timelines, site count or budget, and pricing questions are escalated, not collected. |
-| `BEN-CAPTURE` | benefit | yes | no | — | A sponsor who shares their details becomes a named lead: company, contact, therapeutic area and study phase. | [verify] NARROWED 2026-10-02. Was: "Every sponsor who engages becomes a named lead: company, contact, and what they're planning." capture_sponsor_lead requires company_name, therapeutic_area, study_phase, contact_name, contact_email (notes optional) and is only called once all five are confirmed; a visitor who declines is not captured, so "every sponsor who engages" was wider than the code. |
-| `BEN-DECK` | benefit | yes | no | — | It sends your capabilities deck the moment a sponsor asks for it. | Code reading 2026-10-02: capture_capabilities_request emails the deck once the visitor gives an email address. Supported. |
-| `BEN-FIT` | benefit | yes | no | — | It's configured around your services and your process, not a template. |  |
-| `BEN-ROUTE` | benefit | yes | no | — | Leads land where your team already works, not in another dashboard. | Code reading 2026-10-02 (not a [verify] line): deliverLead() emails the team and pushes the lead to a CRM and a spreadsheet when configured (lib/integrations/). Nova also has its own leads dashboard (app/dashboard), so "not in another dashboard" means "not only". Confirm the wording. |
-| `BEN-SEE` | benefit | yes | no | — | You can see every sponsor lead it captured, and any question it passed to your team. | [verify] NARROWED 2026-10-02. Was: "You can see which sponsors engaged and what they asked." The dashboard (app/dashboard) lists captured leads with their fields and notes, and escalations with the visitor's unanswered question. Conversations are not stored and analytics are anonymous counts, so a sponsor who engaged without leaving details, and what they asked, are not visible. |
-| `PR-BOTH` | proof | yes | no | — | It's live at two CROs, in Türkiye and Mexico. | No countries: serves every lead no other proof line serves. |
-| `PR-MX` | proof | yes | no | Mexico, Brazil, Argentina | It's live at Vertex Clinical Research in Mexico. | Mexico and Latin America. The Nova Agent Kit repo holds only the NoblePath tenant; the Vertex deployment is not visible in that source. |
-| `PR-MX-N` | proof | no | no | Mexico, Brazil, Argentina | *(empty)* | Empty on purpose. Fill ONLY with a number measured from Nova's own dashboard at Vertex, then activate. Never from a web source. When active it replaces PR-MX. |
-| `PR-TR` | proof | yes | no | Turkey, Egypt, UAE, Romania, Hungary, Poland, Czech Republic | It's live at NoblePath, an oncology CRO in Türkiye. | Turkiye and nearby. Which countries count as nearby is a judgement -- edit countries to change it. |
-| `PR-TR-N` | proof | no | no | Turkey, Egypt, UAE, Romania, Hungary, Poland, Czech Republic | *(empty)* | Empty on purpose. Fill ONLY with a number measured from Nova's own dashboard at NoblePath, then activate. Never from a web source. When active it replaces PR-TR. |
-| `A1` | ask | yes | no | — | Would a 48-hour demo built on your own material be worth a look? One word back is enough. |  |
-| `A2` | ask | yes | no | — | Worth a 48-hour demo on your own material? Reply yes and I'll set it up. |  |
-| `L-NP` | link | no | no | — | *(empty)* | The one plain URL allowed after warm-up week 2: NoblePath's site, as a full URL (https://...). Workflow 4 appends it after the composed body only from warm-up week 3 on. countries works as it does for proof. |
+`Capabilities` is what a description or benefit line asserts (migration 013). Two lines in one message that share one say the same thing twice: the prompt names every such pair, and Assemble Drafts tags a message that uses one (`claim-repeat`).
+
+| Code | Slot | Active | Confirmed | Countries | Capabilities | Body | Note |
+|---|---|---|---|---|---|---|---|
+| `D1` | description | yes | no | — | qualifies, captures-lead | an AI assistant for your website that turns sponsor inquiries into qualified leads |  |
+| `D2` | description | yes | no | — | answers, qualifies, booking-link | an AI intake assistant for your website that answers sponsors, qualifies them, and sends them your booking link | SETTLED 2026-10-02 (migration 013). Was: "... answers sponsors, qualifies them, and books the call". Nova does not book: after capture_sponsor_lead succeeds it returns the booking link from CALENDLY_BOOKING_URL (lib/tenants/loader.ts; lib/agent/tools/capture-sponsor-lead.ts), only when that is set. |
+| `ANG-HOURS` | angle | yes | no | — | — | Sponsors often research CROs outside your working hours, frequently from another time zone. An inquiry sent at 11pm waits until morning, and by then they may have moved on to the next CRO. |  |
+| `ANG-SILENT` | angle | yes | no | — | — | How many sponsors visit your site and leave without ever contacting you? |  |
+| `ANG-SPEED` | angle | yes | no | — | — | Sponsors choosing a CRO notice how quickly you respond, and a small CRO can't staff a BD desk around the clock. |  |
+| `ANG-STAKES` | angle | yes | no | — | — | A single sponsor inquiry can be a multi-million-dollar study. | Industry fact, not a Nova result (skill section 4). |
+| `ANG-TIME` | angle | yes | no | — | — | Your BD time should go to qualified sponsors, not to sorting every inquiry that arrives. | [verify] SUPPORTED 2026-10-02: Nova routes non-sponsor visitors to their own flows -- investigators and sites to capture_investigator_registration, trainees to capture_course_enrollment (lib/agent/tools/; system prompt "Distinguishing Sponsor Intent from Investigator Intent"). Seeded verbatim. |
+| `BEN-247` | benefit | yes | no | — | answers | It answers sponsors from your own website, in real time, at any hour. | SETTLED 2026-10-02 (migration 013). Was: "It answers sponsors from your own SOPs and service pages, in real time, at any hour." The knowledge base is one text file per tenant (tenants/<id>/knowledge-base.md), filled only by the website scraper (tenants/noblepath/scripts/scraper.py, which skips PDFs) and loaded verbatim into the system prompt (app/api/chat/route.ts). There is no code path for documents a client provides, so the line claims the website only. |
+| `BEN-BOOK` | benefit | yes | no | — | booking-link | It sends qualified sponsors your booking link, so they can book a call with your team. | SETTLED 2026-10-02 (migration 013). Was: "Qualified sponsors book a call straight into your calendar." Nova sends the booking link (CALENDLY_BOOKING_URL) in its confirmation after a lead is captured, only when that is set; the sponsor books through the link. Nothing reaches a calendar from Nova. |
+| `BEN-BRIEF` | benefit | yes | no | — | study-details | It collects the therapeutic area and study phase before your first call. | [verify] NARROWED 2026-10-02. Was: "It collects the study brief before your first call." The RFP intake (capture_sponsor_lead) records therapeutic area and study phase, plus free-text notes; there are no fields for protocol, timelines, site count or budget, and pricing questions are escalated, not collected. |
+| `BEN-CAPTURE` | benefit | yes | no | — | captures-lead, study-details | A sponsor who shares their details becomes a named lead: company, contact, therapeutic area and study phase. | [verify] NARROWED 2026-10-02. Was: "Every sponsor who engages becomes a named lead: company, contact, and what they're planning." capture_sponsor_lead requires company_name, therapeutic_area, study_phase, contact_name, contact_email (notes optional) and is only called once all five are confirmed; a visitor who declines is not captured, so "every sponsor who engages" was wider than the code. |
+| `BEN-DECK` | benefit | yes | no | — | deck | It sends your capabilities deck the moment a sponsor asks for it. | Code reading 2026-10-02: capture_capabilities_request emails the deck once the visitor gives an email address. Supported. |
+| `BEN-FIT` | benefit | yes | no | — | configured | It's configured around your services and your process, not a template. |  |
+| `BEN-ROUTE` | benefit | yes | no | — | routes-leads | Leads land where your team already works. | SETTLED 2026-10-02 (migration 013). Was: "Leads land where your team already works, not in another dashboard." deliverLead() emails the team and pushes the lead to a CRM and a spreadsheet when configured (lib/integrations/); Nova also has its own leads dashboard (app/dashboard, BEN-SEE), so the "not in another dashboard" clause was dropped. |
+| `BEN-SEE` | benefit | yes | no | — | dashboard | You can see every sponsor lead it captured, and any question it passed to your team. | [verify] NARROWED 2026-10-02. Was: "You can see which sponsors engaged and what they asked." The dashboard (app/dashboard) lists captured leads with their fields and notes, and escalations with the visitor's unanswered question. Conversations are not stored and analytics are anonymous counts, so a sponsor who engaged without leaving details, and what they asked, are not visible. |
+| `PR-BOTH` | proof | yes | no | — | — | It's live at two CROs, in Türkiye and Mexico. | No countries: serves every lead no other proof line serves. |
+| `PR-MX` | proof | yes | no | Mexico, Brazil, Argentina | — | It's live at Vertex Clinical Research in Mexico. | Mexico and Latin America. The Nova Agent Kit repo holds only the NoblePath tenant; the Vertex deployment is not visible in that source. |
+| `PR-MX-N` | proof | no | no | Mexico, Brazil, Argentina | — | *(empty)* | Empty on purpose. Fill ONLY with a number measured from Nova's own dashboard at Vertex, then activate. Never from a web source. When active it replaces PR-MX. |
+| `PR-TR` | proof | yes | no | Turkey, Egypt, UAE, Romania, Hungary, Poland, Czech Republic | — | It's live at NoblePath, an oncology CRO in Türkiye. | Turkiye and nearby. Which countries count as nearby is a judgement -- edit countries to change it. |
+| `PR-TR-N` | proof | no | no | Turkey, Egypt, UAE, Romania, Hungary, Poland, Czech Republic | — | *(empty)* | Empty on purpose. Fill ONLY with a number measured from Nova's own dashboard at NoblePath, then activate. Never from a web source. When active it replaces PR-TR. |
+| `A1` | ask | yes | no | — | — | Would a 48-hour demo built on your own material be worth a look? One word back is enough. |  |
+| `A2` | ask | yes | no | — | — | Worth a 48-hour demo on your own material? Reply yes and I'll set it up. |  |
+| `L-NP` | link | no | no | — | — | *(empty)* | The one plain URL allowed after warm-up week 2: NoblePath's site, as a full URL (https://...). Workflow 4 appends it after the composed body only from warm-up week 3 on. countries works as it does for proof. |
 
 ## 6. What the sample execution produced
 
 | Lead | Email words | DM words | Email claims | DM claims | Email tags | DM tags | Input tok | Output tok (thinking) |
 |---|---|---|---|---|---|---|---|---|
-| 7 | 108 | 80 | D2.ANG-HOURS.BEN-247.BEN-BOOK.PR-MX.A1 | D2.ANG-HOURS.PR-MX.A2 | unconfirmed-claim | unconfirmed-claim | 3429 | 2453 (1942) |
-| 50 | 100 | 85 | D2.ANG-HOURS.BEN-247.PR-BOTH.A1 | D2.ANG-HOURS.PR-BOTH.A2 | unconfirmed-claim | unconfirmed-claim | 3414 | 2399 (1904) |
-| 91 | 104 | 78 | D2.ANG-HOURS.BEN-247.PR-TR.A1 | D2.ANG-HOURS.PR-TR.A2 | unconfirmed-claim | unconfirmed-claim | 3302 | 1675 (1203) |
-| 104 | 107 | 70 | D2.ANG-HOURS.BEN-247.BEN-BOOK.PR-TR.A1 | D1.ANG-STAKES.BEN-BRIEF.PR-TR.A2 | unconfirmed-claim | unconfirmed-claim | 3460 | 2086 (1585) |
+| 50 | 111 | 94 | D2.ANG-HOURS.BEN-SEE.PR-BOTH.A1 | D1.ANG-HOURS.BEN-247.PR-BOTH.A2 | unconfirmed-claim | unconfirmed-claim | 3805 | 2995 (2432) |
 
-API cost of that execution at $2 / $10 per MTok: **$0.1133** for 4 leads (13605 input + 8613 output tokens).
+API cost of that execution at $2 / $10 per MTok: **$0.0376** for 1 leads (3805 input + 2995 output tokens).
+
+## 7. Follow-ups — Workflow 6, composed under the same rules
+
+Drafting skill v3 §8 (2026-10-02): a follow-up is no longer a template. Workflow `followup0001` (versionId `4645384c-8b58-4fb7-b7ca-99829148f5a4`, **not published** — publish it in the n8n UI) asks the same model for it, with the same request parameters, and checks it with the same rule functions.
+
+| | |
+|---|---|
+| Schedule | `Every 30 Minutes` — [{"field": "minutes", "minutesInterval": 30}] |
+| Due | no reply 6 days after the last send or follow-up; at most two follow-ups, then the lead is marked lost |
+| Lengths (note + ask) | #1 40–70 words; #2, the short final note, at most 40 |
+| Claim rules | Assemble Follow-Up embeds the deployed Assemble Drafts' rule section verbatim: **identical to drafting0001's** |
+| Assemble Follow-Up code | sha256 `afa27b3aaab04888…` |
+
+What it is offered: the first email exactly as sent (no greeting, opt-out or signature), the asks, the country's proof line, and for #1 only the angles and benefits that email did not use — a benefit that shares a capability with one it used is withheld too. Nothing else about the prospect reaches the model. A first email written under an older claims list (leads 7, 91 and 104 were emailed under v2) cannot be read off its codes, so the model reports which approved lines it already made (`first_email_covers`) and the added line is checked against that.
+
+The fixed request part:
+
+```json
+{
+  "model": "claude-sonnet-5-5",
+  "max_tokens": 16000,
+  "output_config": {
+    "effort": "high",
+    "format": {
+      "type": "json_schema",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "body": {
+            "type": "string"
+          },
+          "ask": {
+            "type": "string"
+          },
+          "added_claim": {
+            "type": "string"
+          },
+          "claims": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "first_email_covers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "body",
+          "ask",
+          "added_claim",
+          "claims",
+          "first_email_covers"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+The system prompt, exactly:
+
+```
+You write one short follow-up email to a small contract research organisation (CRO) that has
+not replied to a cold first email from Abdullah Amir. A person reviews it before anything is
+sent.
+
+Each message gives you THE FIRST EMAIL exactly as it was sent, and APPROVED CLAIMS: the only
+things you may say about what we built, the problem it solves, and who uses it. You may
+rephrase a claim. You may never widen what it means.
+
+FOLLOW-UP #1:
+- Open by referring back to the first email in a few words ("Following up on my note about
+  after-hours sponsor inquiries"). Do not restate it.
+- Add exactly ONE angle or benefit from the approved list that the first email did not use,
+  and build the note around it. Never one whose point the first email already made.
+- Then exactly one ask.
+- The body plus the ask is 40-70 words.
+
+FOLLOW-UP #2 -- a short final note:
+- Say this is the last note, and restate the offer as the one ask. Add no new claim.
+- The body plus the ask is at most 40 words.
+
+THE PROSPECT: no new fact about them. The only facts are the ones the first email already
+states. Never describe them as sponsoring anything -- in these emails "sponsor" means the
+biotech, pharma, device or academic company that hires a CRO, their client. Never write the
+company's name or a person's name.
+
+THE PRODUCT: the first email introduced it; refer back to it ("the assistant"), do not
+describe it again and do not name it. Never call it a chatbot or a Q&A bot. The word "AI"
+at most once. Never "AI-powered".
+
+NO REPEATS: the lines you use must not repeat the same capability -- each benefit says what it
+is about -- and never restate in your own words a capability the first email already made.
+
+CLAIMS -- forbidden, all of them:
+- guarantees ("you'll never lose a sponsor")
+- any number, percentage or multiplier that is not in the approved claims or the first email
+- claiming to identify anonymous website visitors
+- naming any CRM, tool or integration
+- supported languages
+- any count of clients beyond the two named deployments
+- saying it books calls or fills a calendar -- it sends the sponsor your booking link, and the
+  sponsor books
+- saying it answers from SOPs or from documents -- it answers from their website
+A stakes line is about the industry, not about us.
+
+THE ASK: one question, from the ask lines, rephrased if you like. No links, no scheduling
+link, no call length, no second question. The body before it asks for nothing.
+
+EVERYWHERE: plain text. No links of any kind, no bullets, no placeholders, no merge tags. No
+greeting, no sign-off and no opt-out line -- all three are added afterwards. Never these
+words: revolutionary, cutting-edge, innovative, game-changing, seamless. No invented urgency, no flattery, no exclamation marks.
+
+Return JSON: body (everything before the ask, paragraphs separated by a blank line); ask;
+added_claim (the code of the one angle or benefit you added, or "" for follow-up #2); claims
+(the code of every approved claim the note used, the ask included); first_email_covers (the
+codes of the approved angles and benefits whose point the first email already made).
+```
+
+Tags Assemble Follow-Up adds on top of the inherited ones (§4b: the ask, product-name, "AI", sponsor, claim, area, link, repeat and unconfirmed rules all apply; `proof-missing` does not — a follow-up need not prove anything again, but a deployment it names must be the lead's):
+
+| Tag | Fires when |
+|---|---|
+| `empty` | the body is empty |
+| `long` | follow-up #1 over FOLLOW_UP_1_MAX, or #2 over FOLLOW_UP_2_MAX words (note + ask) |
+| `short` | follow-up #1 under FOLLOW_UP_1_MIN words (note + ask) |
+| `adjective` | any word in BANNED_ADJECTIVES |
+| `merge-tag` | [First Name], {{company}}, <domain> |
+| `prospect-sponsor` | the subject or body calls the prospect a sponsor (PROSPECT_SPONSOR) |
+| `ungrounded-area` | a therapeutic area the lead does not have is named |
+| `claim-code` | the message reported a claim code this lead was not offered, or reported none |
+| `fu-no-new-claim` | #1 did not add exactly one angle or benefit from the lines it was offered |
+| `fu-repeat` | #1's added claim is one the first email used (its codes) or made in other words (the model's first_email_covers) |
+| `fu-new-claim` | #2, the final note, added an angle or benefit |
+| `unconfirmed-claim` | the message used a claims_library line with confirmed=false |
+
+A real per-lead prompt, as sent — lead 7, follow-up #1, from execution #843 (cli, 2026-10-02T11:11:42.666+00:00, workflow version `7c8cb148-f3b7-49e2-9e3b-f03808c3b45d` — an earlier version than the one described above; the system prompt and rules above are the deployed ones):
+
+```
+Country: Argentina
+
+THE FIRST EMAIL, sent 22 Sep 2026 with the subject "INM004 trial — a quick question". The prospect has not
+replied. It is everything you may say about them, and only what it says:
+---
+You're sponsoring a recruiting trial — Efficacy of INM004 in Children With STEC-HUS. How many pharma-team inquiries reach you only after that team has already moved on?
+
+We built Nova so an 11pm pharma-team inquiry is answered in real time and qualified, not the next morning — and lands in the tools you already use. It's live at Vertex Clinical Research in Mexico.
+
+Would a demo on your material be worth 48 hours of our time? One word back is enough.
+---
+
+The first email was written before the current claims list, so its claims cannot be read off codes.
+Read it, and in first_email_covers list the code of every angle and benefit below whose point it
+already made -- in any words. Never add one of those.
+
+APPROVED CLAIMS FOR THIS NOTE. Nothing about the product, the problem or the proof may come from
+anywhere else. Rephrase freely; never widen what a line says.
+
+PAIN AND STAKES ANGLES the first email did not use:
+  [ANG-HOURS] Sponsors often research CROs outside your working hours, frequently from another time zone. An inquiry sent at 11pm waits until morning, and by then they may have moved on to the next CRO.
+  [ANG-SILENT] How many sponsors visit your site and leave without ever contacting you?
+  [ANG-SPEED] Sponsors choosing a CRO notice how quickly you respond, and a small CRO can't staff a BD desk around the clock.
+  [ANG-STAKES] A single sponsor inquiry can be a multi-million-dollar study.
+  [ANG-TIME] Your BD time should go to qualified sponsors, not to sorting every inquiry that arrives.
+
+BENEFITS the first email did not use:
+  [BEN-247] It answers sponsors from your own website, in real time, at any hour.  (about: answers)
+  [BEN-BOOK] It sends qualified sponsors your booking link, so they can book a call with your team.  (about: booking-link)
+  [BEN-BRIEF] It collects the therapeutic area and study phase before your first call.  (about: study-details)
+  [BEN-CAPTURE] A sponsor who shares their details becomes a named lead: company, contact, therapeutic area and study phase.  (about: captures-lead, study-details)
+  [BEN-DECK] It sends your capabilities deck the moment a sponsor asks for it.  (about: deck)
+  [BEN-FIT] It's configured around your services and your process, not a template.  (about: configured)
+  [BEN-ROUTE] Leads land where your team already works.  (about: routes-leads)
+  [BEN-SEE] You can see every sponsor lead it captured, and any question it passed to your team.  (about: dashboard)
+
+PROOF -- only if you mention a deployment; it is matched to their country:
+  [PR-MX] It's live at Vertex Clinical Research in Mexico.
+
+ASK -- end with ONE of these, rephrased if you like:
+  [A1] Would a 48-hour demo built on your own material be worth a look? One word back is enough.
+  [A2] Worth a 48-hour demo on your own material? Reply yes and I'll set it up.
+
+This is follow-up 1 of 2.
+Open by referring back to the first email in a few words, then add exactly ONE angle or benefit from
+the lists above that the first email did not make, and build the note around it. Then the one ask.
+The body plus the ask is 40-70 words. Put the added line's code in added_claim.
+Write no greeting, no sign-off and no opt-out line -- those are added afterwards. In claims, list the
+code of every approved claim the note used.
+```
+
+| Lead | # | Words | Claims | First email covers (model) | Tags | Input tok | Output tok (thinking) |
+|---|---|---|---|---|---|---|---|
+| 7 | 1 | 56 | BEN-SEE.A1 | ANG-HOURS, BEN-247, BEN-ROUTE | unconfirmed-claim | 2677 | 1377 (1206) |
+| 91 | 1 | 66 | BEN-SEE.A1 | ANG-HOURS, BEN-247, BEN-ROUTE | unconfirmed-claim | 2658 | 1138 (952) |
+| 104 | 1 | 55 | BEN-DECK.A2 | ANG-HOURS, BEN-247, BEN-ROUTE, BEN-CAPTURE | unconfirmed-claim | 2671 | 1173 (977) |
+
+API cost of that execution at $2 / $10 per MTok: **$0.0529** for 3 follow-ups (8006 input + 3688 output tokens).
 

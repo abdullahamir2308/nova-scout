@@ -571,8 +571,9 @@ t.check(
 // ===========================================================================
 
 // The active claims-library rows as Get Draft Batch aggregates them (migration
-// 012's seed shape): proof lines carry the countries they serve, and the one
-// with no countries serves everywhere else.
+// 012's seed shape, with migration 013's wording and capabilities): proof lines
+// carry the countries they serve, and the one with no countries serves
+// everywhere else.
 const TR = ['Turkey', 'Egypt', 'UAE', 'Romania', 'Hungary', 'Poland', 'Czech Republic'];
 const LATAM = ['Mexico', 'Brazil', 'Argentina'];
 function row(code, slot, body, extra) {
@@ -581,8 +582,9 @@ function row(code, slot, body, extra) {
 const LIB = [
   row('A1', 'ask', 'Would a 48-hour demo built on your own material be worth a look? One word back is enough.'),
   row('ANG-HOURS', 'angle', 'Sponsors often research CROs outside your working hours.'),
-  row('BEN-247', 'benefit', 'It answers sponsors from your own SOPs and service pages, in real time, at any hour.'),
-  row('D1', 'description', 'an AI assistant for your website that turns sponsor inquiries into qualified leads'),
+  row('BEN-247', 'benefit', 'It answers sponsors from your own website, in real time, at any hour.', { capabilities: ['answers'] }),
+  row('D1', 'description', 'an AI assistant for your website that turns sponsor inquiries into qualified leads',
+    { capabilities: ['qualifies', 'captures-lead'] }),
   row('PR-BOTH', 'proof', 'It\'s live at two CROs, in Türkiye and Mexico.'),
   row('PR-MX', 'proof', 'It\'s live at Vertex Clinical Research in Mexico.', { countries: LATAM }),
   row('PR-TR', 'proof', 'It\'s live at NoblePath, an oncology CRO in Türkiye.', { countries: TR }),
@@ -687,6 +689,26 @@ t.check('every approved claim reaches the prompt with its code',
   }), [true, true, true, true, true]);
 t.check('only this lead\'s proof line is offered -- Vertex is not, for Poland',
   [P.prompt.indexOf('Vertex'), P.prompt.indexOf('two CROs')], [-1, -1]);
+t.check('a description or benefit line shows the model what it is about',
+  [P.prompt.indexOf('qualified leads  (about: qualifies, captures-lead)') !== -1,
+   P.prompt.indexOf('at any hour.  (about: answers)') !== -1], [true, true]);
+t.check('an angle, proof or ask line carries no capability label',
+  /\[(?:ANG-HOURS|PR-TR|A1)\][^\n]*\(about:/.test(P.prompt), false);
+t.check('lines that share no capability produce no NO REPEATS block', P.prompt.indexOf('NO REPEATS'), -1);
+const D2_ROW = row('D2', 'description', 'an AI intake assistant for your website that answers sponsors, qualifies them, and sends them your booking link',
+  { capabilities: ['answers', 'qualifies', 'booking-link'] });
+const BOOK_ROW = row('BEN-BOOK', 'benefit', 'It sends qualified sponsors your booking link, so they can book a call with your team.',
+  { capabilities: ['booking-link'] });
+const REP = assess(withLib({ country: 'Poland' }, LIB.concat([D2_ROW, BOOK_ROW])), ctgov(0, []));
+t.check('every offered pair that shares a capability is named, with what it shares',
+  REP.repeat_pairs.map(function (p) { return p.a + '+' + p.b + ':' + p.shared.join('/'); }).sort(),
+  ['D1+D2:qualifies', 'D2+BEN-247:answers', 'D2+BEN-BOOK:booking-link']);
+t.check('and the prompt tells the model never to use both lines of a pair',
+  [REP.prompt.indexOf('NO REPEATS') !== -1, REP.prompt.indexOf('  D2 with BEN-247 (both: answers)') !== -1,
+   REP.prompt.indexOf('  D2 with BEN-BOOK (both: booking-link)') !== -1], [true, true, true]);
+t.check('a row with no capabilities column (a pre-013 database) offers lines with none, not a crash',
+  assess(withLib({ country: 'Poland' }, LIB.map(function (r) { const c = Object.assign({}, r); delete c.capabilities; return c; })), ctgov(0, []))
+    .library_pools.benefit[0].capabilities, []);
 t.check('the model is asked to report the codes each message used',
   P.prompt.indexOf('email_claims') !== -1 && P.prompt.indexOf('linkedin_claims') !== -1, true);
 t.check('the request carries the build\'s model, max_tokens and effort',

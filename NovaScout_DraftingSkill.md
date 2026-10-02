@@ -58,10 +58,12 @@ The order can flex. These beats should all be present, in about this order:
 
 **Pick one angle.** Choose one pain from §4 and build the email around it. Do not stack every benefit. Use one or two benefits at most.
 
+**No repeats.** The description and the benefits must not repeat the same capability. Each description and benefit line in the claims table names what it is about (its `capabilities`); two lines in one message that share one say the same thing twice. D2 already answers sponsors and sends the booking link, so it never pairs with BEN-247 or BEN-BOOK.
+
 **Naming the product.**
 - The first mention is a description, for example "an AI assistant for your website that turns sponsor inquiries into qualified leads".
 - The name appears at most once, in brackets: "(we call it Nova)".
-- Never describe it as a chatbot or a Q&A bot. It qualifies the inquiry, captures the details, and books the call.
+- Never describe it as a chatbot or a Q&A bot. It qualifies the inquiry, captures the details, and sends the sponsor your booking link.
 - The word "AI" appears at most once, inside the description. Never "AI-powered".
 
 **Claims.**
@@ -73,6 +75,8 @@ The order can flex. These beats should all be present, in about this order:
   - naming a specific CRM, tool or integration
   - supported languages
   - any count of clients beyond the two named ones
+  - saying it books calls or fills a calendar (it sends your booking link; the sponsor books)
+  - saying it answers from SOPs or from documents the client provides (it answers from their website)
 - The stakes line is about the industry, not about Nova: "a single sponsor inquiry can be a multi-million-dollar study" is allowed; "Nova will win you millions" is not.
 
 **Ask.** Exactly one ask. The reply costs one word. No links, no scheduling link, no "30-minute call".
@@ -87,7 +91,7 @@ Every line starts `confirmed = false` until a human confirms it. Lines marked **
 
 ### Description — how to introduce it (pick one)
 - D1: an AI assistant for your website that turns sponsor inquiries into qualified leads
-- D2: an AI intake assistant for your website that answers sponsors, qualifies them, and books the call
+- D2: an AI intake assistant for your website that answers sponsors, qualifies them, and sends them your booking link
 
 ### Pain and stakes angles (pick one)
 - ANG-HOURS: Sponsors often research CROs outside your working hours, frequently from another time zone. An inquiry sent at 11pm waits until morning, and by then they may have moved on to the next CRO.
@@ -97,11 +101,11 @@ Every line starts `confirmed = false` until a human confirms it. Lines marked **
 - ANG-TIME: Your BD time should go to qualified sponsors, not to sorting every inquiry that arrives. **[verify: Nova routes non-sponsor visitors, e.g. investigators or trainees, to their own flows]**
 
 ### Benefits (pick one or two)
-- BEN-247: It answers sponsors from your own SOPs and service pages, in real time, at any hour.
+- BEN-247: It answers sponsors from your own website, in real time, at any hour.
 - BEN-CAPTURE: Every sponsor who engages becomes a named lead: company, contact, and what they're planning. **[verify fields captured]**
 - BEN-BRIEF: It collects the study brief before your first call. **[verify: which study details the RFP intake captures]**
-- BEN-BOOK: Qualified sponsors book a call straight into your calendar.
-- BEN-ROUTE: Leads land where your team already works, not in another dashboard.
+- BEN-BOOK: It sends qualified sponsors your booking link, so they can book a call with your team.
+- BEN-ROUTE: Leads land where your team already works.
 - BEN-SEE: You can see which sponsors engaged and what they asked. **[verify: admin dashboard shows this]**
 - BEN-DECK: It sends your capabilities deck the moment a sponsor asks for it.
 - BEN-FIT: It's configured around your services and your process, not a template.
@@ -139,7 +143,7 @@ Subject: `Oncology sponsor inquiries after hours`
 
 > Your site lists oncology and immunology. In those areas, a single sponsor inquiry can be a multi-million-dollar study, and sponsors often write outside your working hours, so that inquiry waits until morning while they contact the next CRO.
 >
-> We built an AI assistant for CRO websites that answers sponsors from your own service pages at any hour, collects their study brief, and books qualified calls into your calendar (we call it Nova). It's live at NoblePath, an oncology CRO in Türkiye.
+> We built an AI assistant for CRO websites that answers sponsors from your own service pages at any hour, collects their study brief, and sends qualified sponsors your booking link (we call it Nova). It's live at NoblePath, an oncology CRO in Türkiye.
 >
 > Would a 48-hour demo built on your own material be worth a look? One word back is enough.
 
@@ -163,4 +167,19 @@ About 100 words. One prospect fact. One angle (hours plus stakes). A description
 
 ---
 
-*Skill v3, 2026-09-30. Change claims in the table; change structure only with evidence from real replies.*
+## 8. Follow-ups
+
+The master doc's Section 9 sets the schedule: no reply after 6 days, a follow-up draft goes to the review queue as pending; at most two, then the lead is marked lost. Both follow-ups are composed by the drafting model under every rule above (§0, §3): claims only from the approved list, rephrased but never widened, no repeats, no numbers the claims don't hold, and nothing about the prospect that the first email did not already say.
+
+**Follow-up #1.** 40–70 words between the greeting and the opt-out line.
+- Open by referring back to the first email in a few words ("Following up on my note about after-hours sponsor inquiries"). Do not restate it.
+- Add one angle or benefit from §4 that the first email did not use, and build the note around it.
+- Exactly one ask, from the ask lines, rephrased if you like.
+
+**Follow-up #2 — a short final note.** At most 40 words. Say this is the last note, restate the offer as the one ask, and add no new claim.
+
+**Both.** They stay in the first email's thread: the subject is "Re: " plus its subject, and the first email is quoted below the signature. The greeting, opt-out line and signature are fixed text, appended, never written by the model. No link of any kind.
+
+---
+
+*Skill v3, 2026-09-30. Amended 2026-10-02: D2, BEN-BOOK, BEN-247 and BEN-ROUTE settled against the Nova Agent Kit code, the no-repeat rule, and follow-ups composed (§8). Change claims in the table; change structure only with evidence from real replies.*

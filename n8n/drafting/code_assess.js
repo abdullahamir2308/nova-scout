@@ -212,6 +212,7 @@ function libraryRows(raw) {
       countries: Array.isArray(r.countries) && r.countries.length ? r.countries.map(fold) : null,
       measured: r.measured === true,
       confirmed: r.confirmed === true,
+      capabilities: Array.isArray(r.capabilities) ? r.capabilities.map(str).filter(Boolean) : [],
     });
   }
   return out;
@@ -234,7 +235,27 @@ function forCountry(rows, country) {
 }
 
 function lines(rows) {
-  return rows.map(function (r) { return { code: r.code, body: r.body, confirmed: r.confirmed }; });
+  return rows.map(function (r) {
+    return { code: r.code, body: r.body, confirmed: r.confirmed, capabilities: r.capabilities };
+  });
+}
+
+// Skill v3 section 3, No repeats: the description and the benefits must not
+// repeat the same capability. Every pair of offered description/benefit lines
+// that share one, worked out here so the prompt can name them outright rather
+// than leave the model to compare capability lists. Assemble Drafts tags a
+// message that uses one anyway (`claim-repeat`).
+function repeatPairs(pool) {
+  const pairs = [];
+  for (let i = 0; i < pool.length; i++) {
+    for (let j = i + 1; j < pool.length; j++) {
+      const shared = (pool[i].capabilities || []).filter(function (c) {
+        return (pool[j].capabilities || []).indexOf(c) !== -1;
+      });
+      if (shared.length) pairs.push({ a: pool[i].code, b: pool[j].code, shared: shared });
+    }
+  }
+  return pairs;
 }
 
 // What a trial is called in a subject line. A title does not fit in 50
@@ -601,12 +622,24 @@ const CLAIM_HEADINGS = [
   ['ask', 'ASK -- end each message with ONE of these, rephrased if you like:'],
 ];
 const claimsSheet = CLAIM_HEADINGS.map(function (h) {
-  return [h[1]].concat(pools[h[0]].map(function (l) { return '  [' + l.code + '] ' + l.body; })).join('\n');
+  return [h[1]].concat(pools[h[0]].map(function (l) {
+    const about = (h[0] === 'description' || h[0] === 'benefit') && l.capabilities.length
+      ? '  (about: ' + l.capabilities.join(', ') + ')' : '';
+    return '  [' + l.code + '] ' + l.body + about;
+  })).join('\n');
 }).join('\n\n');
+
+const pairs = repeatPairs(pools.description.concat(pools.benefit));
+const repeatSheet = pairs.length
+  ? 'NO REPEATS -- the description and the benefits must not repeat the same capability. These\n' +
+    'pairs say the same thing twice, so never use both lines of a pair in one message:\n' +
+    pairs.map(function (p) { return '  ' + p.a + ' with ' + p.b + ' (both: ' + p.shared.join(', ') + ')'; }).join('\n') +
+    '\n\n'
+  : '';
 
 const fullPrompt = prompt + '\n\nAPPROVED CLAIMS FOR THIS EMAIL. Nothing about the product, the problem or the\n' +
   'proof may come from anywhere else. Rephrase freely; never widen what a line says.\n\n' +
-  claimsSheet + '\n\n' +
+  claimsSheet + '\n\n' + repeatSheet +
   'Write the email subject, the email (body and ask) and the LinkedIn DM (body and ask).\n' +
   'Write no greeting and no sign-off -- those are added afterwards. In email_claims\n' +
   'and linkedin_claims, list the code of every claim that message used.';
@@ -664,6 +697,7 @@ return {
     headcount: headcount,
     absent_areas: absentAreas,
     library_pools: pools,
+    repeat_pairs: pairs,
     library_link: linkPool,
     library_gap: libraryGap,
     warmup_week: warmupWeek,
