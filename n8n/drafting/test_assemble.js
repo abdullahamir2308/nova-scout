@@ -541,4 +541,16 @@ t.check('judged per message: a DM that repeats tags the DM, not the email',
 t.check('an unconfirmed claim the model did not use is not',
   has(emailFlags({ email_claims: ['D1', 'ANG-HOURS', 'BEN-FIT', 'PR-TR', 'A1'] }, { library_pools: UNCONF }), 'unconfirmed-claim'), false);
 
+// --- the repair loop (2026-10-03): this same code runs again on a repaired answer --
+const FIRST = assemble();
+t.check('it hands on the parsed answer (what a repair edits) and the email fields it came from',
+  [FIRST.composition.email_body, FIRST.composition.email_claims.length, FIRST.approval.repair_fields, FIRST.repair],
+  [CLEAN_BODY, 5, ['email_subject', 'email_body', 'email_ask'], null]);
+const REPAIRED = run(Object.assign(claude(generation()), { usage: null,
+  repair: { round: 1, target: 0, history: [{ attempt: 1, result: 'hold', reasons: ['claim-check: widened "x" (BEN-247)'] }] } }));
+t.check('a repaired answer (Apply Repair\'s output) runs every rule again and carries the attempts on to the gate',
+  [REPAIRED.write, REPAIRED.repair.round, REPAIRED.repair.history.length, draftOf(REPAIRED, 'email').body === draftOf(FIRST, 'email').body,
+   REPAIRED.email_flags],
+  [true, 1, 1, true, FIRST.email_flags]);
+
 t.done();

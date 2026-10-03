@@ -746,7 +746,12 @@ return {
       claims: approvalClaims,
       first_email: null,
       check: { subject: emailSubject, text: emailCore },
+      repair_fields: ['email_subject', 'email_body', 'email_ask'],
     },
+    // The repair loop edits the model's answer and runs it through a second
+    // copy of this node; `repair` (set by Apply Repair) carries the attempts.
+    composition: parsed,
+    repair: resp.repair || null,
     payload: {
       lead_id: src.lead_id,
       advance: true,

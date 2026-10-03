@@ -1075,14 +1075,11 @@ _assert_emitted_upstream(_assess_js, _claude_reads, "code_assess.js")
 # so a first touch and a follow-up are judged by the same functions.
 # ---------------------------------------------------------------------------
 
-APPROVAL_JS = js("code_approval.js")
-_approval_at = APPROVAL_JS.find("// Node body")
-assert _approval_at != -1, "code_approval.js has no '// Node body' marker"
-APPROVAL_RULES = APPROVAL_JS[:_approval_at]
-assert "$(" not in APPROVAL_RULES and "$input" not in APPROVAL_RULES, (
-    "the rules section of code_approval.js reads n8n data -- node-body code has moved above its 'Node body' "
-    "marker, and Apply Claim Check (which embeds that section) would run it a second time")
-APPLY_JS = APPROVAL_RULES + "\n" + js("code_approval_apply.js")
+import approval_chain  # noqa: E402  (this directory; shared with n8n/sendtrack/build_workflow.py)
+
+APPROVAL = approval_chain.load(HERE)
+APPROVAL_JS = APPROVAL["gate"]
+APPROVAL_RULES = APPROVAL["rules"]
 
 # The claim check is a second call to the drafting model, with its parameters
 # (Section 3). A cheaper or different model here would be a different check
@@ -1106,6 +1103,15 @@ assert "target.approved_by = 'auto'" in js("code_approval_apply.js")
 CHECK_BODY = "={{ JSON.stringify($json.check_request) }}"
 _assert_emitted_upstream(APPROVAL_JS, set(re.findall(r"\$json\.(\w+)", CHECK_BODY)) | {"needs_check"},
                          "code_approval.js (Approval Gate)")
+# The repair loop's boundaries: Apply Claim Check -> [Needs Repair?] -> Claude
+# Repair ($json.repair_request) -> Apply Repair -> [Repaired?] -> the Assemble
+# copy, which must hand the repair state and the composition on.
+_assert_emitted_upstream(js("code_approval_apply.js"), {"needs_repair", "repair_request", "repair_state"},
+                         "code_approval_apply.js (Apply Claim Check)")
+_assert_emitted_upstream(js("code_approval_repair.js"), {"repaired", "repair", "content", "stop_reason"},
+                         "code_approval_repair.js (Apply Repair)")
+_assert_emitted_upstream(_assemble_js, {"composition", "repair", "repair_fields"},
+                         "code_assemble.js (Assemble Drafts)")
 # What the gate reads off the item must be what both upstream nodes emit.
 _assert_emitted_upstream(_assemble_js, {"approval", "payload"}, "code_assemble.js (Assemble Drafts)")
 _assert_emitted_upstream(js("code_lowcontext.js"), {"payload"}, "code_lowcontext.js (Build Low-Context Drafts)")
@@ -1120,6 +1126,8 @@ for _f in re.findall(r"d->>?'(\w+)'", WRITE_SQL):
         continue
     assert re.search(r"\bd\.%s = |target\.%s = " % (_f, _f), APPROVAL_JS + js("code_approval_apply.js")), (
         "Write Drafts & Advance reads d->>'%s', which neither Approval Gate nor Apply Claim Check sets" % _f)
+    assert re.search(r"\bd\.%s = " % _f, js("code_approval_repair.js")), (
+        "Write Drafts & Advance reads d->>'%s', which Apply Repair does not set on a held draft" % _f)
 
 # The same class of bug one node earlier: every `lead.X` Assess Grounding reads
 # off the batch row must be a column Get Draft Batch returns. A missing one is
@@ -1134,6 +1142,13 @@ assert not _unread, (
     "code_assess.js reads lead.%s, but Get Draft Batch returns no such column. It would be "
     "undefined at runtime with no error." % ", lead.".join(_unread)
 )
+
+# The auto-approval chain with its repair rounds, generated (approval_chain.py)
+# -- the same chain Follow-Ups carries.
+_chain_nodes, _chain_conns, _write_pos = approval_chain.build(
+    APPROVAL, "Assemble Drafts", _assemble_js, "Write Drafts & Advance", ANTHROPIC_CRED, DRAFT_MODEL, DRAFT_EFFORT,
+    (1320, 130))
+CHAIN_ROUNDS = approval_chain.names(APPROVAL["max_repairs"], "Assemble Drafts")
 
 nodes = [
     {
@@ -1391,76 +1406,7 @@ nodes = [
             "on this branch -- there is nothing to write from."
         ),
     },
-    {
-        "parameters": {"mode": "runOnceForEachItem", "jsCode": APPROVAL_JS},
-        "name": "Approval Gate",
-        "type": "n8n-nodes-base.code",
-        "typeVersion": 2,
-        "position": [1320, 130],
-        "notes": (
-            "Auto-approval, rules 1-4 (migration 014): an EMAIL draft goes on to the claim check only if "
-            "settings.auto_approve_email is on, it carries no rule tag, it is not low-context, and every claim "
-            "code it records is confirmed. Anything else is held -- written 'pending' with hold_reason -- and no "
-            "check is paid for. A LinkedIn draft is always held (Section 6). The database re-checks all of this "
-            "on the write.\n\n"
-            "Same code as Follow-Ups' node of the same name (n8n/drafting/code_approval.js)."
-        ),
-    },
-    {
-        "parameters": {
-            "conditions": boolean_condition("needscheck", "={{ $json.needs_check }}", True),
-            "options": {},
-        },
-        "name": "Needs Claim Check?",
-        "type": "n8n-nodes-base.if",
-        "typeVersion": 2.2,
-        "position": [1540, 130],
-        "notes": "true: an email draft that passed rules 1-4. false: everything is held; straight to the write.",
-    },
-    {
-        "parameters": {
-            "method": "POST",
-            "url": "https://api.anthropic.com/v1/messages",
-            "authentication": "predefinedCredentialType",
-            "nodeCredentialType": "anthropicApi",
-            "sendHeaders": True,
-            "headerParameters": {"parameters": [{"name": "anthropic-version", "value": "2023-06-01"}]},
-            "sendBody": True,
-            "specifyBody": "json",
-            "jsonBody": CHECK_BODY,
-            "options": {"timeout": 300000},
-        },
-        "name": "Claude Claim Check",
-        "type": "n8n-nodes-base.httpRequest",
-        "typeVersion": 4.2,
-        "position": [1760, 20],
-        "credentials": ANTHROPIC_CRED,
-        "onError": "continueRegularOutput",
-        "retryOnFail": True,
-        "maxTries": 2,
-        "waitBetweenTries": 5000,
-        "notes": (
-            "Auto-approval, rule 5: a second %s call (effort %s, Section 3's parameters) that compares each "
-            "product claim in the email with the confirmed claims and each prospect fact with the record the "
-            "draft was written from, sentence by sentence. A widened claim fails. The body is $json.check_request, "
-            "built by Approval Gate.\n\n"
-            "Errors continue as items: Apply Claim Check holds the draft for a human. No fallback to another "
-            "model -- the check is Sonnet 5.5's or a person's."
-        ) % (DRAFT_MODEL, DRAFT_EFFORT),
-    },
-    {
-        "parameters": {"mode": "runOnceForEachItem", "jsCode": APPLY_JS},
-        "name": "Apply Claim Check",
-        "type": "n8n-nodes-base.code",
-        "typeVersion": 2,
-        "position": [1980, 20],
-        "notes": (
-            "Approved by the workflow only if every statement the check found is supported AND its quotes cover "
-            "the whole email (a sentence it skipped is a sentence nobody judged). Anything else -- a widened or "
-            "unsupported claim, an unsupported or joined fact, a failed call -- is held with the reason. The "
-            "verdicts go into drafts.claim_check either way."
-        ),
-    },
+    *_chain_nodes,
     {
         "parameters": {
             "operation": "executeQuery",
@@ -1470,7 +1416,7 @@ nodes = [
         "name": "Write Drafts & Advance",
         "type": "n8n-nodes-base.postgres",
         "typeVersion": 2.7,
-        "position": [2200, 130],
+        "position": _write_pos,
         "credentials": PG_CRED,
         "notes": (
             "Both drafts and the status advance in one statement. The whole payload goes in as a "
@@ -1518,25 +1464,24 @@ connections = {
     "Build Low-Context Drafts": {
         "main": [[{"node": "Approval Gate", "type": "main", "index": 0}]]
     },
-    "Approval Gate": {"main": [[{"node": "Needs Claim Check?", "type": "main", "index": 0}]]},
-    "Needs Claim Check?": {
-        "main": [
-            [{"node": "Claude Claim Check", "type": "main", "index": 0}],
-            [{"node": "Write Drafts & Advance", "type": "main", "index": 0}],
-        ]
-    },
-    "Claude Claim Check": {"main": [[{"node": "Apply Claim Check", "type": "main", "index": 0}]]},
-    "Apply Claim Check": {
-        "main": [[{"node": "Write Drafts & Advance", "type": "main", "index": 0}]]
-    },
+    **_chain_conns,
 }
 
 # Nothing reaches the write without passing the gate: both of the gate's exits
 # end at Write Drafts & Advance, and nothing else does.
 _into_write = sorted(src for src, outs in connections.items()
                      for branch in outs["main"] for e in branch if e["node"] == "Write Drafts & Advance")
-assert _into_write == ["Apply Claim Check", "Needs Claim Check?"], (
+assert _into_write == approval_chain.exits(CHAIN_ROUNDS), (
     "something reaches Write Drafts & Advance without the Approval Gate: %r" % _into_write)
+assert len(CHAIN_ROUNDS) == APPROVAL["max_repairs"] + 1, "the chain does not unroll MAX_REPAIRS repair rounds"
+
+# Every $('Node') a Code node reads must exist in this workflow -- n8n stops the
+# execution there. The chain's copies read their round's own nodes.
+_names = {n["name"] for n in nodes}
+for _n in nodes:
+    if _n["type"] == "n8n-nodes-base.code":
+        for _ref in re.findall(r"\$\('([^']+)'\)", _n["parameters"]["jsCode"]):
+            assert _ref in _names, "%s reads $('%s'), but there is no node named %r" % (_n["name"], _ref, _ref)
 
 workflow = {
     "id": "drafting0001",

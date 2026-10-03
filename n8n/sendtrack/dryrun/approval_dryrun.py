@@ -7,12 +7,16 @@ What it proves, through n8n:
 
   1. a clean draft auto-approves -- a first touch and a follow-up
   2. a tagged draft is held, before any claim check is paid for
-  3. a claim-check failure is held -- draft 99's own follow-up text, whose
-     "..., so you know exactly what came in." widens BEN-SEE
+  3. the repair loop (2026-10-03): a draft that widens on the first attempt is
+     repaired by the real model and approved -- draft 99's own follow-up text,
+     whose "..., so you know exactly what came in." widens BEN-SEE, and the same
+     widening inside a first touch; and a draft that keeps widening is held
+     after 2 repairs, with every attempt's reasons
   4. a low-context draft is held
   5. a LinkedIn draft is held
   6. with settings.auto_approve_email off, nothing auto-approves, and no claim
-     check runs at all
+     check or repair runs at all
+  plus the cost of every checked draft, repairs included.
   plus: an auto-approved email is an ordinary Send candidate (Send is unchanged),
   and the Daily Digest reaches the operator once per day, listing what was
   approved and what was held and why.
@@ -20,13 +24,16 @@ What it proves, through n8n:
 REAL: the workflows (built from the same node lists as the shipped ones -- the
 differences are listed and asserted below), n8n, every Postgres statement and
 trigger, the ClinicalTrials.gov lookup, nodemailer's SMTP conversation, and the
-Claude Claim Check: a real Sonnet 5.5 call through the real credential. That
-call is the thing under test, and it leaves this machine (it reaches no inbox).
+Claude Claim Check and Claude Repair: real Sonnet 5.5 calls through the real
+credential. They are the thing under test, and they leave this machine (they
+reach no inbox).
 
 NOT REAL: the composing model. Claude Draft and Claude Follow-Up are replaced by
 fixture nodes of the same name that return fixed compositions, so each
 scenario's draft text is known in advance -- real text where it exists (draft
 85's tagged first touch, draft 99's follow-up), written for the case otherwise.
+In the one scenario that proves the loop's bound, Claude Repair 1 and 2 are
+fixtures too, returning a rewrite that still widens; the checker stays real.
 The database is novascout_dryrun: a copy of novascout with migration 014
 applied and every active claim confirmed (step 5 of the brief), every contact
 address rewritten to ...@dryrun.invalid and the operator address replaced by
@@ -126,6 +133,9 @@ def make_base():
                "WHERE email IS NOT NULL AND email <> '';\n"
                "DELETE FROM settings;\n"
                "INSERT INTO settings (key, value) VALUES ('operator_email', '%s'), ('auto_approve_email', 'true');\n"
+               # The live digest has run since 2026-10-03: a copy of its digest_log
+               # would make today's scratch digest 'already sent' (dry run, 2026-10-03).
+               "DELETE FROM digest_log;\n"
                "UPDATE claims_library SET confirmed = true WHERE active AND NOT confirmed;\n" % OPERATOR)
     return int(psql(BASE, "SELECT count(*) FROM contacts WHERE coalesce(email, '') <> '' "
                           "AND email NOT LIKE '%@dryrun.invalid';").strip())
@@ -272,10 +282,46 @@ def with_fixture(wf, wid, name, node, mode, fixtures):
     return v
 
 
-def drafting_variant(fixtures):
+# A repair that keeps widening: each flagged widening is swapped for another
+# one (or, if the checker's quote is not inside the sentence, one is added), so
+# the text changes every round and is held every round by the real checker.
+STUBBORN = {1: "so your team sees everything that happened", 2: "so your team has the whole picture of every inquiry"}
+
+
+def stubborn_repair_node(name, k, pos):
+    src = ("// TEST FIXTURE -- stands in for %s in the dry run only: a repair that keeps\n"
+           "// widening, to prove the loop stops after MAX_REPAIRS. The claim check stays REAL.\n"
+           "const PHRASE = %s;\n"
+           "const st = $input.item.json.repair_state || {};\n"
+           "const rewrites = (st.flagged || []).map(function (f) {\n"
+           "  const stmt = ((f.reasons || [])[0] || {}).statement || '';\n"
+           "  let rep = stmt && f.sentence.indexOf(stmt) !== -1 ? f.sentence.replace(stmt, PHRASE) : '';\n"
+           "  if (!rep || rep === f.sentence) rep = f.sentence.replace(/[.!?]+\\s*$/, '') + ', ' + PHRASE + '.';\n"
+           "  return { original: f.sentence, replacement: rep };\n"
+           "});\n"
+           "return { json: { id: 'fixture-repair', type: 'message', role: 'assistant', model: 'fixture',\n"
+           "  stop_reason: 'end_turn', stop_details: null,\n"
+           "  content: [{ type: 'text', text: JSON.stringify({ rewrites: rewrites }) }],\n"
+           "  usage: { input_tokens: 0, output_tokens: 0 } } };\n") % (name, json.dumps(STUBBORN[k]))
+    return {"parameters": {"mode": "runOnceForEachItem", "jsCode": src}, "name": name, "type": "n8n-nodes-base.code",
+            "typeVersion": 2, "position": pos, "notes": "Test fixture. Never in a shipped workflow."}
+
+
+def with_stubborn_repairs(v):
+    out = []
+    for n in v["nodes"]:
+        m = re.match(r"^Claude Repair (\d+)$", n["name"])
+        out.append(stubborn_repair_node(n["name"], int(m.group(1)), n["position"]) if m else n)
+    v["nodes"] = out
+    return v
+
+
+def drafting_variant(fixtures, stubborn=False):
     shipped = load("shipped", "drafting.json")
     v = with_fixture(shipped, "drafting0001t", "TEST - Drafting (scratch DB, fixture composer, real claim check)",
                      "Claude Draft", "runOnceForEachItem", fixtures)
+    if stubborn:
+        v = with_stubborn_repairs(v)
     v["nodes"] = [n for n in v["nodes"] if n["name"] != "Every 30 Minutes"]
     v["connections"] = {k: x for k, x in v["connections"].items() if k != "Every 30 Minutes"}
     for n in v["nodes"]:
@@ -287,10 +333,12 @@ def drafting_variant(fixtures):
     return v, shipped, want
 
 
-def followups_variant(fixtures):
+def followups_variant(fixtures, stubborn=False):
     dry = load("variants", "followups-dryrun.json")
     v = with_fixture(dry, "followup0001t", "TEST - Follow-Ups (scratch DB, fixture composer, real claim check)",
                      "Claude Follow-Up", "runOnceForEachItem", fixtures)
+    if stubborn:
+        v = with_stubborn_repairs(v)
     return v, load("shipped", "follow-ups.json")
 
 
@@ -388,22 +436,45 @@ CLEAN_FOLLOW_UP = {
 def written(since_id):
     return {(r["lead_id"], r["channel"]): r for r in psql_json(DRY, """
         SELECT d.id, d.lead_id, d.channel, d.status, d.approved_by, d.approved_at IS NOT NULL AS has_approved_at,
-               d.variant, d.hold_reason, d.claim_check->>'result' AS check_result,
-               d.claim_check->'statements' AS statements, d.claim_check->'usage' AS usage
+               d.variant, d.subject, d.body, d.hold_reason, d.claim_check->>'result' AS check_result,
+               d.claim_check->'statements' AS statements, d.claim_check->'usage' AS usage,
+               (d.claim_check->>'repairs')::int AS repairs, d.claim_check->'attempts' AS attempts,
+               d.claim_check->'compose_usage' AS compose_usage, d.claim_check->'repair_failed' AS repair_failed
           FROM drafts d WHERE d.id > %d ORDER BY d.id""" % since_id)}
+
+
+COSTS = []
+
+
+def usd(u):
+    u = u or {}
+    return (int(u.get("input_tokens") or 0) * 2 + int(u.get("output_tokens") or 0) * 10) / 1e6
+
+
+def draft_cost(label, r):
+    """Every paid call behind one draft: composing (zero here -- a fixture), each
+    claim check, each repair."""
+    attempts = r.get("attempts") or []
+    checks = [a.get("check_usage") for a in attempts if a.get("check_usage")]
+    repairs = [a.get("repair_usage") for a in attempts if a.get("repair_usage")]
+    if (r.get("repair_failed") or {}).get("usage"):
+        repairs.append(r["repair_failed"]["usage"])
+    row = {"label": label, "draft": r["id"], "status": r["status"], "repairs": r.get("repairs") or 0,
+           "checks": len(checks), "check_usd": sum(usd(u) for u in checks), "repair_usd": sum(usd(u) for u in repairs),
+           "compose_usd": usd(r.get("compose_usage"))}
+    row["total_usd"] = row["check_usd"] + row["repair_usd"] + row["compose_usd"]
+    COSTS.append(row)
+    for u in checks + repairs:
+        tokens = int(u.get("input_tokens") or 0) + int(u.get("output_tokens") or 0)
+        if tokens:   # a fixture repair reports zero: it was not a call
+            COST["input"] += int(u.get("input_tokens") or 0)
+            COST["output"] += int(u.get("output_tokens") or 0)
+            COST["calls"] += 1
+    return row
 
 
 def max_id():
     return int(psql(DRY, "SELECT coalesce(max(id), 0) FROM drafts;").strip())
-
-
-def tally(rows):
-    for r in rows:
-        u = r.get("usage") or {}
-        if u:
-            COST["input"] += int(u.get("input_tokens") or 0)
-            COST["output"] += int(u.get("output_tokens") or 0)
-            COST["calls"] += 1
 
 
 def verdicts(row):
@@ -412,12 +483,17 @@ def verdicts(row):
 
 
 def print_row(label, r):
-    print("    %-34s draft %-4s %-8s %-8s approved_by=%-5s %s" % (label, r["id"], r["channel"], r["status"],
-                                                                  r["approved_by"], r["variant"]))
+    print("    %-34s draft %-4s %-8s %-8s approved_by=%-5s repairs=%s %s" % (
+        label, r["id"], r["channel"], r["status"], r["approved_by"], r.get("repairs"), r["variant"]))
     if r["hold_reason"]:
         print("      hold_reason: %s" % r["hold_reason"])
-    for v in verdicts(r):
-        print("      check: %-8s %-11s %-10s %s" % v)
+    for a in r.get("attempts") or []:
+        print("      attempt %s: %s%s" % (a.get("attempt"), a.get("result"),
+                                       ("  rewrote: " + "; ".join("\"%s\" -> \"%s\"" % (x["original"][:60], x["replacement"][:60])
+                                                                 for x in a.get("rewrites") or [])) if a.get("rewrites") else ""))
+        for st_ in a.get("statements") or []:
+            if st_["kind"] != "none" and st_["verdict"] != "supported":
+                print("        check: %-8s %-11s %-10s %s" % (st_["kind"], st_["verdict"], st_.get("source", ""), st_["statement"][:80]))
 
 
 # =============================================================================
@@ -486,7 +562,6 @@ show("Write Follow-Up", [{k: w[k] for k in ("lead_id", "status", "approved_by", 
                          for w in out_items(run2, "Write Follow-Up")])
 checked_fu = out_items(run2, "Claude Claim Check") or []
 w = written(since)
-tally(w.values())
 print("  what was written:")
 for key, label in (((50, "email"), "lead 50 clean first touch"), ((50, "linkedin"), "lead 50 LinkedIn"),
                    ((104, "email"), "lead 104 tagged first touch"), ((104, "linkedin"), "lead 104 LinkedIn"),
@@ -510,11 +585,17 @@ expect("2. a tagged draft is HELD with its tags, and no claim check was paid for
        and r.get("check_result") is None and not any(g["lead_id"] == 104 and g["needs_check"] for g in gate),
        str({k: r.get(k) for k in ("status", "hold_reason", "variant")}))
 r = w.get((7, "email"), {})
-widened = [s for s in (r.get("statements") or []) if s["kind"] == "claim" and s["verdict"] == "widened"]
-expect("3. draft 99's follow-up text is HELD by the claim check, which names the widened statement",
-       r.get("status") == "pending" and r.get("approved_by") is None and r.get("check_result") == "hold"
-       and (r.get("hold_reason") or "").startswith("claim-check: ") and "exactly what came in" in (r.get("hold_reason") or "")
-       and widened, str({k: r.get(k) for k in ("status", "hold_reason")}))
+first = (r.get("attempts") or [{}])[0]
+expect("3. draft 99's follow-up text widens on the first attempt -- the check names the widened statement",
+       first.get("result") == "hold" and any(x["verdict"] == "widened" and "exactly what came in" in x["statement"]
+                                             for x in first.get("statements") or []),
+       str(first.get("reasons")))
+expect("3. ... is REPAIRED by the real model and then APPROVED: the checker passes the repaired text",
+       r.get("status") == "approved" and r.get("approved_by") == "auto" and r.get("check_result") == "pass"
+       and (r.get("repairs") or 0) >= 1 and "exactly what came in" not in (r.get("body") or ""),
+       str({k: r.get(k) for k in ("status", "repairs", "hold_reason")}))
+r50 = w.get((50, "email"), {})
+expect("a clean draft costs no repair", (r50.get("repairs"), w.get((91, "email"), {}).get("repairs")) == (0, 0))
 r = w.get((78, "email"), {})
 expect("4. a low-context draft is HELD, without any model call",
        r.get("status") == "pending" and (r.get("hold_reason") or "").startswith("low-context") and r.get("check_result") is None,
@@ -526,8 +607,12 @@ expect("5. every LinkedIn draft is HELD (Section 6) -- including the clean lead'
 expect("exactly the email drafts that passed rules 1-4 reached the claim check (50 and the two follow-ups)",
        (len(checked_ft), len(checked_fu)) == (1, 2), "first touch %d, follow-ups %d" % (len(checked_ft), len(checked_fu)))
 expect("nothing else came out approved",
-       sorted(k for k, x in w.items() if x["status"] == "approved") == [(50, "email"), (91, "email")],
+       sorted(k for k, x in w.items() if x["status"] == "approved") == [(7, "email"), (50, "email"), (91, "email")],
        str(sorted(k for k, x in w.items() if x["status"] == "approved")))
+for key, label in (((50, "email"), "clean first touch"), ((91, "email"), "clean follow-up"),
+                   ((7, "email"), "draft 99's text, repaired")):
+    if key in w:
+        draft_cost(label, w[key])
 
 print("  -- Send, unchanged: is an auto-approved draft an ordinary candidate? --")
 run = execute("send0001dry")
@@ -537,10 +622,10 @@ excl = {x["draft_id"]: x["reason"] for x in dec["excluded"]}
 show("Decide Send", {"send": dec["send"], "reason": dec["reason"],
                      "eligible": [(e["draft_id"], e["country"], e["local_time"], e["in_window"]) for e in dec["eligible"]],
                      "excluded": sorted(excl.items())})
-ids = [w.get(k, {}).get("id", -1) for k in ((50, "email"), (91, "email"))]
-expect("both auto-approved drafts pass every Send guard (eligible; business hours and pacing decide the rest)",
+ids = [w.get(k, {}).get("id", -1) for k in ((50, "email"), (91, "email"), (7, "email"))]
+expect("every auto-approved draft -- the repaired one too -- passes every Send guard (eligible; hours and pacing decide)",
        all(i in elig for i in ids), "eligible %s, excluded %s" % (sorted(elig), excl))
-held_ids = [w.get(k, {}).get("id", -1) for k in ((7, "email"), (104, "email"), (78, "email"))]
+held_ids = [w.get(k, {}).get("id", -1) for k in ((104, "email"), (78, "email"))]
 expect("no held draft is even a candidate", not any(i in elig or i in excl for i in held_ids))
 
 print("  -- the Daily Digest --")
@@ -560,10 +645,10 @@ if notes:
     print("    Subject: %s" % m.get("Subject"))
     for ln in text.rstrip("\n").split("\n"):
         print("    | " + ln)
-expect("the digest lists both auto-approvals under AUTO-APPROVED",
-       all(("#%d  " % i) in text.split("SENT (")[0] for i in ids) and "AUTO-APPROVED (2)" in text, "")
-expect("... and the held drafts with their reasons: the widened claim, the tags, low-context, LinkedIn",
-       "exactly what came in" in text and "rule-tags: " in text and "low-context: " in text and "linkedin: " in text)
+expect("the digest lists all three auto-approvals under AUTO-APPROVED",
+       all(("#%d  " % i) in text.split("SENT (")[0] for i in ids) and "AUTO-APPROVED (3)" in text, "")
+expect("... and the held drafts with their reasons: the tags, low-context, LinkedIn",
+       "rule-tags: " in text and "low-context: " in text and "linkedin: " in text)
 expect("recorded once SMTP accepted it", rec and rec[0]["recorded"] == 1)
 before = len(sink_log())
 run = execute("digest0001dry")
@@ -586,8 +671,8 @@ expect("6. nothing auto-approves: every new draft is pending, approved_by empty"
        str(sorted((k, x["status"]) for k, x in w.items())))
 expect("6. the clean first touch and the clean follow-up are held for the flag",
        all((w.get(k, {}).get("hold_reason") or "").startswith("auto-approve-off") for k in ((50, "email"), (91, "email"))))
-expect("6. and no claim check ran in either workflow -- nothing was paid for",
-       not ran(run, "Claude Claim Check") and not ran(run2, "Claude Claim Check"))
+expect("6. and no claim check or repair ran in either workflow -- nothing was paid for",
+       not any(ran(x, n) for x in (run, run2) for n in ("Claude Claim Check", "Claude Repair 1", "Claude Repair 2")))
 print()
 
 # --- 3. the database's own guard --------------------------------------------------------------
@@ -603,29 +688,51 @@ expect("with the flag off, even a well-formed auto-approval is held by the table
 expect("and a tagged one says why", "rule tags long" in row[1]["hold_reason"])
 print()
 
-# --- 4. stability and the approved drafts ------------------------------------------------------
-print("=== 4. the check again: draft 99 a second time, the widening inside a first touch, drafts 100 and 101 ===")
-fresh("UPDATE leads SET status = 'contact_found' WHERE id = 91;\nDELETE FROM drafts WHERE variant LIKE 'follow-up-%';\n")
+# --- 4. the repair loop's two ends ------------------------------------------------------------------
+print("=== 4. a first touch repaired by the real model; a follow-up whose repairs keep widening ===")
+fresh("UPDATE leads SET status = 'contact_found' WHERE id = 91;\n"
+      "UPDATE leads SET status = 'drafted' WHERE id = 104;\n"
+      "DELETE FROM drafts WHERE variant LIKE 'follow-up-%';\n")
 since = max_id()
 import_wf(drafting_variant({91: WIDENED_FIRST_TOUCH})[0])
-import_wf(followups_variant({7: DRAFT_99, 104: DRAFT_101})[0])
-execute("drafting0001t")
-execute("followup0001t")
+stubborn_wf, _ = followups_variant({7: DRAFT_99}, stubborn=True)
+got = node_diff(followups_variant({7: DRAFT_99})[0], stubborn_wf)
+expect("the stubborn variant differs from the same variant with real repairs only in its two repair nodes (fixtures); "
+       "every check is real",
+       got == sorted([("Claude Repair 1", "credentials"), ("Claude Repair 1", "replaced by a fixture"),
+                      ("Claude Repair 2", "credentials"), ("Claude Repair 2", "replaced by a fixture")])
+       and all(n["type"] == "n8n-nodes-base.httpRequest" for n in stubborn_wf["nodes"] if n["name"].startswith("Claude Claim Check")),
+       str(got))
+import_wf(stubborn_wf)
+run = execute("drafting0001t")
+run2 = execute("followup0001t")
 w = written(since)
-fresh("DELETE FROM drafts WHERE variant LIKE 'follow-up-%';\nUPDATE leads SET status = 'drafted' WHERE id IN (7, 104);\n")
-since2 = max_id()
-import_wf(followups_variant({91: DRAFT_100})[0])
-execute("followup0001t")
-w2 = written(since2)
-tally(list(w.values()) + list(w2.values()))
-for key, label, src in (((7, "email"), "draft 99's text (2nd run)", w), ((91, "email"), "lead 91 first touch + widening", w),
-                        ((104, "email"), "draft 101's text", w), ((91, "email"), "draft 100's text", w2)):
-    if key in src:
-        print_row(label, src[key])
-expect("draft 99's text is held again on a second, independent run",
-       w.get((7, "email"), {}).get("status") == "pending" and "exactly what came in" in (w.get((7, "email"), {}).get("hold_reason") or ""))
-expect("the same widening inside a first touch is held too (the first-touch path)",
-       w.get((91, "email"), {}).get("status") == "pending" and (w.get((91, "email"), {}).get("hold_reason") or "").startswith("claim-check"))
+for key, label in (((91, "email"), "lead 91 first touch + widening"), ((7, "email"), "lead 7: repairs keep widening")):
+    if key in w:
+        print_row(label, w[key])
+    else:
+        print("    %-34s NOT WRITTEN" % label)
+r = w.get((91, "email"), {})
+first = (r.get("attempts") or [{}])[0]
+expect("3. a first touch that widens on the first attempt is repaired by the real model and APPROVED",
+       first.get("result") == "hold" and r.get("status") == "approved" and r.get("approved_by") == "auto"
+       and (r.get("repairs") or 0) >= 1 and "exactly what came in" not in (r.get("body") or ""),
+       str({k: r.get(k) for k in ("status", "repairs", "hold_reason")}))
+r = w.get((7, "email"), {})
+atts = r.get("attempts") or []
+expect("3. a draft that keeps widening is HELD after 2 repairs -- three attempts, each held by the real check",
+       r.get("status") == "pending" and r.get("approved_by") is None and r.get("repairs") == 2 and len(atts) == 3
+       and all(a.get("result") == "hold" for a in atts),
+       str({"status": r.get("status"), "repairs": r.get("repairs"), "attempts": [a.get("result") for a in atts]}))
+hr = r.get("hold_reason") or ""
+expect("3. ... with every attempt's reasons recorded, labelled", hr.startswith("first draft: claim-check: ")
+       and " | after repair 1: " in hr and " | after repair 2: " in hr, hr)
+expect("3. ... and the loop ran exactly its rounds: three checks, two repairs, no more",
+       all(ran(run2, n) for n in ("Claude Claim Check", "Claude Claim Check R1", "Claude Claim Check R2", "Claude Repair 1",
+                                  "Claude Repair 2")) and len(out_items(run2, "Claude Claim Check R2") or []) == 1)
+for key, label in (((91, "email"), "first touch, repaired"), ((7, "email"), "kept widening, held")):
+    if key in w:
+        draft_cost(label, w[key])
 print()
 
 # --- the real database, untouched --------------------------------------------------------------
@@ -634,7 +741,13 @@ real_after = fingerprint(REAL)
 show("real novascout AFTER ", real_after)
 expect("the real novascout database is the same shape as before the run", real_after == real_before)
 cost = COST["input"] * 2 / 1e6 + COST["output"] * 10 / 1e6
-print("  claim checks paid for: %d calls, %d input + %d output tokens = $%.4f (Sonnet 5.5, $2/$10 per MTok)"
+print("\n  cost per draft, repairs included (Sonnet 5.5, $2/$10 per MTok; the composer is a fixture here, $0):")
+print("    %-28s %-6s %-9s %-8s %-7s %-10s %-10s %s" % ("draft", "id", "status", "repairs", "checks", "checks $",
+                                                       "repairs $", "total $"))
+for c in COSTS:
+    print("    %-28s %-6s %-9s %-8s %-7s %-10.4f %-10.4f %.4f" % (c["label"], c["draft"], c["status"], c["repairs"],
+                                                               c["checks"], c["check_usd"], c["repair_usd"], c["total_usd"]))
+print("  paid calls in this run: %d (checks + real repairs), %d input + %d output tokens = $%.4f"
       % (COST["calls"], COST["input"], COST["output"], cost))
 if not KEEP:
     psql("postgres", "DROP DATABASE IF EXISTS %s WITH (FORCE);\nDROP DATABASE IF EXISTS %s WITH (FORCE);" % (DRY, BASE))

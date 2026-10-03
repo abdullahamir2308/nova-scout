@@ -198,7 +198,12 @@ return {
       claims: src.check_claims,
       first_email: src.first_core,
       check: { subject: null, text: core },
+      repair_fields: ['body', 'ask'],
     },
+    // The repair loop edits the model's answer and runs it through a second
+    // copy of this node; `repair` (set by Apply Repair) carries the attempts.
+    composition: parsed,
+    repair: resp.repair || null,
     payload: {
       lead_id: src.lead_id,
       action: 'draft-follow-up',

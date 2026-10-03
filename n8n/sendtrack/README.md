@@ -22,12 +22,12 @@ python build_workflow.py          # regenerate the five workflow JSONs
 node   test_decide.js             # 74 cases -- the send decision and every guard in it
 node   test_send_result.js        # 21 cases -- what happens after the SMTP call
 node   test_mailbox.js            # 71 cases -- Sent mirror, reply classification, positive-signal flag, notification
-node   test_followup.js           # 83 cases -- composed follow-ups: the request, every section 8 rule, the frame (cross-checked against the send path), the approval context
+node   test_followup.js           # 85 cases -- composed follow-ups: the request, every section 8 rule, the frame (cross-checked against the send path), the approval context
 node   test_digest.js             # 19 cases -- the Daily Digest: when it is due, what it says
 python test_followup_mutations.py # breaks each follow-up rule in turn; test_followup.js must fail every time
 node   test_health.js             # 33 cases -- IMAP Health: problems, when it alerts, what it says
 python test_imap_health.py        # 21 cases -- the checker's answer; Message-ID parity with Mailbox Watch
-python test_drift_guards.py       # 92 cases -- each spec/wiring guard is made to fire
+python test_drift_guards.py       # 99 cases -- each spec/wiring guard is made to fire
 python provision_credentials.py   # n8n SMTP/IMAP credentials from .env (+ the two dry-run ones)
 python sync_settings.py           # the operator's notification address, .env -> the settings table
 python imap_preflight.py          # read-only: IMAP works, and the warm-up state from the real Sent folder
@@ -204,12 +204,23 @@ Find Due Follow-Ups -> Build Follow-Up -> Needs Model? -> Claude Follow-Up -> As
   tag, every claim code confirmed, and a second Sonnet 5.5 call finding every
   claim supported by a confirmed line and every prospect fact in the enrichment
   record, it is written `approved` (`approved_by = 'auto'`) and Send sends it in
-  the recipient's business hours like any approved draft. Otherwise it is
-  written `pending` with `hold_reason`. Only the note is checked -- the subject
+  the recipient's business hours like any approved draft. A claim-check hold
+  for widened or unsupported statements is first repaired (the same repair loop
+  as Workflow 4, up to 2 repairs, every rule and the check again on the result;
+  the chain is drafting's `approval_chain.py`). Otherwise it is written
+  `pending` with `hold_reason`, every attempt's reasons listed.
+- **#1's added line is said almost word for word** (skill section 8, 2026-10-03):
+  the prompt no longer says "build the note around it" -- every held follow-up
+  before this was held for a sentence added to that line -- and the build
+  refuses the phrase coming back. Only the note is checked -- the subject
   is `Re:` + one already sent, and the quoted first email already went out. The
   enrichment record reaches the checker only, never the composing model. The
-  record holds no trial (Workflow 4 stores none), so a follow-up naming one is
-  held for a person.
+  record holds no trial (Workflow 4 stores none): a follow-up that says
+  something about the trial is held, but one that only mentions it while
+  referring back to the first email passes as a reference (measured
+  2026-10-03, draft 107). Nor is "pharma team" a rule tag -- a note referring
+  back to a 2026-09-22 first email can copy that retired v2 wording (drafts
+  107 and 108 did; `audit_drafts_vs_onepager.py` fails on them).
 - A failed call writes nothing; the lead is due again next run. Write Follow-Up
   dedupes on the follow-up **number** (`follow-up-1/BEN-DECK.A1+...` and a
   pre-2026-10-02 bare `follow-up-1` are the same slot).

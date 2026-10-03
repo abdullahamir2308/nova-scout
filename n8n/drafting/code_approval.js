@@ -27,6 +27,18 @@
 // auto-approval that breaks one into a hold, so a bug here can make the
 // workflow approve less, never more.
 //
+// THE REPAIR LOOP (2026-10-03). When 5 holds an email for a widened or
+// unsupported statement, the drafting model is sent the email and the
+// checker's exact reasons and rewrites only the flagged sentences
+// (code_approval_apply.js builds that request; code_approval_repair.js
+// applies the rewrites -- by code, so nothing else in the email can change).
+// The repaired composition then runs through a second copy of the Assemble
+// node (every rule again, the same code), this gate, and the claim check
+// again. At most MAX_REPAIRS repairs; the workflows unroll exactly that many
+// rounds. Nothing about rules 1-5 is relaxed: a repair is one more chance to
+// pass the same checks. A draft is HELD for a claim-check failure only after
+// the repairs, and hold_reason then lists every attempt's reasons.
+//
 // The item this node reads carries `payload` (the drafts Write will insert --
 // `payload.drafts` in Workflow 4, `payload.draft` in Follow-Ups) and
 // `approval`, the context its Assemble node built:
@@ -37,6 +49,10 @@
 //   approval.claims        [{code, slot, body, confirmed}] -- the lines it may use
 //   approval.first_email   the first email as sent (follow-ups only), context
 //   approval.check         {subject, text}: the generated text the email carries
+//   approval.repair_fields the composition fields that text came from
+//
+// plus `composition` (the model's parsed answer, which a repair edits) and,
+// after a repair, `repair` (the attempts so far, for the record).
 //
 // A low-context item (Workflow 4's other branch) has no `approval`; its drafts
 // are held for what they are.
@@ -376,6 +392,201 @@ function judgeCheck(resp, ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// The repair loop
+// ---------------------------------------------------------------------------
+
+// The workflows unroll exactly this many repair rounds; both builds refuse a
+// different count.
+const MAX_REPAIRS = 2;
+
+// What a repair may fix: a statement the checker judged to say more than its
+// source. A check that failed as a process (an HTTP error, a refusal, quotes
+// that do not cover the email, a "supported" claim citing no confirmed code) is
+// not a sentence the composer can rewrite, so it is held as it is.
+const REPAIRABLE = ['widened', 'unsupported', 'joined'];
+
+const REPAIR_SCHEMA = {
+  type: 'object',
+  properties: {
+    rewrites: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          original: { type: 'string' },
+          replacement: { type: 'string' },
+        },
+        required: ['original', 'replacement'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['rewrites'],
+  additionalProperties: false,
+};
+
+const REPAIR_SYSTEM_PROMPT = [
+  'You repair one outbound sales email that an automatic claim check held. A small company sells a',
+  'website assistant to contract research organisations (CROs). The check found sentences that say',
+  'more than their sources support. Rewrite ONLY those sentences, so that each says no more than its',
+  'source. Every other sentence stays exactly as it is -- you are not shown it to change it.',
+  '',
+  'You are given APPROVED CLAIMS (the only things the email may say about what we built, what it does,',
+  'the problem it addresses, who uses it, and the offer), the PROSPECT RECORD (the only facts about the',
+  'recipient), the email, and each flagged sentence with the checker\'s exact reason.',
+  '',
+  'For each flagged sentence:',
+  '- Remove what the checker says goes beyond the source. Say what the approved claim says, in its own',
+  '  words, rephrased only for grammar and to fit the sentence.',
+  '- Add nothing: no new claim, fact, number, outcome, consequence or name. Shorter is better than',
+  '  wider.',
+  '- If nothing in the sentence can stay without the widening, make it the approved claim it rests on,',
+  '  or return an empty replacement to delete the sentence.',
+  '- Keep "(we call it Nova)" if the sentence has it. No greeting, no links.',
+  '',
+  'Return JSON: rewrites, one per flagged sentence -- "original" (the flagged sentence exactly as it is',
+  'given to you) and "replacement".',
+].join('\n');
+
+// The flagged sentences, each with every reason the checker gave for it.
+function flaggedSentences(statements) {
+  const out = [];
+  const byKey = {};
+  (statements || []).forEach(function (s) {
+    if (!s || REPAIRABLE.indexOf(s.verdict) === -1) return;
+    const key = apWords(s.sentence).replace(/^subject /, '');
+    if (!key) return;
+    if (!byKey[key]) {
+      byKey[key] = { sentence: apStr(s.sentence).replace(/^subject:\s*/i, ''), reasons: [] };
+      out.push(byKey[key]);
+    }
+    byKey[key].reasons.push({ statement: apStr(s.statement), kind: s.kind, verdict: s.verdict,
+      source: apStr(s.source), why: apStr(s.why) });
+  });
+  return out;
+}
+
+function repairPrompt(ctx, flagged) {
+  const claims = (ctx.claims || []).filter(function (c) { return c && c.confirmed === true; });
+  const subject = apStr(ctx.check && ctx.check.subject);
+  const out = ['APPROVED CLAIMS:'].concat(claims.map(function (c) {
+    return '  [' + apStr(c.code) + '] (' + apStr(c.slot) + ') ' + apStr(c.body);
+  }), ['', 'PROSPECT RECORD:', apStr(ctx.record) || '(nothing is known about them)']);
+  if (ctx.kind === 'follow-up' && apStr(ctx.first_email)) {
+    out.push('', 'THE FIRST EMAIL, already sent to them -- context only:', '---', apStr(ctx.first_email), '---');
+  }
+  out.push('', 'THE EMAIL:');
+  if (subject) out.push('Subject: ' + subject);
+  out.push('---', apStr(ctx.check && ctx.check.text), '---', '', 'FLAGGED SENTENCES -- rewrite these, and only these:');
+  flagged.forEach(function (f, i) {
+    out.push(String(i + 1) + '. ' + f.sentence);
+    f.reasons.forEach(function (r) {
+      out.push('   checker: ' + r.verdict + ' -- "' + r.statement + '"' + (r.source ? ' (compared with ' + r.source + ')' : '') +
+        ': ' + r.why);
+    });
+  });
+  return out.join('\n');
+}
+
+function repairRequest(ctx, flagged) {
+  return {
+    model: CHECK_MODEL,
+    max_tokens: CHECK_MAX_TOKENS,
+    output_config: { effort: CHECK_EFFORT, format: { type: 'json_schema', schema: REPAIR_SCHEMA } },
+    system: REPAIR_SYSTEM_PROMPT,
+    messages: [{ role: 'user', content: repairPrompt(ctx, flagged) }],
+  };
+}
+
+// Where a quoted sentence sits in a field of the composition: compared word by
+// word, folded the same way the coverage check folds, so curly quotes, case and
+// accents do not stop a match. The span runs to the end of its trailing
+// punctuation.
+function tokenSpans(text) {
+  const re = /[\p{L}\p{N}]+/gu;
+  const out = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    out.push({ w: apWords(m[0]), s: m.index, e: m.index + m[0].length });
+  }
+  return out.filter(function (t) { return t.w; });
+}
+
+function locate(text, quote) {
+  const q = apWords(quote).replace(/^subject /, '').split(' ').filter(Boolean);
+  if (!q.length) return null;
+  const t = tokenSpans(text);
+  for (let i = 0; i + q.length <= t.length; i++) {
+    let ok = true;
+    for (let j = 0; j < q.length; j++) {
+      if (t[i + j].w !== q[j]) { ok = false; break; }
+    }
+    if (ok) {
+      let end = t[i + q.length - 1].e;
+      while (end < text.length && !/\s/.test(text[end])) end++;
+      return { s: t[i].s, e: end };
+    }
+  }
+  return null;
+}
+
+// The model's rewrites, applied BY CODE to the fields the email's generated
+// text came from. A rewrite whose original is not a flagged sentence is
+// ignored, so a repair can change nothing the checker did not flag.
+function applyRewrites(composition, fields, flagged, rewrites) {
+  const out = JSON.parse(JSON.stringify(composition || {}));
+  const keys = {};
+  flagged.forEach(function (f) { keys[apWords(f.sentence)] = f; });
+  const applied = [];
+  const ignored = [];
+  (rewrites || []).forEach(function (r) {
+    const original = apStr(r && r.original).replace(/^subject:\s*/i, '');
+    const replacement = apStr(r && r.replacement);
+    const f = keys[apWords(original)];
+    if (!f) {
+      ignored.push({ original: original, why: 'not a flagged sentence' });
+      return;
+    }
+    for (let i = 0; i < (fields || []).length; i++) {
+      const field = fields[i];
+      if (typeof out[field] !== 'string') continue;
+      const at = locate(out[field], f.sentence);
+      if (!at) continue;
+      const before = out[field].slice(0, at.s);
+      const after = out[field].slice(at.e);
+      if (replacement) {
+        out[field] = before + replacement + after;
+      } else {
+        // An empty replacement deletes the sentence, and the space beside it.
+        const b = before.replace(/[ \t]+$/, '');
+        const a = after.replace(/^[ \t]+/, '');
+        out[field] = b + (b && a && !/\n$/.test(b) && !/^\n/.test(a) ? ' ' : '') + a;
+      }
+      applied.push({ field: field, original: f.sentence, replacement: replacement });
+      delete keys[apWords(original)];
+      return;
+    }
+    ignored.push({ original: original, why: 'not found in the email' });
+  });
+  const changed = applied.some(function (a) { return apWords(a.original) !== apWords(a.replacement); });
+  return { composition: out, applied: applied, ignored: ignored, changed: changed };
+}
+
+// Every attempt's reasons, for hold_reason. One attempt reads as it always
+// did; after repairs each attempt is labelled.
+function attemptLabel(n) {
+  return n === 1 ? 'first draft' : 'after repair ' + (n - 1);
+}
+
+function historyText(history) {
+  const list = (history || []).filter(function (h) { return h && Array.isArray(h.reasons); });
+  if (list.length === 1 && !list[0].repair_failed) return list[0].reasons.join('; ');
+  return list.map(function (h) {
+    return attemptLabel(h.attempt) + ': ' + h.reasons.join('; ') + (h.repair_failed ? '; repair ' + h.attempt + ' failed: ' + h.repair_failed : '');
+  }).join(' | ');
+}
+
+// ---------------------------------------------------------------------------
 // Node body
 // ---------------------------------------------------------------------------
 
@@ -386,6 +597,12 @@ const ctx = item.approval || null;
 const payload = JSON.parse(JSON.stringify(item.payload || {}));
 const list = draftsOf(payload);
 
+// After a repair: the attempts so far belong to the draft the repair was for.
+// If this gate now holds it (a rewrite that broke a rule), every earlier
+// attempt's reasons stay on it.
+const repair = item.repair && typeof item.repair === 'object' ? item.repair : null;
+const prior = repair && Array.isArray(repair.history) ? repair.history : [];
+
 const candidates = [];
 list.forEach(function (d, i) {
   const reasons = gateReasons(d, ctx);
@@ -393,6 +610,12 @@ list.forEach(function (d, i) {
   d.approved_by = null;
   d.claim_check = null;
   d.hold_reason = reasons.length ? reasons.join('; ') : null;
+  if (reasons.length && prior.length && repair.target === i) {
+    const history = prior.concat([{ attempt: prior.length + 1, result: 'hold', reasons: reasons, statements: [] }]);
+    d.hold_reason = historyText(history);
+    d.claim_check = { result: 'hold', reasons: reasons, repairs: prior.length, attempts: history,
+      compose_usage: repair.compose_usage || null };
+  }
   if (!reasons.length) candidates.push(i);
 });
 

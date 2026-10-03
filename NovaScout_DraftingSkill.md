@@ -173,7 +173,7 @@ The master doc's Section 9 sets the schedule: no reply after 6 days, a follow-up
 
 **Follow-up #1.** 40–70 words between the greeting and the opt-out line.
 - Open by referring back to the first email in a few words ("Following up on my note about after-hours sponsor inquiries"). Do not restate it.
-- Add one angle or benefit from §4 that the first email did not use, and build the note around it.
+- Add one angle or benefit from §4 that the first email did not use, in that line's own words: almost word for word, rephrased only for grammar ("It sends" may become "the assistant sends"). Add nothing to it — no consequence, no outcome, no "so you can …", no second sentence about it. (Amended 2026-10-03: "build the note around it" invited exactly that, and all six composed follow-ups the claim check held — 99–101, 104–106 — were held for a sentence added to this line.)
 - Exactly one ask, from the ask lines, rephrased if you like.
 
 **Follow-up #2 — a short final note.** At most 40 words. Say this is the last note, restate the offer as the one ask, and add no new claim.
@@ -182,4 +182,4 @@ The master doc's Section 9 sets the schedule: no reply after 6 days, a follow-up
 
 ---
 
-*Skill v3, 2026-09-30. Amended 2026-10-02: D2, BEN-BOOK, BEN-247 and BEN-ROUTE settled against the Nova Agent Kit code, the no-repeat rule, and follow-ups composed (§8). Change claims in the table; change structure only with evidence from real replies.*
+*Skill v3, 2026-09-30. Amended 2026-10-02: D2, BEN-BOOK, BEN-247 and BEN-ROUTE settled against the Nova Agent Kit code, the no-repeat rule, and follow-ups composed (§8). Amended 2026-10-03: follow-up #1's added line almost word for word (§8). Change claims in the table; change structure only with evidence from real replies.*

@@ -34,6 +34,9 @@ RULES = os.path.join(REPO, "n8n", "drafting", "code_assemble.js")
 # Apply Claim Check verbatim, so each case gets its own copy of those too.
 APPROVAL = os.path.join(REPO, "n8n", "drafting", "code_approval.js")
 APPROVAL_APPLY = os.path.join(REPO, "n8n", "drafting", "code_approval_apply.js")
+# The repair loop (2026-10-03): Apply Repair's body and the chain generator.
+APPROVAL_REPAIR = os.path.join(REPO, "n8n", "drafting", "code_approval_repair.js")
+APPROVAL_CHAIN = os.path.join(REPO, "n8n", "drafting", "approval_chain.py")
 
 PASSED = []
 FAILED = []
@@ -85,7 +88,11 @@ def setup(mutate_doc=None, mutate_compose=None, mutate_file=None, mutate_skill=N
                                 (APPROVAL, os.path.join("drafting", "code_approval.js"), mutate_approval,
                                  "code_approval.js"),
                                 (APPROVAL_APPLY, os.path.join("drafting", "code_approval_apply.js"), None,
-                                 "code_approval_apply.js")):
+                                 "code_approval_apply.js"),
+                                (APPROVAL_REPAIR, os.path.join("drafting", "code_approval_repair.js"), None,
+                                 "code_approval_repair.js"),
+                                (APPROVAL_CHAIN, os.path.join("drafting", "approval_chain.py"), None,
+                                 "approval_chain.py")):
         text = read(src)
         if fn:
             new = fn(text)
@@ -303,12 +310,54 @@ case("Write Follow-Up reads a draft field nothing upstream produces -> refuses",
 case("the shared gate reads an approval field Assemble Follow-Up never builds -> refuses",
      "Assemble Follow-Up's `approval` has no",
      mutate_approval=lambda s: s.replace("if (ctx.auto_approve !== true)", "if (ctx.auto_approve !== true || ctx.reviewer)", 1))
+def _rules():
+    return read(APPROVAL)[:read(APPROVAL).index("// Node body")]
+
+
 positive(
-    "Follow-Ups ships drafting's Approval Gate verbatim, and Apply Claim Check as its rules + the apply body",
-    lambda tmp: None if _fu_code(tmp, "Approval Gate") == read(APPROVAL)
-    and _fu_code(tmp, "Apply Claim Check") == read(APPROVAL)[:read(APPROVAL).index("// Node body")] + "\n" + read(APPROVAL_APPLY)
-    else "the follow-up approval nodes are not drafting's code, verbatim",
+    "Follow-Ups ships drafting's Approval Gate verbatim in every round, and Apply Claim Check / Apply Repair as its "
+    "rules + their bodies, each reading its own round's node",
+    lambda tmp: None if all(_fu_code(tmp, g) == read(APPROVAL) for g in ("Approval Gate", "Approval Gate R1", "Approval Gate R2"))
+    and _fu_code(tmp, "Apply Claim Check") == _rules() + "\n" + read(APPROVAL_APPLY).replace("$('__GATE__')", "$('Approval Gate')")
+    and _fu_code(tmp, "Apply Claim Check R2") == _rules() + "\n" + read(APPROVAL_APPLY).replace("$('__GATE__')", "$('Approval Gate R2')")
+    and _fu_code(tmp, "Apply Repair 1") == _rules() + "\n" + read(APPROVAL_REPAIR).replace("$('__CHECKED__')", "$('Apply Claim Check')")
+    and _fu_code(tmp, "Apply Repair 2") == _rules() + "\n" + read(APPROVAL_REPAIR).replace("$('__CHECKED__')", "$('Apply Claim Check R1')")
+    and _fu_code(tmp, "Assemble Follow-Up R1") == _fu_code(tmp, "Assemble Follow-Up")
+    else "the follow-up approval and repair nodes are not drafting's code, verbatim, each reading its own round",
 )
+positive(
+    "MAX_REPAIRS decides how many repair rounds Follow-Ups unrolls",
+    lambda tmp: None if "Apply Claim Check R3" in {n["name"] for n in load(tmp, "follow-ups.json")["nodes"]}
+    else "MAX_REPAIRS = 3 did not unroll a third round",
+    mutate_approval=lambda s: s.replace("const MAX_REPAIRS = 2;", "const MAX_REPAIRS = 3;", 1),
+)
+case("the repair is sent to a cheaper model than the claim check -> refuses", "the repair request no longer uses",
+     mutate_approval=lambda s: s.replace("function repairRequest(ctx, flagged) {\n  return {\n    model: CHECK_MODEL,",
+                                         "function repairRequest(ctx, flagged) {\n  return {\n    model: 'claude-haiku-4-5',", 1))
+case("Apply Claim Check stops reading its own round's gate -> refuses", "must read $('__GATE__') exactly once",
+     mutate_file=("build_workflow.py", lambda s: s.replace("import approval_chain  # noqa: E402",
+                                                           "import approval_chain  # noqa: E402\n"
+                                                           "approval_chain_load = approval_chain.load\n"
+                                                           "def _load(d):\n"
+                                                           "    import io as _io\n"
+                                                           "    p = os.path.join(d, 'code_approval_apply.js')\n"
+                                                           "    src = _io.open(p, encoding='utf-8').read()\n"
+                                                           "    _io.open(p, 'w', encoding='utf-8').write(src.replace(\"$('__GATE__')\", \"$('Approval Gate')\"))\n"
+                                                           "    return approval_chain_load(d)\n"
+                                                           "approval_chain.load = _load", 1)))
+case("Assemble Follow-Up stops handing the composition to the repair loop -> refuses",
+     "the repair loop (composition / repair / repair_fields)",
+     mutate_file=("code_followup_assemble.js", lambda s: s.replace("    composition: parsed,\n", "", 1)))
+case("a repaired follow-up reaches Write Follow-Up without the Approval Gate -> refuses",
+     "something reaches Write Follow-Up without the Approval Gate",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         '    "Drop Failed Generations": edge("Approval Gate"),\n    **_fu_chain_conns,\n}',
+         '    "Drop Failed Generations": edge("Approval Gate"),\n    **_fu_chain_conns,\n'
+         '    "Apply Repair 1": edge("Write Follow-Up"),\n}', 1)))
+case("'build the note around it' comes back into the follow-up prompt -> refuses", "build the note around it",
+     mutate_file=("code_followup.js", lambda s: s.replace("almost word for word,", "almost word for word, and build the note around it,", 1)))
+case("skill section 8 drops the word-for-word rule -> refuses", "almost word for word",
+     mutate_skill=lambda s: s.replace("in that line's own words: almost word for word", "in its own words", 1))
 
 # --- the Daily Digest --------------------------------------------------------
 case("Build Digest reads a field Load Digest does not return -> refuses", "Load Digest does not produce",

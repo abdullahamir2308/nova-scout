@@ -466,7 +466,9 @@ gate_src = nodes["Approval Gate"]["parameters"]["jsCode"]
 apply_src = nodes["Apply Claim Check"]["parameters"]["jsCode"]
 rules_src = gate_src[:gate_src.index("// Node body")]
 probe = subprocess.run(["node", "-e", rules_src + "\nprocess.stdout.write(JSON.stringify({model: CHECK_MODEL, effort: "
-                        "CHECK_EFFORT, max_tokens: CHECK_MAX_TOKENS, schema: CHECK_SCHEMA, system: CHECK_SYSTEM_PROMPT}));"],
+                        "CHECK_EFFORT, max_tokens: CHECK_MAX_TOKENS, schema: CHECK_SCHEMA, system: CHECK_SYSTEM_PROMPT, "
+                        "max_repairs: MAX_REPAIRS, repairable: REPAIRABLE, repair_schema: REPAIR_SCHEMA, "
+                        "repair_system: REPAIR_SYSTEM_PROMPT}));"],
                        capture_output=True, encoding="utf-8")
 if probe.returncode:
     sys.exit("could not evaluate the deployed Approval Gate's rules: " + probe.stderr)
@@ -474,7 +476,11 @@ CHECK = json.loads(probe.stdout)
 check_node = nodes["Claude Claim Check"]
 fu_same = (fu_nodes["Approval Gate"]["parameters"]["jsCode"] == gate_src
            and fu_nodes["Apply Claim Check"]["parameters"]["jsCode"] == apply_src
-           and fu_nodes["Claude Claim Check"]["parameters"] == check_node["parameters"])
+           and fu_nodes["Claude Claim Check"]["parameters"] == check_node["parameters"]
+           and all(fu_nodes.get("Apply Repair %d" % k, {}).get("parameters", {}).get("jsCode")
+                   == nodes.get("Apply Repair %d" % k, {}).get("parameters", {}).get("jsCode")
+                   and "Apply Repair %d" % k in nodes for k in range(1, CHECK["max_repairs"] + 1)))
+repair_rounds = sorted(n for n in nodes if n.startswith("Claude Repair "))
 flag = psql("novascout", "SELECT coalesce((SELECT value FROM settings WHERE key = 'auto_approve_email'), '(no row -- on)');")
 held = psql("novascout", "SELECT count(*) || ' pending, ' || count(*) FILTER (WHERE hold_reason IS NOT NULL) || ' with a reason' "
                          "FROM drafts WHERE status = 'pending';")
@@ -485,7 +491,8 @@ L.append("|---|---|")
 L.append("| settings.auto_approve_email | `%s` (live) |" % flag)
 L.append("| Approval Gate code | sha256 `%s…` |" % sha(gate_src))
 L.append("| Apply Claim Check code | sha256 `%s…` (the gate's rules section + the apply body) |" % sha(apply_src))
-L.append("| Follow-Ups (`%s`) | %s |" % (FU, "the same three nodes, identical code and request" if fu_same
+L.append("| Repair rounds | %d (`MAX_REPAIRS`), deployed as %s |" % (CHECK["max_repairs"], ", ".join(repair_rounds)))
+L.append("| Follow-Ups (`%s`) | %s |" % (FU, "the same gate, check and repair nodes, identical code and request" if fu_same
                                          else "**DIFFERS** from drafting0001's -- rebuild and re-import both"))
 L.append("| The exceptions queue now | %s |" % held)
 L.append("")
@@ -500,7 +507,9 @@ for line in [
     "every claim code on its `variant` is an active, confirmed line (`unconfirmed-claim: ...`, `no-claims`);",
     "the claim check below finds every claim supported by a confirmed line and every prospect fact in the record, and "
     "its quoted sentences cover the whole email (`claim-check: ...`, `claim-check-incomplete: ...`); a failed call "
-    "holds it (`claim-check-failed: ...`) -- no fallback model.",
+    "holds it (`claim-check-failed: ...`) -- no fallback model. A hold for %s statements is first **repaired**, up to "
+    "%d times (below); \"held\" for a claim-check failure means it still failed after the repairs."
+    % ("/".join(CHECK["repairable"]), CHECK["max_repairs"]),
 ]:
     L.append("- " + line)
 L.append("")
@@ -524,6 +533,17 @@ L.append("The model judges statements; code decides. Apply Claim Check approves 
          "and names a code that is a confirmed line, every `prospect` fact is `supported`, every `none` is `none`, the "
          "quoted sentences (a leading \"Subject:\" label dropped) account for every word of the email, and a first email "
          "has at least one claim. The verdicts are kept in `drafts.claim_check`.")
+L.append("")
+L.append("**The repair loop.** A hold that names %s statements goes back to the drafting model (`Claude Repair N`, "
+         "same model, effort and limits as the check) with each flagged sentence and the checker's exact reason; "
+         "`Apply Repair N` applies the rewrites by code, only to flagged sentences, and a second copy of Assemble "
+         "Drafts, the Approval Gate and the claim check run on the result. At most %d repairs; every attempt's verdicts, "
+         "rewrites and cost stay in `drafts.claim_check.attempts`, and a final hold lists every attempt's reasons. "
+         "The repair's schema and system prompt, exactly:" % ("/".join(CHECK["repairable"]), CHECK["max_repairs"]))
+L.append("")
+L.append(fence(json.dumps(CHECK["repair_schema"], indent=2), "json"))
+L.append("")
+L.append(fence(CHECK["repair_system"]))
 L.append("")
 
 with io.open(OUT, "w", encoding="utf-8", newline="\n") as fh:

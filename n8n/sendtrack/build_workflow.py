@@ -44,6 +44,7 @@ import io
 import json
 import os
 import re
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.environ.get("SENDTRACK_OUT", os.path.join(HERE, "..", "workflows"))
@@ -1463,9 +1464,16 @@ _fu_write_reads = _sql_payload_reads(FOLLOWUP_WRITE_SQL) | set(re.findall(r"p\.p
 FOLLOWUP_DECISION_FIELDS = {"status", "approved_by", "hold_reason", "claim_check"}
 _approval_all = _read(os.path.join(DRAFTING_DIR, "code_approval.js")) + _read(
     os.path.join(DRAFTING_DIR, "code_approval_apply.js"))
+_approval_repair = _read(os.path.join(DRAFTING_DIR, "code_approval_repair.js"))
 for _f in sorted(_fu_write_reads & FOLLOWUP_DECISION_FIELDS):
     assert re.search(r"\b(?:d|target)\.%s = " % _f, _approval_all), (
         "Write Follow-Up reads draft.%s, which neither Approval Gate nor Apply Claim Check sets" % _f)
+    assert re.search(r"\bd\.%s = " % _f, _approval_repair), (
+        "Write Follow-Up reads draft.%s, which Apply Repair does not set on a held draft" % _f)
+# The repair loop runs a second copy of Assemble Follow-Up, which must hand the
+# composition and the repair state on.
+_assert_js_emits("the repair loop (composition / repair / repair_fields)", {"composition", "repair", "repair_fields"},
+                 _fu_assemble, "code_followup_assemble.js")
 _assert_js_emits("Write Follow-Up (a composed follow-up)", (_fu_write_reads - FOLLOWUP_DECISION_FIELDS) |
                  {"payload", "draft"}, _fu_assemble, "code_followup_assemble.js")
 _assert_js_emits("Approval Gate (item.approval / item.payload)", {"approval", "payload"}, _fu_assemble,
@@ -1583,8 +1591,11 @@ FOLLOWUP_SYSTEM_PROMPT = "\n".join([
     "FOLLOW-UP #1:",
     "- Open by referring back to the first email in a few words (\"Following up on my note about",
     "  after-hours sponsor inquiries\"). Do not restate it.",
-    "- Add exactly ONE angle or benefit from the approved list that the first email did not use,",
-    "  and build the note around it. Never one whose point the first email already made.",
+    "- Add exactly ONE angle or benefit from the approved list that the first email did not use. Never",
+    "  one whose point the first email already made.",
+    "- Say that line almost word for word: its own words, rephrased only for grammar (\"It sends\" may",
+    "  become \"the assistant sends\"). Add nothing to it -- no consequence, no outcome, no \"so you can",
+    "  ...\", no second sentence about it. Every follow-up held so far was held for a sentence added here.",
     "- Then exactly one ask.",
     "- The body plus the ask is %d-%d words." % (FU1_MIN, FU1_MAX),
     "",
@@ -1629,6 +1640,16 @@ FOLLOWUP_SYSTEM_PROMPT = "\n".join([
     "codes of the approved angles and benefits whose point the first email already made).",
 ])
 assert "%d-%d words" % (FU1_MIN, FU1_MAX) in FOLLOWUP_SYSTEM_PROMPT and "at most %d words" % FU2_MAX in FOLLOWUP_SYSTEM_PROMPT
+# Skill section 8 (amended 2026-10-03): #1's added line is said almost word for
+# word, nothing added. The prompt and the per-lead task must both say it.
+assert re.search(r"Add one angle or benefit from §4 that the first email did not use, in that line's own words: "
+                 r"almost word for word", SKILL_DOC), (
+    "skill section 8 no longer says follow-up #1's added line is used almost word for word")
+assert "almost word for word" in FOLLOWUP_SYSTEM_PROMPT and "almost word for word" in js("code_followup.js"), (
+    "the follow-up prompt no longer tells the model to use the added line almost word for word (skill section 8)")
+assert "build the note around it" not in FOLLOWUP_SYSTEM_PROMPT + js("code_followup.js"), (
+    "'build the note around it' is back in the follow-up prompt -- it invited the added sentences every held "
+    "follow-up was held for (skill section 8, 2026-10-03)")
 
 
 DECIDE_JS = bake("code_decide.js", SIGNATURE=SIGNATURE)
@@ -1654,14 +1675,13 @@ DIGEST_JS = bake("code_digest.js", SENDER_ZONE=SENDER_ZONE, SENDER_OFFSET=SENDER
 # Check, verbatim -- drafting's code_approval.js, and its rules section followed
 # by code_approval_apply.js -- so a follow-up is judged by the same functions as
 # a first touch.
-APPROVAL_JS = _read(os.path.join(DRAFTING_DIR, "code_approval.js"))
-_approval_at = APPROVAL_JS.find("// Node body")
-assert _approval_at != -1, "drafting's code_approval.js has no '// Node body' marker"
-APPROVAL_RULES = APPROVAL_JS[:_approval_at]
-assert "$(" not in APPROVAL_RULES and "$input" not in APPROVAL_RULES, (
-    "the rules section of drafting's code_approval.js reads n8n data -- node-body code has moved above its "
-    "'Node body' marker")
-APPLY_JS = APPROVAL_RULES + "\n" + _read(os.path.join(DRAFTING_DIR, "code_approval_apply.js"))
+# The chain itself -- gate, claim check, and the repair rounds -- comes from
+# drafting's approval_chain.py, so both workflows carry the same nodes.
+sys.path.insert(0, DRAFTING_DIR)
+import approval_chain  # noqa: E402
+APPROVAL = approval_chain.load(DRAFTING_DIR)
+APPROVAL_JS = APPROVAL["gate"]
+APPROVAL_RULES = APPROVAL["rules"]
 _check_model = re.search(r"^const CHECK_MODEL = '([a-z0-9-]+)';", APPROVAL_RULES, re.M)
 _check_effort = re.search(r"^const CHECK_EFFORT = '([a-z]+)';", APPROVAL_RULES, re.M)
 assert _check_model and _check_model.group(1) == DRAFT_MODEL and _check_effort and _check_effort.group(1) == DRAFT_EFFORT, (
@@ -1908,6 +1928,13 @@ FOLLOWUP_CONFIG = {"now_override": "", "follow_up_days": FOLLOW_UP_DAYS, "max_fo
                    "batch_size": 10}
 FOLLOWUP_TRIGGER = "Every 30 Minutes"
 
+# The auto-approval chain with its repair rounds (drafting's approval_chain.py),
+# the same chain Workflow 4 carries; its Assemble copies are Assemble Follow-Up.
+_fu_chain_nodes, _fu_chain_conns, _fu_write_pos = approval_chain.build(
+    APPROVAL, "Assemble Follow-Up", FOLLOWUP_ASSEMBLE_JS, "Write Follow-Up", ANTHROPIC_CRED, DRAFT_MODEL, DRAFT_EFFORT,
+    (880, 30))
+FU_CHAIN_ROUNDS = approval_chain.names(APPROVAL["max_repairs"], "Assemble Follow-Up")
+
 followup_nodes = [
     {"parameters": {"rule": {"interval": [{"field": "minutes", "minutesInterval": 30}]}},
      "name": FOLLOWUP_TRIGGER, "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2, "position": [-880, 40],
@@ -1974,38 +2001,8 @@ followup_nodes = [
         "name": "Drop Failed Generations", "type": "n8n-nodes-base.filter", "typeVersion": 2.2, "position": [660, 30],
         "notes": "A failed Claude call writes nothing; the lead is due again on the next run.",
     },
-    code_node("Approval Gate", APPROVAL_JS, "runOnceForEachItem", [880, 30],
-              "Auto-approval, rules 1-4 (migration 014): the follow-up goes on to the claim check only if "
-              "settings.auto_approve_email is on, it carries no rule tag, and every claim code it records is "
-              "confirmed. Anything else is held -- written 'pending' with hold_reason -- and no check is paid for. "
-              "Same code as Workflow 4's node of the same name (n8n/drafting/code_approval.js)."),
-    if_node("Needs Claim Check?", "needscheck", "={{ $json.needs_check }}", [1100, 30],
-            "true: a follow-up that passed rules 1-4. false: held; straight to the write."),
-    {
-        "parameters": {
-            "method": "POST",
-            "url": "https://api.anthropic.com/v1/messages",
-            "authentication": "predefinedCredentialType",
-            "nodeCredentialType": "anthropicApi",
-            "sendHeaders": True,
-            "headerParameters": {"parameters": [{"name": "anthropic-version", "value": "2023-06-01"}]},
-            "sendBody": True,
-            "specifyBody": "json",
-            "jsonBody": "={{ JSON.stringify($json.check_request) }}",
-            "options": {"timeout": 300000},
-        },
-        "name": "Claude Claim Check", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [1320, -60],
-        "credentials": ANTHROPIC_CRED, "onError": "continueRegularOutput", "retryOnFail": True, "maxTries": 2,
-        "waitBetweenTries": 5000,
-        "notes": ("Auto-approval, rule 5: a second %s call (effort %s, Section 3) that compares each claim in the "
-                  "follow-up with the confirmed claims and each prospect fact with the enrichment record. A widened "
-                  "claim fails. Errors continue as items and hold the follow-up for a human; no fallback model."
-                  % (DRAFT_MODEL, DRAFT_EFFORT)),
-    },
-    code_node("Apply Claim Check", APPLY_JS, "runOnceForEachItem", [1540, -60],
-              "Approved by the workflow only if every statement the check found is supported and its quotes cover "
-              "the whole note. Anything else is held with the reason; the verdicts go into drafts.claim_check."),
-    pg_node("Write Follow-Up", FOLLOWUP_WRITE_SQL, "={{ [JSON.stringify($json.payload)] }}", [1760, 130],
+    *_fu_chain_nodes,
+    pg_node("Write Follow-Up", FOLLOWUP_WRITE_SQL, "={{ [JSON.stringify($json.payload)] }}", _fu_write_pos,
             "Into drafts as 'pending' with hold_reason -- the exceptions queue -- or approved by this workflow "
             "when the gate and the claim check passed it (migration 014; the table re-checks). Or the lead "
             "marked lost."),
@@ -2021,18 +2018,16 @@ followup_connections = {
     "Claude Follow-Up": edge("Assemble Follow-Up"),
     "Assemble Follow-Up": edge("Drop Failed Generations"),
     "Drop Failed Generations": edge("Approval Gate"),
-    "Approval Gate": edge("Needs Claim Check?"),
-    "Needs Claim Check?": branch("Claude Claim Check", "Write Follow-Up"),
-    "Claude Claim Check": edge("Apply Claim Check"),
-    "Apply Claim Check": edge("Write Follow-Up"),
+    **_fu_chain_conns,
 }
 
 # A composed follow-up reaches the write only through the gate; the only other
 # way in is a mark-lost row, which carries no draft.
 _into_write = sorted(src for src, outs in followup_connections.items()
                      for br in outs["main"] for e in br if e["node"] == "Write Follow-Up")
-assert _into_write == ["Apply Claim Check", "Needs Claim Check?", "Needs Model?"], (
+assert _into_write == sorted(approval_chain.exits(FU_CHAIN_ROUNDS) + ["Needs Model?"]), (
     "something reaches Write Follow-Up without the Approval Gate: %r" % _into_write)
+assert len(FU_CHAIN_ROUNDS) == APPROVAL["max_repairs"] + 1, "the chain does not unroll MAX_REPAIRS repair rounds"
 assert followup_connections["Needs Model?"]["main"][1] == [{"node": "Write Follow-Up", "type": "main", "index": 0}]
 
 # ---------------------------------------------------------------------------

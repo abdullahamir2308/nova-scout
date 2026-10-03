@@ -1,13 +1,13 @@
 # Drafting review — Workflow 4, skill v3, as deployed
 
-Generated 2026-10-03 06:46 UTC by `n8n/drafting/write_drafting_review.py`, read-only, from the live n8n and novascout databases — not from the repo.
+Generated 2026-10-03 07:41 UTC by `n8n/drafting/write_drafting_review.py`, read-only, from the live n8n and novascout databases — not from the repo.
 
 | Source | Value |
 |---|---|
-| n8n workflow | `drafting0001`, versionId `f5ededfb-d2e6-4b21-ba8f-70fd1a291718`, updated 2026-10-03T06:26:39.156+00:00 |
-| Published | yes, version `f5ededfb-d2e6-4b21-ba8f-70fd1a291718` |
+| n8n workflow | `drafting0001`, versionId `a133bc9f-61a1-4dc7-8f0f-e71bd9d74a75`, updated 2026-10-03T07:38:15.67+00:00 |
+| Published | **no** — publish it in the n8n UI; this document describes the saved version |
 | Assess Grounding code | sha256 `80f3510f77446d56…` |
-| Assemble Drafts code | sha256 `7ae5351a85940d1f…` |
+| Assemble Drafts code | sha256 `3ee0574d2fda37a8…` |
 | Sample execution | #845 (cli, 2026-10-02T11:13:34.297+00:00, workflow version `364fa8d7-c3c7-48e4-9041-704d8f6d44b1`) |
 | claims_library | 23 rows, 20 active, 20 confirmed |
 
@@ -401,7 +401,7 @@ API cost of that execution at $2 / $10 per MTok: **$0.0376** for 1 leads (3805 i
 
 ## 7. Follow-ups — Workflow 6, composed under the same rules
 
-Drafting skill v3 §8 (2026-10-02): a follow-up is no longer a template. Workflow `followup0001` (versionId `58dd5e57-9fb8-4087-abdf-9097c59dd9d2`, **not published** — publish it in the n8n UI) asks the same model for it, with the same request parameters, and checks it with the same rule functions.
+Drafting skill v3 §8 (2026-10-02): a follow-up is no longer a template. Workflow `followup0001` (versionId `3e1a26a0-bebb-42b5-ba59-d5294ac8fde4`, **not published** — publish it in the n8n UI) asks the same model for it, with the same request parameters, and checks it with the same rule functions.
 
 | | |
 |---|---|
@@ -409,7 +409,7 @@ Drafting skill v3 §8 (2026-10-02): a follow-up is no longer a template. Workflo
 | Due | no reply 6 days after the last send or follow-up; at most two follow-ups, then the lead is marked lost |
 | Lengths (note + ask) | #1 40–70 words; #2, the short final note, at most 40 |
 | Claim rules | Assemble Follow-Up embeds the deployed Assemble Drafts' rule section verbatim: **identical to drafting0001's** |
-| Assemble Follow-Up code | sha256 `e3a080563efe4427…` |
+| Assemble Follow-Up code | sha256 `52da49a3bbe6373c…` |
 
 What it is offered: the first email exactly as sent (no greeting, opt-out or signature), the asks, the country's proof line, and for #1 only the angles and benefits that email did not use — a benefit that shares a capability with one it used is withheld too. Nothing else about the prospect reaches the model. A first email written under an older claims list (leads 7, 91 and 104 were emailed under v2) cannot be read off its codes, so the model reports which approved lines it already made (`first_email_covers`) and the added line is checked against that.
 
@@ -476,8 +476,11 @@ rephrase a claim. You may never widen what it means.
 FOLLOW-UP #1:
 - Open by referring back to the first email in a few words ("Following up on my note about
   after-hours sponsor inquiries"). Do not restate it.
-- Add exactly ONE angle or benefit from the approved list that the first email did not use,
-  and build the note around it. Never one whose point the first email already made.
+- Add exactly ONE angle or benefit from the approved list that the first email did not use. Never
+  one whose point the first email already made.
+- Say that line almost word for word: its own words, rephrased only for grammar ("It sends" may
+  become "the assistant sends"). Add nothing to it -- no consequence, no outcome, no "so you can
+  ...", no second sentence about it. Every follow-up held so far was held for a sentence added here.
 - Then exactly one ask.
 - The body plus the ask is 40-70 words.
 
@@ -606,10 +609,11 @@ API cost of that execution at $2 / $10 per MTok: **$0.0529** for 3 follow-ups (8
 | | |
 |---|---|
 | settings.auto_approve_email | `true` (live) |
-| Approval Gate code | sha256 `621729df68acd70a…` |
-| Apply Claim Check code | sha256 `88777ac8f111768f…` (the gate's rules section + the apply body) |
-| Follow-Ups (`followup0001`) | the same three nodes, identical code and request |
-| The exceptions queue now | 8 pending, 8 with a reason |
+| Approval Gate code | sha256 `7b1753d81778412a…` |
+| Apply Claim Check code | sha256 `4def4b421479ba69…` (the gate's rules section + the apply body) |
+| Repair rounds | 2 (`MAX_REPAIRS`), deployed as Claude Repair 1, Claude Repair 2 |
+| Follow-Ups (`followup0001`) | the same gate, check and repair nodes, identical code and request |
+| The exceptions queue now | 5 pending, 5 with a reason |
 
 An email draft is approved by the workflow (`approved_by = 'auto'`) only if all of these hold; anything else is written `pending` with `hold_reason`:
 
@@ -618,7 +622,7 @@ An email draft is approved by the workflow (`approved_by = 'auto'`) only if all 
 - it is not a low-context note (`low-context`);
 - no rule tag from section 4b on its `variant` (`rule-tags: ...`);
 - every claim code on its `variant` is an active, confirmed line (`unconfirmed-claim: ...`, `no-claims`);
-- the claim check below finds every claim supported by a confirmed line and every prospect fact in the record, and its quoted sentences cover the whole email (`claim-check: ...`, `claim-check-incomplete: ...`); a failed call holds it (`claim-check-failed: ...`) -- no fallback model.
+- the claim check below finds every claim supported by a confirmed line and every prospect fact in the record, and its quoted sentences cover the whole email (`claim-check: ...`, `claim-check-incomplete: ...`); a failed call holds it (`claim-check-failed: ...`) -- no fallback model. A hold for widened/unsupported/joined statements is first **repaired**, up to 2 times (below); "held" for a claim-check failure means it still failed after the repairs.
 
 Node **Claude Claim Check**: `POST https://api.anthropic.com/v1/messages`, credential `novascoutAnthropic01`, on error `continueRegularOutput`, retry 2 × 5000 ms. The body is the per-draft `$json.check_request` the Approval Gate builds from this fixed part, plus the confirmed lines, the prospect record (the fact sheet above; for a follow-up, the enrichment record and the first email as context) and the generated text:
 
@@ -749,4 +753,60 @@ sentence.
 ```
 
 The model judges statements; code decides. Apply Claim Check approves only if every `claim` is `supported` and names a code that is a confirmed line, every `prospect` fact is `supported`, every `none` is `none`, the quoted sentences (a leading "Subject:" label dropped) account for every word of the email, and a first email has at least one claim. The verdicts are kept in `drafts.claim_check`.
+
+**The repair loop.** A hold that names widened/unsupported/joined statements goes back to the drafting model (`Claude Repair N`, same model, effort and limits as the check) with each flagged sentence and the checker's exact reason; `Apply Repair N` applies the rewrites by code, only to flagged sentences, and a second copy of Assemble Drafts, the Approval Gate and the claim check run on the result. At most 2 repairs; every attempt's verdicts, rewrites and cost stay in `drafts.claim_check.attempts`, and a final hold lists every attempt's reasons. The repair's schema and system prompt, exactly:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "rewrites": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "original": {
+            "type": "string"
+          },
+          "replacement": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "original",
+          "replacement"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "rewrites"
+  ],
+  "additionalProperties": false
+}
+```
+
+```
+You repair one outbound sales email that an automatic claim check held. A small company sells a
+website assistant to contract research organisations (CROs). The check found sentences that say
+more than their sources support. Rewrite ONLY those sentences, so that each says no more than its
+source. Every other sentence stays exactly as it is -- you are not shown it to change it.
+
+You are given APPROVED CLAIMS (the only things the email may say about what we built, what it does,
+the problem it addresses, who uses it, and the offer), the PROSPECT RECORD (the only facts about the
+recipient), the email, and each flagged sentence with the checker's exact reason.
+
+For each flagged sentence:
+- Remove what the checker says goes beyond the source. Say what the approved claim says, in its own
+  words, rephrased only for grammar and to fit the sentence.
+- Add nothing: no new claim, fact, number, outcome, consequence or name. Shorter is better than
+  wider.
+- If nothing in the sentence can stay without the widening, make it the approved claim it rests on,
+  or return an empty replacement to delete the sentence.
+- Keep "(we call it Nova)" if the sentence has it. No greeting, no links.
+
+Return JSON: rewrites, one per flagged sentence -- "original" (the flagged sentence exactly as it is
+given to you) and "replacement".
+```
 

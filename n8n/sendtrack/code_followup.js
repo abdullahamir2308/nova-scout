@@ -145,7 +145,9 @@ function poolsFor(r, n) {
 // The record is worded as Workflow 4's fact sheet words it, boundaries
 // included. It holds no trial: Workflow 4 looks the trial up at
 // ClinicalTrials.gov on each run and stores it nowhere, so a follow-up that
-// names one cannot be checked here and is held for a person.
+// says something about one cannot be checked here and is held for a person
+// (a reference back to the first email that only mentions it passes as a
+// reference -- measured 2026-10-03, draft 107).
 function prospectRecord(r) {
   const facts = [];
   const areas = Array.isArray(r.therapeutic_areas) ? r.therapeutic_areas.map(str).filter(Boolean) : [];
@@ -240,7 +242,8 @@ function followUpRequest(r, item) {
   const task = n === 1
     ? ['This is follow-up 1 of ' + MAX_FOLLOW_UPS + '.',
        'Open by referring back to the first email in a few words, then add exactly ONE angle or benefit from',
-       'the lists above that the first email did not make, and build the note around it. Then the one ask.',
+       'the lists above that the first email did not make -- in that line\'s own words, almost word for word,',
+       'rephrased only for grammar, with nothing added about what it achieves. Then the one ask.',
        'The body plus the ask is ' + FOLLOW_UP_1_MIN + '-' + FOLLOW_UP_1_MAX + ' words. Put the added line\'s code in added_claim.']
     : ['This is follow-up 2 of ' + MAX_FOLLOW_UPS + ' -- the short final note.',
        'Say this is the last note, and restate the offer as the one ask. Add no new claim: added_claim is "".',

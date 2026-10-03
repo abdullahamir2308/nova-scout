@@ -298,6 +298,11 @@ t.check('Assemble Follow-Up hands the gate a follow-up context: the note and ask
   [AP.approval.kind, AP.approval.auto_approve, AP.approval.check.subject, AP.approval.check.text,
    AP.approval.check.text.indexOf('wrote:')],
   ['follow-up', true, null, CLEAN.body + '\n\n' + CLEAN.ask, -1]);
+t.check('the repair loop gets the parsed answer and the fields the note came from',
+  [AP.approval.repair_fields, AP.composition.body, AP.composition.added_claim, AP.repair], [['body', 'ask'], CLEAN.body, 'BEN-DECK', null]);
+t.check('#1 is told to say its added line almost word for word, nothing added (skill section 8, 2026-10-03)',
+  [ENRICHED.prompt.indexOf("in that line's own words, almost word for word") !== -1, ENRICHED.prompt.indexOf('build the note around it')],
+  [true, -1]);
 t.check('... with the record, the claims and the first email from Build Follow-Up',
   [AP.approval.record === ENRICHED.prospect_record, AP.approval.claims.length, AP.approval.first_email === ENRICHED.first_core],
   [true, 12, true]);

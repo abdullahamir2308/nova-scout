@@ -596,6 +596,43 @@ case(
     expect_in="without the Approval Gate",
 )
 case(
+    "the repair goes to a cheaper model than the claim check -> build refuses",
+    mutate_js=lambda s: s.replace("function repairRequest(ctx, flagged) {\n  return {\n    model: CHECK_MODEL,",
+                                  "function repairRequest(ctx, flagged) {\n  return {\n    model: 'claude-haiku-4-5',", 1),
+    js_file="code_approval.js",
+    expect_in="the repair request no longer uses",
+)
+case(
+    "Apply Repair stops reading the Apply Claim Check copy it follows -> build refuses",
+    mutate_js=lambda s: s.replace("const prev = $('__CHECKED__').item.json;", "const prev = $('Apply Claim Check').item.json;", 1),
+    js_file="code_approval_repair.js",
+    expect_in="must read $('__CHECKED__') exactly once",
+)
+case(
+    "MAX_REPAIRS set beyond what the chain is meant to unroll -> build refuses",
+    mutate_js=lambda s: s.replace("const MAX_REPAIRS = 2;", "const MAX_REPAIRS = 9;", 1),
+    js_file="code_approval.js",
+    expect_in="keep it small",
+)
+case(
+    "Assemble Drafts stops handing on the composition the repair edits -> build refuses",
+    mutate_js=lambda s: s.replace("    composition: parsed,\n", "", 1),
+    js_file="code_assemble.js",
+    expect_in="does not emit ['composition']",
+)
+case(
+    "Apply Repair stops setting the hold on a draft it gives up on -> build refuses",
+    mutate_js=lambda s: s.replace("    d.hold_reason = historyText(history);", "    void 0;", 1),
+    js_file="code_approval_repair.js",
+    expect_in="Apply Repair does not set on a held draft",
+)
+case(
+    "a repaired draft reaches Write Drafts & Advance without the gate copy -> build refuses",
+    mutate_js=lambda s: s.replace("    **_chain_conns,\n}", "    **_chain_conns,\n    \"Apply Repair 1\": {\"main\": [[{\"node\": \"Write Drafts & Advance\", \"type\": \"main\", \"index\": 0}]]},\n}", 1),
+    js_file="build_workflow.py",
+    expect_in="without the Approval Gate",
+)
+case(
     "the drafts INSERT writes an approval column Section 8 does not define -> build refuses",
     mutate_doc=lambda d: d.replace("  approved_by (auto|human), approved_at, hold_reason, claim_check jsonb\n",
                                    "  approved_by (auto|human), approved_at, claim_check jsonb\n", 1),

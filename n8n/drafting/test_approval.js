@@ -16,7 +16,11 @@ const RULES = (function () {
   const src = fs.readFileSync(GATE, 'utf8');
   return src.slice(0, src.indexOf('// Node body'));
 })();
-const asShipped = function (src) { return RULES + '\n' + src; };
+// As the build ships them: the rules section, then the body, with the node it
+// follows baked in (approval_chain.py) -- round 0's names here.
+const asShipped = function (src) { return RULES + '\n' + src.replace("$('__GATE__')", "$('Approval Gate')"); };
+const REPAIR = path.join(__dirname, 'code_approval_repair.js');
+const repairShipped = function (src) { return RULES + '\n' + src.replace("$('__CHECKED__')", "$('Apply Claim Check')"); };
 
 const t = runner('Auto-approval -- Approval Gate and Apply Claim Check (migration 014)');
 
@@ -292,5 +296,171 @@ a = apply(followUp('follow-up-1/BEN-DECK.A1'), response([FU_SENTENCES[0], FU_SEN
   st(FU_SENTENCES[1].sentence, 'none', '', 'none'), st(FU_SENTENCES[2].sentence, 'none', '', 'none')])));
 t.check('near miss: a follow-up with no claim statement is not held for that (only a first email must have one)',
   a.payload.draft.status, 'approved');
+
+// ===================================================================================
+// The repair loop (2026-10-03)
+// ===================================================================================
+
+const ASK = 'Would a 48-hour demo built on your own material be worth a look? One word back is enough.';
+const BODY99 = BODY.replace('You can see every sponsor lead it captured, and any question it passed to your team.', DRAFT99);
+const FIXED = 'You can see every sponsor lead it captured, and any question it passed to your team.';
+const FIELDS = ['email_subject', 'email_body', 'email_ask'];
+function composition(text) {
+  return { email_subject: SUBJECT, email_body: text.replace(' ' + ASK, ''), email_ask: ASK, linkedin_body: 'li body',
+    linkedin_ask: 'li ask?', email_claims: ['D2', 'ANG-HOURS', 'BEN-SEE', 'PR-BOTH', 'A1'], linkedin_claims: ['D2'] };
+}
+// A first touch carrying what the loop needs, as Assemble Drafts emits it.
+function repairable(over, extra) {
+  const it = firstTouch(CLEAN, ctx(Object.assign({ check: { subject: SUBJECT, text: BODY99 }, repair_fields: FIELDS }, over || {})));
+  Object.assign(it.json, { composition: composition(BODY99), usage: { input_tokens: 3000, output_tokens: 1500 } }, extra || {});
+  return it;
+}
+
+// --- Apply Claim Check: repair, or the end of the loop -----------------------------
+a = apply(repairable(), response(widened));
+d = emailOf(a);
+t.check('a widened statement sends the draft to a repair instead of ending there',
+  [a.needs_repair, d.status, a.repair_state.flagged.length, a.repair_state.flagged[0].sentence], [true, 'pending', 1, DRAFT99]);
+const rq = a.repair_request;
+t.check('the repair goes to the drafting model with the check\'s parameters and a strict schema',
+  [rq.model, rq.output_config.effort, rq.max_tokens, rq.output_config.format.schema.properties.rewrites.items.additionalProperties,
+   ['temperature', 'top_p', 'top_k', 'thinking'].filter(function (k) { return k in rq; })],
+  ['claude-sonnet-5-5', 'high', 16000, false, []]);
+const rqText = rq.messages[0].content;
+t.check('... carrying the email, the flagged sentence and the checker\'s exact reason, and the confirmed lines',
+  [rqText.indexOf('1. ' + DRAFT99) !== -1,
+   rqText.indexOf('checker: widened -- "so you know exactly what came in" (compared with BEN-SEE): because') !== -1,
+   rqText.indexOf('[BEN-SEE] (benefit) You can see every sponsor lead') !== -1, rqText.indexOf('Subject: ' + SUBJECT) !== -1],
+  [true, true, true, true]);
+t.check('... told to rewrite only the flagged sentences, in the claim\'s own words, adding nothing',
+  [rq.system.indexOf('Rewrite ONLY those sentences') !== -1, rq.system.indexOf('in its own') !== -1,
+   rq.system.indexOf('Add nothing') !== -1], [true, true, true]);
+t.check('an unconfirmed line is never offered to the repair as something it may say',
+  apply(repairable({ claims: CLAIMS.concat([claim('BEN-FIT', 'benefit', 'Configured around you.', false)]) }), response(widened))
+    .repair_request.messages[0].content.indexOf('BEN-FIT'), -1);
+t.check('the attempt is recorded on the draft: 1 attempt, 0 repairs, the composing cost carried',
+  [d.claim_check.attempts.length, d.claim_check.repairs, d.claim_check.compose_usage.output_tokens, a.repair_state.compose_usage.output_tokens],
+  [1, 0, 1500, 1500]);
+t.check('a hold the composer cannot fix -- a sentence the check skipped -- is final, not repaired',
+  apply(repairable({ check: { subject: SUBJECT, text: BODY } }), response(SENTENCES.filter(function (_, i) { return i !== 5; }))).needs_repair, false);
+t.check('... nor a failed call',
+  apply(repairable(), response([], { error: { message: 'overloaded' } })).needs_repair, false);
+t.check('... nor a "supported" claim that cites no confirmed line (the checker\'s answer, not the draft, is wrong)',
+  apply(repairable({ check: { subject: SUBJECT, text: BODY } }), response(swap(4, st(SENTENCES[4].sentence, 'claim', '', 'supported')))).needs_repair, false);
+t.check('a joined or unsupported prospect fact is repairable too',
+  [apply(repairable({ check: { subject: SUBJECT, text: BODY } }), response(swap(1, st(SENTENCES[1].sentence, 'prospect', '1, 2', 'joined')))).needs_repair,
+   apply(repairable({ check: { subject: SUBJECT, text: BODY } }), response(swap(0, st(SUBJECT, 'prospect', '', 'unsupported')))).needs_repair],
+  [true, true]);
+t.check('without the composition to edit, it is held rather than repaired blind',
+  apply(repairable({}, { composition: null }), response(widened)).needs_repair, false);
+
+const H1 = { attempt: 1, result: 'hold', reasons: ['claim-check: widened "so you know exactly what came in" (BEN-SEE)'], statements: [] };
+const H2 = { attempt: 2, result: 'hold', reasons: ['claim-check: widened "nothing that came in is lost" (BEN-SEE)'], statements: [],
+  repair_usage: { input_tokens: 900, output_tokens: 250 } };
+function afterRepairs(history, text) {
+  return repairable({ check: { subject: SUBJECT, text: text || BODY99 } }, {
+    repair: { round: history.length, target: 0, history: history, compose_usage: { input_tokens: 3000, output_tokens: 1500 },
+      last_repair_usage: { input_tokens: 800, output_tokens: 300 }, rewrites: [{ field: 'email_body', original: DRAFT99, replacement: FIXED }] },
+    usage: null,
+  });
+}
+a = apply(afterRepairs([H1, H2]), response(widened));
+d = emailOf(a);
+t.check('after MAX_REPAIRS (2) repairs a third hold is final: no more repairs', [a.needs_repair, d.status, d.approved_by], [false, 'pending', null]);
+t.check('... and the hold lists every attempt\'s reasons, labelled',
+  d.hold_reason, 'first draft: claim-check: widened "so you know exactly what came in" (BEN-SEE) | after repair 1: claim-check: widened ' +
+  '"nothing that came in is lost" (BEN-SEE) | after repair 2: claim-check: widened "so you know exactly what came in" (BEN-SEE)');
+t.check('... with all three attempts, the repairs and the composing cost on the draft',
+  [d.claim_check.attempts.length, d.claim_check.repairs, d.claim_check.compose_usage.output_tokens, d.claim_check.attempts[2].repair_usage.output_tokens],
+  [3, 2, 1500, 300]);
+a = apply(afterRepairs([H1], BODY), response(SENTENCES));
+d = emailOf(a);
+t.check('a repaired email that passes the check is APPROVED by the workflow',
+  [d.status, d.approved_by, d.hold_reason, d.claim_check.result, a.needs_repair], ['approved', 'auto', null, 'pass', false]);
+t.check('... its record shows the failed first draft, the repair\'s rewrite and cost, and the pass',
+  [d.claim_check.repairs, d.claim_check.attempts.length, d.claim_check.attempts[0].result, d.claim_check.attempts[1].rewrites[0].replacement,
+   d.claim_check.attempts[1].repair_usage.output_tokens, d.claim_check.attempts[1].result],
+  [1, 2, 'hold', FIXED, 300, 'pass']);
+
+// --- Apply Repair: the rewrites, applied by code -----------------------------------
+const PREV = apply(repairable(), response(widened));
+function repairResp(rewrites, over) {
+  return Object.assign({ model: 'claude-sonnet-5-5', stop_reason: 'end_turn', usage: { input_tokens: 1200, output_tokens: 400 },
+    content: [{ type: 'thinking', thinking: '' }, { type: 'text', text: JSON.stringify({ rewrites: rewrites }) }] }, over || {});
+}
+function runRepair(prev, resp) {
+  return runForEachItem(REPAIR, [{ json: resp }], { 'Apply Claim Check': [{ json: prev }] }, repairShipped)[0].json;
+}
+let r = runRepair(PREV, repairResp([{ original: DRAFT99, replacement: FIXED }]));
+let comp = JSON.parse(r.content[0].text);
+t.check('a repair rewrites the flagged sentence, by code',
+  [r.repaired, comp.email_body.indexOf('exactly what came in'), comp.email_body.indexOf(FIXED) !== -1], [true, -1, true]);
+t.check('... and nothing else: every other field and sentence is byte-identical',
+  [comp.email_subject, comp.email_ask, comp.linkedin_body, comp.email_claims.join('.'), comp.email_body.replace(FIXED, DRAFT99)],
+  [SUBJECT, ASK, 'li body', 'D2.ANG-HOURS.BEN-SEE.PR-BOTH.A1', composition(BODY99).email_body]);
+t.check('... leaving shaped like a model response for the Assemble copy, carrying the attempts so far',
+  [r.stop_reason, r.repair.round, r.repair.target, r.repair.history.length, r.repair.last_repair_usage.output_tokens,
+   r.repair.compose_usage.output_tokens, r.repair.rewrites.length],
+  ['end_turn', 1, 0, 1, 400, 1500, 1]);
+r = runRepair(PREV, repairResp([{ original: DRAFT99, replacement: FIXED },
+  { original: "It's live at two CROs, in Türkiye and Mexico.", replacement: "It's live at forty CROs." }]));
+comp = JSON.parse(r.content[0].text);
+t.check('a rewrite of a sentence the checker did not flag is ignored -- a repair changes only what was flagged',
+  [comp.email_body.indexOf("It's live at two CROs, in Türkiye and Mexico.") !== -1, comp.email_body.indexOf('forty'), r.repair.ignored[0].why],
+  [true, -1, 'not a flagged sentence']);
+r = runRepair(PREV, repairResp([{ original: DRAFT99.toUpperCase().replace(',', ' ,'), replacement: FIXED }]));
+t.check('near miss: the flagged sentence quoted back with different case and spacing still matches', r.repaired, true);
+r = runRepair(PREV, repairResp([{ original: DRAFT99, replacement: '' }]));
+comp = JSON.parse(r.content[0].text);
+t.check('an empty replacement deletes the sentence and leaves clean spacing',
+  [comp.email_body.indexOf('so you know'), /  /.test(comp.email_body), comp.email_body.indexOf("(we call it Nova). It's live at two CROs") !== -1],
+  [-1, false, true]);
+r = runRepair(PREV, repairResp([{ original: DRAFT99, replacement: DRAFT99 }]));
+t.check('a repair that changes nothing ends the loop: held, with every reason so far and why the repair failed',
+  [r.repaired, emailOf(r).status, emailOf(r).approved_by, emailOf(r).hold_reason, emailOf(r).claim_check.repairs],
+  [false, 'pending', null, 'first draft: claim-check: widened "so you know exactly what came in" (BEN-SEE); repair 1 failed: the rewrites ' +
+   'changed no flagged sentence', 1]);
+r = runRepair(PREV, repairResp([{ original: 'We guarantee results.', replacement: 'x' }]));
+t.check('... and one that only rewrites unflagged text says so',
+  emailOf(r).hold_reason.indexOf('repair 1 failed: the rewrites changed no flagged sentence (not a flagged sentence)') !== -1, true);
+t.check('a failed repair call ends the loop with its error',
+  emailOf(runRepair(PREV, repairResp([], { error: { message: 'overloaded' } }))).hold_reason.indexOf('repair 1 failed: {"message":"overloaded"}') !== -1, true);
+t.check('... a refusal with its category',
+  emailOf(runRepair(PREV, repairResp([], { stop_reason: 'refusal', stop_details: { category: 'cyber' }, content: [] }))).hold_reason
+    .indexOf('repair 1 failed: stop_reason "refusal" (cyber)') !== -1, true);
+t.check('... an answer that is not the repair schema',
+  emailOf(runRepair(PREV, repairResp([], { content: [{ type: 'text', text: '{"rewrite": []}' }] }))).hold_reason
+    .indexOf('repair 1 failed: the answer was not the repair schema') !== -1, true);
+const PREV_SUBJ = apply(repairable({ check: { subject: SUBJECT, text: BODY } }),
+  response(swap(0, st('Subject: ' + SUBJECT, 'prospect', '', 'unsupported'))));
+r = runRepair(PREV_SUBJ, repairResp([{ original: 'Subject: ' + SUBJECT, replacement: 'Sponsor inquiries after your working hours' }]));
+comp = JSON.parse(r.content[0].text);
+t.check('a flagged subject is repaired in the subject field, its "Subject:" label dropped',
+  [r.repaired, comp.email_subject, comp.email_body], [true, 'Sponsor inquiries after your working hours', composition(BODY99).email_body]);
+
+// --- the gate copy after a repair -------------------------------------------------
+const AFTER = firstTouch(CLEAN + '+long', ctx({ repair_fields: FIELDS }));
+AFTER.json.repair = { round: 1, target: 0, history: [H1], compose_usage: { output_tokens: 1500 } };
+g = gate(AFTER);
+t.check('a rewrite that breaks a rule is held by the gate copy, with every attempt\'s reasons',
+  [g.needs_check, g.payload.drafts[0].hold_reason, g.payload.drafts[0].claim_check.repairs, g.payload.drafts[0].claim_check.attempts.length],
+  [false, 'first draft: claim-check: widened "so you know exactly what came in" (BEN-SEE) | after repair 1: rule-tags: long', 1, 2]);
+t.check('... and the attempts belong to that draft only, not to its LinkedIn DM',
+  [g.payload.drafts[1].hold_reason, g.payload.drafts[1].claim_check], ['linkedin: always reviewed and sent by hand', null]);
+
+// --- a follow-up goes round the same loop -----------------------------------------
+const FU_W = 'Following up on my note about after-hours sponsor inquiries. One more thing the assistant does: it sends your capabilities deck ' +
+  'the moment a sponsor asks for it, so no request ever waits.\n\n' + ASK;
+const FU_W_SENT = 'One more thing the assistant does: it sends your capabilities deck the moment a sponsor asks for it, so no request ever waits.';
+const fuItem = followUp('follow-up-1/BEN-DECK.A1', { check: { subject: null, text: FU_W }, repair_fields: ['body', 'ask'] });
+fuItem.json.composition = { body: FU_W.replace('\n\n' + ASK, ''), ask: ASK, added_claim: 'BEN-DECK', claims: ['BEN-DECK', 'A1'], first_email_covers: [] };
+const FU_PREV = apply(fuItem, response([FU_SENTENCES[0], st(FU_W_SENT, 'claim', 'BEN-DECK', 'widened', 'so no request ever waits'),
+  FU_SENTENCES[2], FU_SENTENCES[3]]));
+t.check('a follow-up held for a widened statement goes to a repair, with the first email as context',
+  [FU_PREV.needs_repair, FU_PREV.repair_request.messages[0].content.indexOf('THE FIRST EMAIL, already sent to them') !== -1], [true, true]);
+r = runRepair(FU_PREV, repairResp([{ original: FU_W_SENT, replacement: 'One more thing the assistant does: it sends your capabilities deck the moment a sponsor asks for it.' }]));
+comp = JSON.parse(r.content[0].text);
+t.check('... and the repair edits the follow-up\'s own fields (payload.draft shape)',
+  [r.repaired, comp.body.indexOf('ever waits'), comp.ask, comp.added_claim], [true, -1, ASK, 'BEN-DECK']);
 
 t.done();
