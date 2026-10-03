@@ -701,6 +701,28 @@ const linkedinCodes = linkedinClaims.used.join('.');
 const emailFlags = checkEmail();
 const linkedinFlags = checkLinkedin();
 
+// --- What auto-approval needs (migration 014, code_approval.js) -------------
+//
+// The Approval Gate decides from the variant (tags, claim codes) and this: the
+// lines this lead was offered with their confirmation, and the prospect record
+// -- exactly the fact sheet the drafting model was given, so the claim check
+// compares the email with what its writer actually had, the ClinicalTrials.gov
+// trial included (it is looked up per run and stored nowhere else). The check
+// reads only the generated text: subject, body, link line and ask -- never the
+// greeting, opt-out or signature, which are fixed.
+const approvalClaims = [];
+SLOT_ORDER.forEach(function (slot) {
+  (pools[slot] || []).forEach(function (l) {
+    approvalClaims.push({ code: l.code, slot: slot, body: l.body, confirmed: l.confirmed === true });
+  });
+});
+if (link) approvalClaims.push({ code: link.code, slot: 'link', body: link.body, confirmed: link.confirmed === true });
+const approvalRecord = ['Company: ' + str(src.company_name) + ' (the email never names it)',
+  'Country: ' + str(src.country), str(src.fact_sheet)]
+  .concat(src.headcount !== null && src.headcount !== undefined
+    ? ['Also on their own site: a team of ' + src.headcount + ' people. This says nothing about what they do.'] : [])
+  .join('\n');
+
 return {
   json: Object.assign({}, base, {
     write: true,
@@ -716,6 +738,15 @@ return {
     unknown_claims: unique(emailClaims.unknown.concat(linkedinClaims.unknown)),
     model: resp.model,
     usage: resp.usage || null,
+    approval: {
+      kind: 'first-touch',
+      auto_approve: src.auto_approve === true,
+      country: src.country,
+      record: approvalRecord,
+      claims: approvalClaims,
+      first_email: null,
+      check: { subject: emailSubject, text: emailCore },
+    },
     payload: {
       lead_id: src.lead_id,
       advance: true,

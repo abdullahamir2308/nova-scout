@@ -187,6 +187,18 @@ return {
     first_email_covers: covers,
     model: resp.model,
     usage: resp.usage || null,
+    // Auto-approval (migration 014): what the shared Approval Gate and the claim
+    // check need. Only the note itself is checked -- not the subject (Re: + the
+    // subject already sent) and not the quoted first email, which went out.
+    approval: {
+      kind: 'follow-up',
+      auto_approve: src.auto_approve === true,
+      country: src.country,
+      record: src.prospect_record,
+      claims: src.check_claims,
+      first_email: src.first_core,
+      check: { subject: null, text: core },
+    },
     payload: {
       lead_id: src.lead_id,
       action: 'draft-follow-up',

@@ -135,6 +135,55 @@ function poolsFor(r, n) {
   return { pools: pools, firstCodes: firstCodes, retired: retired };
 }
 
+// --- For the claim check only (auto-approval, migration 014) ----------------
+//
+// Neither of these reaches the composing model, which still sees only the first
+// email. They go to the Approval Gate and the claim check, which compares each
+// prospect fact in the follow-up with the enrichment record and each claim with
+// the confirmed lines.
+//
+// The record is worded as Workflow 4's fact sheet words it, boundaries
+// included. It holds no trial: Workflow 4 looks the trial up at
+// ClinicalTrials.gov on each run and stores it nowhere, so a follow-up that
+// names one cannot be checked here and is held for a person.
+function prospectRecord(r) {
+  const facts = [];
+  const areas = Array.isArray(r.therapeutic_areas) ? r.therapeutic_areas.map(str).filter(Boolean) : [];
+  if (areas.length) {
+    facts.push('Therapeutic areas listed on their own website: ' + areas.join(', ') +
+      '. This says nothing about which area any particular trial belongs to.');
+  }
+  const phases = Array.isArray(r.phases) ? r.phases.map(str).filter(Boolean) : [];
+  if (phases.length) facts.push('Trial phases listed on their own website: ' + phases.join(', ') + '.');
+  if (str(r.city)) {
+    facts.push('The company is based in ' + str(r.city) +
+      '. This says nothing about where any trial runs or where any staff sit.');
+  }
+  if (str(r.founder_name)) {
+    facts.push('Named on their own site as founder or MD: ' + str(r.founder_name) +
+      '. This says nothing about which trials or clients this person personally handles.');
+  }
+  const n = Number(r.employee_estimate);
+  if (r.employee_estimate !== null && r.employee_estimate !== undefined && Number.isInteger(n) && n > 0) {
+    facts.push('Their own site states a team of ' + n + ' people. This says nothing about what they do.');
+  }
+  facts.push('No trial is part of this record. The first email may name one; nothing here confirms it.');
+  return ['Company: ' + str(r.company_name) + ' (the email never names it)', 'Country: ' + str(r.country)]
+    .concat(facts.map(function (f, i) { return String(i + 1) + '. ' + f; })).join('\n');
+}
+
+// Every line a follow-up may draw on or refer back to, with its confirmation:
+// the descriptions, angles, benefits and asks, and only this lead's proof. A
+// follow-up opens by referring to the first email's angle, which its own pool
+// leaves out, so the checker gets the whole set.
+function checkClaims(r) {
+  const lib = libraryRows(r.library);
+  const proof = forCountry(lib.filter(function (l) { return l.slot === 'proof'; }), r.country);
+  return lib.filter(function (l) { return ['description', 'angle', 'benefit', 'ask'].indexOf(l.slot) !== -1; })
+    .concat(proof)
+    .map(function (l) { return { code: l.code, slot: l.slot, body: l.body, confirmed: l.confirmed }; });
+}
+
 function sheet(heading, list, withCaps) {
   return [heading].concat(list.map(function (l) {
     return '  [' + l.code + '] ' + l.body + (withCaps && l.capabilities.length ? '  (about: ' + l.capabilities.join(', ') + ')' : '');
@@ -244,6 +293,12 @@ function followUpRequest(r, item) {
       library_pools: pools,
       absent_areas: absent,
       corpus: corpus,
+      // Auto-approval (migration 014): for the Approval Gate and the claim
+      // check, never for the composing model.
+      auto_approve: r.auto_approve_email === true,
+      prospect_record: prospectRecord(r),
+      check_claims: checkClaims(r),
+      first_core: core,
       prompt: prompt,
       request: Object.assign({}, CLAUDE_REQUEST, {
         system: SYSTEM_PROMPT,

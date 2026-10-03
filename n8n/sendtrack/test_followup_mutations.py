@@ -65,6 +65,9 @@ def workdir():
     shutil.copytree(HERE, os.path.join(tmp, "sendtrack"), ignore=shutil.ignore_patterns("__pycache__", "dryrun"))
     os.makedirs(os.path.join(tmp, "drafting"))
     shutil.copy(os.path.join(DRAFTING, "code_assemble.js"), os.path.join(tmp, "drafting", "code_assemble.js"))
+    # test_followup.js runs an assembled follow-up through the shared Approval
+    # Gate (migration 014).
+    shutil.copy(os.path.join(DRAFTING, "code_approval.js"), os.path.join(tmp, "drafting", "code_approval.js"))
     return tmp
 
 

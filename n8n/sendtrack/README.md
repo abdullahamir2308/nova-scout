@@ -2,7 +2,8 @@
 
 Sends approved email drafts under Section 5's warm-up ceiling, watches the same
 mailbox for replies and opt-outs, queues follow-ups, and checks that the mailbox
-watch is still listening. Four workflows:
+watch is still listening, and tells the operator once a day what happened.
+Five workflows:
 
 | File | Id | What it does |
 |---|---|---|
@@ -10,31 +11,34 @@ watch is still listening. Four workflows:
 | `../workflows/mailbox-watch.json` | `mailwatch0001` | IMAP on **Sent** (mirror for the ceiling) and on **INBOX** (reply / opt-out / bounce / out-of-office). |
 | `../workflows/follow-ups.json` | `followup0001` | cron every 30 min → follow-up composed by the drafting model, checked by the drafting rules, into the review queue as `pending`; or mark lost. |
 | `../workflows/imap-health.json` | `imaphealth0001` | cron every 20 min → IMAP checker → has Mailbox Watch missed anything? → alert the operator. |
+| `../workflows/daily-digest.json` | `digest0001` | cron every 30 min → once per operator day, from 08:00 PKT: what auto-approved, what was sent, what is held and why → the operator. |
 
 Same generated-not-hand-edited pattern as the other stages: the `.js` files are
 the tested sources, `build_workflow.py` embeds them verbatim, and the build
 parses the Master Ref and refuses to run when code and doc disagree.
 
 ```
-python build_workflow.py          # regenerate the four workflow JSONs
+python build_workflow.py          # regenerate the five workflow JSONs
 node   test_decide.js             # 74 cases -- the send decision and every guard in it
 node   test_send_result.js        # 21 cases -- what happens after the SMTP call
 node   test_mailbox.js            # 71 cases -- Sent mirror, reply classification, positive-signal flag, notification
-node   test_followup.js           # 69 cases -- composed follow-ups: the request, every section 8 rule, the frame (cross-checked against the send path)
+node   test_followup.js           # 83 cases -- composed follow-ups: the request, every section 8 rule, the frame (cross-checked against the send path), the approval context
+node   test_digest.js             # 19 cases -- the Daily Digest: when it is due, what it says
 python test_followup_mutations.py # breaks each follow-up rule in turn; test_followup.js must fail every time
 node   test_health.js             # 33 cases -- IMAP Health: problems, when it alerts, what it says
 python test_imap_health.py        # 21 cases -- the checker's answer; Message-ID parity with Mailbox Watch
-python test_drift_guards.py       # 81 cases -- each spec/wiring guard is made to fire
+python test_drift_guards.py       # 92 cases -- each spec/wiring guard is made to fire
 python provision_credentials.py   # n8n SMTP/IMAP credentials from .env (+ the two dry-run ones)
 python sync_settings.py           # the operator's notification address, .env -> the settings table
 python imap_preflight.py          # read-only: IMAP works, and the warm-up state from the real Sent folder
 python dryrun/dryrun.py           # the real send path, end to end, into a scratch DB and an SMTP sink
 python dryrun/health_dryrun.py    # IMAP Health end to end: real checker, scratch DB, SMTP sink
+python dryrun/approval_dryrun.py  # auto-approval end to end: Drafting, Follow-Ups, Send, Digest; real claim check
 python status_now.py              # read-only: what would the send path do right now?
 ```
 
-Migrations `postgres/migrations/007_send_and_track.sql`, `008_settings.sql` and
-`009_mailbox_health.sql` must be applied first, `sync_settings.py` run once, and
+Migrations `postgres/migrations/007_send_and_track.sql`, `008_settings.sql`,
+`009_mailbox_health.sql` and `014_auto_approval.sql` must be applied first, `sync_settings.py` run once, and
 the `imap-health` service running (`docker compose up -d imap-health`).
 
 ## The warm-up ceiling belongs to the mailbox
@@ -194,6 +198,18 @@ Find Due Follow-Ups -> Build Follow-Up -> Needs Model? -> Claude Follow-Up -> As
   are appended, never generated; the subject is `Re:` + the first subject.
   `test_followup.js` runs every composed follow-up through Send's real
   `ineligibility()`.
+- **Auto-approval (migration 014).** A composed follow-up then goes through
+  Workflow 4's own Approval Gate and claim check (`../drafting/code_approval.js`
+  and `code_approval_apply.js`, embedded verbatim): with the flag on, no rule
+  tag, every claim code confirmed, and a second Sonnet 5.5 call finding every
+  claim supported by a confirmed line and every prospect fact in the enrichment
+  record, it is written `approved` (`approved_by = 'auto'`) and Send sends it in
+  the recipient's business hours like any approved draft. Otherwise it is
+  written `pending` with `hold_reason`. Only the note is checked -- the subject
+  is `Re:` + one already sent, and the quoted first email already went out. The
+  enrichment record reaches the checker only, never the composing model. The
+  record holds no trial (Workflow 4 stores none), so a follow-up naming one is
+  held for a person.
 - A failed call writes nothing; the lead is due again next run. Write Follow-Up
   dedupes on the follow-up **number** (`follow-up-1/BEN-DECK.A1+...` and a
   pre-2026-10-02 bare `follow-up-1` are the same slot).
@@ -211,6 +227,26 @@ of the last run, persisted in `staticData` (`recurrenceRules: [0]` from 09-23
 installed function with that state gives SKIPPED at 00:00:29 and FIRES at 06/12/18.
 Minutes intervals are counted on elapsed time there, so they are safe; the build
 now refuses any hours/days/weeks interval above 1 in any Workflow 6 schedule.
+
+## The Daily Digest
+
+Auto-approval means drafts reach prospects that no person read, so the operator
+gets one email a day saying what happened (`code_digest.js`, migration 014's
+`digest_log`):
+
+- **AUTO-APPROVED** -- every draft the workflows approved themselves since the
+  last digest, and what became of it. Each goes out in its recipient's
+  business hours; rejecting it in the review queue stops it.
+- **SENT** -- every email SMTP accepted, and who approved it (`auto`/`human`).
+- **HELD FOR A PERSON** -- every pending draft, new ones marked, each with its
+  `hold_reason`: the exceptions queue.
+
+It runs every 30 minutes and sends at the first tick at or after 08:00 on the
+operator's clock (before India, the earliest recipient, opens at 08:30 PKT),
+once per operator day; it covers from where the last digest stopped, so a day
+the host was off is folded into the next one. Recorded only once SMTP accepted
+it. It goes only to `settings.operator_email`, so -- like a reply
+notification -- it uses no warm-up slot. No address, no digest.
 
 ## Is Mailbox Watch still listening?
 

@@ -1,17 +1,17 @@
 # Drafting review — Workflow 4, skill v3, as deployed
 
-Generated 2026-10-02 11:19 UTC by `n8n/drafting/write_drafting_review.py`, read-only, from the live n8n and novascout databases — not from the repo.
+Generated 2026-10-03 06:46 UTC by `n8n/drafting/write_drafting_review.py`, read-only, from the live n8n and novascout databases — not from the repo.
 
 | Source | Value |
 |---|---|
-| n8n workflow | `drafting0001`, versionId `364fa8d7-c3c7-48e4-9041-704d8f6d44b1`, updated 2026-10-02T11:13:21.102+00:00 |
-| Published | **no** — publish it in the n8n UI; this document describes the saved version |
-| Assess Grounding code | sha256 `424935635ae969c5…` |
-| Assemble Drafts code | sha256 `469d081ad2e5fe6b…` |
+| n8n workflow | `drafting0001`, versionId `f5ededfb-d2e6-4b21-ba8f-70fd1a291718`, updated 2026-10-03T06:26:39.156+00:00 |
+| Published | yes, version `f5ededfb-d2e6-4b21-ba8f-70fd1a291718` |
+| Assess Grounding code | sha256 `80f3510f77446d56…` |
+| Assemble Drafts code | sha256 `7ae5351a85940d1f…` |
 | Sample execution | #845 (cli, 2026-10-02T11:13:34.297+00:00, workflow version `364fa8d7-c3c7-48e4-9041-704d8f6d44b1`) |
-| claims_library | 23 rows, 20 active, 0 confirmed |
+| claims_library | 23 rows, 20 active, 20 confirmed |
 
-A human approves every draft before it can send. Nothing below changes that gate.
+**Auto-approval (migration 014):** an email draft that passes every rule below, uses only confirmed claims and passes a second Sonnet 5.5 claim check is approved by the workflow that wrote it; anything else, and every LinkedIn DM, waits for a human with its `hold_reason`. Section 8 has the gate and the check as deployed.
 
 ## 1. The model call
 
@@ -357,38 +357,38 @@ claims_prospect_never_sponsor | CHECK (((body IS NULL) OR (body !~* '\myou(''re|
 claims_slot_v3 | CHECK ((slot = ANY (ARRAY['description'::text, 'angle'::text, 'benefit'::text, 'proof'::text, 'ask'::text, 'link'::text])))
 ```
 
-`drafts` (migration 006): status must be pending/approved/rejected/sent; a rejection needs one of four reasons.
+`drafts` (migration 006): status must be pending/approved/rejected/sent; a rejection needs one of four reasons. Migration 014's trigger turns an `approved_by = 'auto'` approval that breaks a section 8 rule into a hold.
 
 ## 5. The live claims library — all 23 rows
 
-Only **active** rows reach the model; every row is `confirmed=false` until a human confirms it, and every draft built from an unconfirmed line is tagged `unconfirmed-claim`. Read the `note` before confirming: it records what the Nova Agent Kit code showed.
+Only **active** rows reach the model. A row is confirmed by a human; a draft built from an unconfirmed line is tagged `unconfirmed-claim` and never auto-approves, and editing a confirmed line's text un-confirms it (migration 014). Read the `note` before confirming: it records what the Nova Agent Kit code showed.
 
 `Capabilities` is what a description or benefit line asserts (migration 013). Two lines in one message that share one say the same thing twice: the prompt names every such pair, and Assemble Drafts tags a message that uses one (`claim-repeat`).
 
 | Code | Slot | Active | Confirmed | Countries | Capabilities | Body | Note |
 |---|---|---|---|---|---|---|---|
-| `D1` | description | yes | no | — | qualifies, captures-lead | an AI assistant for your website that turns sponsor inquiries into qualified leads |  |
-| `D2` | description | yes | no | — | answers, qualifies, booking-link | an AI intake assistant for your website that answers sponsors, qualifies them, and sends them your booking link | SETTLED 2026-10-02 (migration 013). Was: "... answers sponsors, qualifies them, and books the call". Nova does not book: after capture_sponsor_lead succeeds it returns the booking link from CALENDLY_BOOKING_URL (lib/tenants/loader.ts; lib/agent/tools/capture-sponsor-lead.ts), only when that is set. |
-| `ANG-HOURS` | angle | yes | no | — | — | Sponsors often research CROs outside your working hours, frequently from another time zone. An inquiry sent at 11pm waits until morning, and by then they may have moved on to the next CRO. |  |
-| `ANG-SILENT` | angle | yes | no | — | — | How many sponsors visit your site and leave without ever contacting you? |  |
-| `ANG-SPEED` | angle | yes | no | — | — | Sponsors choosing a CRO notice how quickly you respond, and a small CRO can't staff a BD desk around the clock. |  |
-| `ANG-STAKES` | angle | yes | no | — | — | A single sponsor inquiry can be a multi-million-dollar study. | Industry fact, not a Nova result (skill section 4). |
-| `ANG-TIME` | angle | yes | no | — | — | Your BD time should go to qualified sponsors, not to sorting every inquiry that arrives. | [verify] SUPPORTED 2026-10-02: Nova routes non-sponsor visitors to their own flows -- investigators and sites to capture_investigator_registration, trainees to capture_course_enrollment (lib/agent/tools/; system prompt "Distinguishing Sponsor Intent from Investigator Intent"). Seeded verbatim. |
-| `BEN-247` | benefit | yes | no | — | answers | It answers sponsors from your own website, in real time, at any hour. | SETTLED 2026-10-02 (migration 013). Was: "It answers sponsors from your own SOPs and service pages, in real time, at any hour." The knowledge base is one text file per tenant (tenants/<id>/knowledge-base.md), filled only by the website scraper (tenants/noblepath/scripts/scraper.py, which skips PDFs) and loaded verbatim into the system prompt (app/api/chat/route.ts). There is no code path for documents a client provides, so the line claims the website only. |
-| `BEN-BOOK` | benefit | yes | no | — | booking-link | It sends qualified sponsors your booking link, so they can book a call with your team. | SETTLED 2026-10-02 (migration 013). Was: "Qualified sponsors book a call straight into your calendar." Nova sends the booking link (CALENDLY_BOOKING_URL) in its confirmation after a lead is captured, only when that is set; the sponsor books through the link. Nothing reaches a calendar from Nova. |
-| `BEN-BRIEF` | benefit | yes | no | — | study-details | It collects the therapeutic area and study phase before your first call. | [verify] NARROWED 2026-10-02. Was: "It collects the study brief before your first call." The RFP intake (capture_sponsor_lead) records therapeutic area and study phase, plus free-text notes; there are no fields for protocol, timelines, site count or budget, and pricing questions are escalated, not collected. |
-| `BEN-CAPTURE` | benefit | yes | no | — | captures-lead, study-details | A sponsor who shares their details becomes a named lead: company, contact, therapeutic area and study phase. | [verify] NARROWED 2026-10-02. Was: "Every sponsor who engages becomes a named lead: company, contact, and what they're planning." capture_sponsor_lead requires company_name, therapeutic_area, study_phase, contact_name, contact_email (notes optional) and is only called once all five are confirmed; a visitor who declines is not captured, so "every sponsor who engages" was wider than the code. |
-| `BEN-DECK` | benefit | yes | no | — | deck | It sends your capabilities deck the moment a sponsor asks for it. | Code reading 2026-10-02: capture_capabilities_request emails the deck once the visitor gives an email address. Supported. |
-| `BEN-FIT` | benefit | yes | no | — | configured | It's configured around your services and your process, not a template. |  |
-| `BEN-ROUTE` | benefit | yes | no | — | routes-leads | Leads land where your team already works. | SETTLED 2026-10-02 (migration 013). Was: "Leads land where your team already works, not in another dashboard." deliverLead() emails the team and pushes the lead to a CRM and a spreadsheet when configured (lib/integrations/); Nova also has its own leads dashboard (app/dashboard, BEN-SEE), so the "not in another dashboard" clause was dropped. |
-| `BEN-SEE` | benefit | yes | no | — | dashboard | You can see every sponsor lead it captured, and any question it passed to your team. | [verify] NARROWED 2026-10-02. Was: "You can see which sponsors engaged and what they asked." The dashboard (app/dashboard) lists captured leads with their fields and notes, and escalations with the visitor's unanswered question. Conversations are not stored and analytics are anonymous counts, so a sponsor who engaged without leaving details, and what they asked, are not visible. |
-| `PR-BOTH` | proof | yes | no | — | — | It's live at two CROs, in Türkiye and Mexico. | No countries: serves every lead no other proof line serves. |
-| `PR-MX` | proof | yes | no | Mexico, Brazil, Argentina | — | It's live at Vertex Clinical Research in Mexico. | Mexico and Latin America. The Nova Agent Kit repo holds only the NoblePath tenant; the Vertex deployment is not visible in that source. |
+| `D1` | description | yes | yes | — | qualifies, captures-lead | an AI assistant for your website that turns sponsor inquiries into qualified leads |  |
+| `D2` | description | yes | yes | — | answers, qualifies, booking-link | an AI intake assistant for your website that answers sponsors, qualifies them, and sends them your booking link | SETTLED 2026-10-02 (migration 013). Was: "... answers sponsors, qualifies them, and books the call". Nova does not book: after capture_sponsor_lead succeeds it returns the booking link from CALENDLY_BOOKING_URL (lib/tenants/loader.ts; lib/agent/tools/capture-sponsor-lead.ts), only when that is set. |
+| `ANG-HOURS` | angle | yes | yes | — | — | Sponsors often research CROs outside your working hours, frequently from another time zone. An inquiry sent at 11pm waits until morning, and by then they may have moved on to the next CRO. |  |
+| `ANG-SILENT` | angle | yes | yes | — | — | How many sponsors visit your site and leave without ever contacting you? |  |
+| `ANG-SPEED` | angle | yes | yes | — | — | Sponsors choosing a CRO notice how quickly you respond, and a small CRO can't staff a BD desk around the clock. |  |
+| `ANG-STAKES` | angle | yes | yes | — | — | A single sponsor inquiry can be a multi-million-dollar study. | Industry fact, not a Nova result (skill section 4). |
+| `ANG-TIME` | angle | yes | yes | — | — | Your BD time should go to qualified sponsors, not to sorting every inquiry that arrives. | [verify] SUPPORTED 2026-10-02: Nova routes non-sponsor visitors to their own flows -- investigators and sites to capture_investigator_registration, trainees to capture_course_enrollment (lib/agent/tools/; system prompt "Distinguishing Sponsor Intent from Investigator Intent"). Seeded verbatim. |
+| `BEN-247` | benefit | yes | yes | — | answers | It answers sponsors from your own website, in real time, at any hour. | SETTLED 2026-10-02 (migration 013). Was: "It answers sponsors from your own SOPs and service pages, in real time, at any hour." The knowledge base is one text file per tenant (tenants/<id>/knowledge-base.md), filled only by the website scraper (tenants/noblepath/scripts/scraper.py, which skips PDFs) and loaded verbatim into the system prompt (app/api/chat/route.ts). There is no code path for documents a client provides, so the line claims the website only. |
+| `BEN-BOOK` | benefit | yes | yes | — | booking-link | It sends qualified sponsors your booking link, so they can book a call with your team. | SETTLED 2026-10-02 (migration 013). Was: "Qualified sponsors book a call straight into your calendar." Nova sends the booking link (CALENDLY_BOOKING_URL) in its confirmation after a lead is captured, only when that is set; the sponsor books through the link. Nothing reaches a calendar from Nova. |
+| `BEN-BRIEF` | benefit | yes | yes | — | study-details | It collects the therapeutic area and study phase before your first call. | [verify] NARROWED 2026-10-02. Was: "It collects the study brief before your first call." The RFP intake (capture_sponsor_lead) records therapeutic area and study phase, plus free-text notes; there are no fields for protocol, timelines, site count or budget, and pricing questions are escalated, not collected. |
+| `BEN-CAPTURE` | benefit | yes | yes | — | captures-lead, study-details | A sponsor who shares their details becomes a named lead: company, contact, therapeutic area and study phase. | [verify] NARROWED 2026-10-02. Was: "Every sponsor who engages becomes a named lead: company, contact, and what they're planning." capture_sponsor_lead requires company_name, therapeutic_area, study_phase, contact_name, contact_email (notes optional) and is only called once all five are confirmed; a visitor who declines is not captured, so "every sponsor who engages" was wider than the code. |
+| `BEN-DECK` | benefit | yes | yes | — | deck | It sends your capabilities deck the moment a sponsor asks for it. | Code reading 2026-10-02: capture_capabilities_request emails the deck once the visitor gives an email address. Supported. |
+| `BEN-FIT` | benefit | yes | yes | — | configured | It's configured around your services and your process, not a template. |  |
+| `BEN-ROUTE` | benefit | yes | yes | — | routes-leads | Leads land where your team already works. | SETTLED 2026-10-02 (migration 013). Was: "Leads land where your team already works, not in another dashboard." deliverLead() emails the team and pushes the lead to a CRM and a spreadsheet when configured (lib/integrations/); Nova also has its own leads dashboard (app/dashboard, BEN-SEE), so the "not in another dashboard" clause was dropped. |
+| `BEN-SEE` | benefit | yes | yes | — | dashboard | You can see every sponsor lead it captured, and any question it passed to your team. | [verify] NARROWED 2026-10-02. Was: "You can see which sponsors engaged and what they asked." The dashboard (app/dashboard) lists captured leads with their fields and notes, and escalations with the visitor's unanswered question. Conversations are not stored and analytics are anonymous counts, so a sponsor who engaged without leaving details, and what they asked, are not visible. |
+| `PR-BOTH` | proof | yes | yes | — | — | It's live at two CROs, in Türkiye and Mexico. | No countries: serves every lead no other proof line serves. |
+| `PR-MX` | proof | yes | yes | Mexico, Brazil, Argentina | — | It's live at Vertex Clinical Research in Mexico. | Mexico and Latin America. The Nova Agent Kit repo holds only the NoblePath tenant; the Vertex deployment is not visible in that source. |
 | `PR-MX-N` | proof | no | no | Mexico, Brazil, Argentina | — | *(empty)* | Empty on purpose. Fill ONLY with a number measured from Nova's own dashboard at Vertex, then activate. Never from a web source. When active it replaces PR-MX. |
-| `PR-TR` | proof | yes | no | Turkey, Egypt, UAE, Romania, Hungary, Poland, Czech Republic | — | It's live at NoblePath, an oncology CRO in Türkiye. | Turkiye and nearby. Which countries count as nearby is a judgement -- edit countries to change it. |
+| `PR-TR` | proof | yes | yes | Turkey, Egypt, UAE, Romania, Hungary, Poland, Czech Republic | — | It's live at NoblePath, an oncology CRO in Türkiye. | Turkiye and nearby. Which countries count as nearby is a judgement -- edit countries to change it. |
 | `PR-TR-N` | proof | no | no | Turkey, Egypt, UAE, Romania, Hungary, Poland, Czech Republic | — | *(empty)* | Empty on purpose. Fill ONLY with a number measured from Nova's own dashboard at NoblePath, then activate. Never from a web source. When active it replaces PR-TR. |
-| `A1` | ask | yes | no | — | — | Would a 48-hour demo built on your own material be worth a look? One word back is enough. |  |
-| `A2` | ask | yes | no | — | — | Worth a 48-hour demo on your own material? Reply yes and I'll set it up. |  |
+| `A1` | ask | yes | yes | — | — | Would a 48-hour demo built on your own material be worth a look? One word back is enough. |  |
+| `A2` | ask | yes | yes | — | — | Worth a 48-hour demo on your own material? Reply yes and I'll set it up. |  |
 | `L-NP` | link | no | no | — | — | *(empty)* | The one plain URL allowed after warm-up week 2: NoblePath's site, as a full URL (https://...). Workflow 4 appends it after the composed body only from warm-up week 3 on. countries works as it does for proof. |
 
 ## 6. What the sample execution produced
@@ -401,7 +401,7 @@ API cost of that execution at $2 / $10 per MTok: **$0.0376** for 1 leads (3805 i
 
 ## 7. Follow-ups — Workflow 6, composed under the same rules
 
-Drafting skill v3 §8 (2026-10-02): a follow-up is no longer a template. Workflow `followup0001` (versionId `4645384c-8b58-4fb7-b7ca-99829148f5a4`, **not published** — publish it in the n8n UI) asks the same model for it, with the same request parameters, and checks it with the same rule functions.
+Drafting skill v3 §8 (2026-10-02): a follow-up is no longer a template. Workflow `followup0001` (versionId `58dd5e57-9fb8-4087-abdf-9097c59dd9d2`, **not published** — publish it in the n8n UI) asks the same model for it, with the same request parameters, and checks it with the same rule functions.
 
 | | |
 |---|---|
@@ -409,7 +409,7 @@ Drafting skill v3 §8 (2026-10-02): a follow-up is no longer a template. Workflo
 | Due | no reply 6 days after the last send or follow-up; at most two follow-ups, then the lead is marked lost |
 | Lengths (note + ask) | #1 40–70 words; #2, the short final note, at most 40 |
 | Claim rules | Assemble Follow-Up embeds the deployed Assemble Drafts' rule section verbatim: **identical to drafting0001's** |
-| Assemble Follow-Up code | sha256 `afa27b3aaab04888…` |
+| Assemble Follow-Up code | sha256 `e3a080563efe4427…` |
 
 What it is offered: the first email exactly as sent (no greeting, opt-out or signature), the asks, the country's proof line, and for #1 only the angles and benefits that email did not use — a benefit that shares a capability with one it used is withheld too. Nothing else about the prospect reaches the model. A first email written under an older claims list (leads 7, 91 and 104 were emailed under v2) cannot be read off its codes, so the model reports which approved lines it already made (`first_email_covers`) and the added line is checked against that.
 
@@ -600,4 +600,153 @@ code of every approved claim the note used.
 | 104 | 1 | 55 | BEN-DECK.A2 | ANG-HOURS, BEN-247, BEN-ROUTE, BEN-CAPTURE | unconfirmed-claim | 2671 | 1173 (977) |
 
 API cost of that execution at $2 / $10 per MTok: **$0.0529** for 3 follow-ups (8006 input + 3688 output tokens).
+
+## 8. Auto-approval — the gate and the claim check, as deployed
+
+| | |
+|---|---|
+| settings.auto_approve_email | `true` (live) |
+| Approval Gate code | sha256 `621729df68acd70a…` |
+| Apply Claim Check code | sha256 `88777ac8f111768f…` (the gate's rules section + the apply body) |
+| Follow-Ups (`followup0001`) | the same three nodes, identical code and request |
+| The exceptions queue now | 8 pending, 8 with a reason |
+
+An email draft is approved by the workflow (`approved_by = 'auto'`) only if all of these hold; anything else is written `pending` with `hold_reason`:
+
+- `settings.auto_approve_email` is on (`auto-approve-off`) -- off, no claim check is called at all;
+- it is an email: a LinkedIn DM never auto-approves (`linkedin`, Section 6);
+- it is not a low-context note (`low-context`);
+- no rule tag from section 4b on its `variant` (`rule-tags: ...`);
+- every claim code on its `variant` is an active, confirmed line (`unconfirmed-claim: ...`, `no-claims`);
+- the claim check below finds every claim supported by a confirmed line and every prospect fact in the record, and its quoted sentences cover the whole email (`claim-check: ...`, `claim-check-incomplete: ...`); a failed call holds it (`claim-check-failed: ...`) -- no fallback model.
+
+Node **Claude Claim Check**: `POST https://api.anthropic.com/v1/messages`, credential `novascoutAnthropic01`, on error `continueRegularOutput`, retry 2 × 5000 ms. The body is the per-draft `$json.check_request` the Approval Gate builds from this fixed part, plus the confirmed lines, the prospect record (the fact sheet above; for a follow-up, the enrichment record and the first email as context) and the generated text:
+
+```json
+{
+  "model": "claude-sonnet-5-5",
+  "max_tokens": 16000,
+  "output_config": {
+    "effort": "high",
+    "format": {
+      "type": "json_schema",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "statements": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "sentence": {
+                  "type": "string"
+                },
+                "statement": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "claim",
+                    "prospect",
+                    "none"
+                  ]
+                },
+                "source": {
+                  "type": "string"
+                },
+                "why": {
+                  "type": "string"
+                },
+                "verdict": {
+                  "type": "string",
+                  "enum": [
+                    "supported",
+                    "widened",
+                    "unsupported",
+                    "joined",
+                    "none"
+                  ]
+                }
+              },
+              "required": [
+                "sentence",
+                "statement",
+                "kind",
+                "source",
+                "why",
+                "verdict"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "statements"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+The check's system prompt, exactly:
+
+```
+You check one outbound sales email before it is sent with no human review. A small company
+sells a website assistant to contract research organisations (CROs). Your only job is to find
+any statement in the email that says more than its sources support.
+
+You are given:
+- APPROVED CLAIMS: the only things the email may say about what we built, what it does, the
+  problem it addresses, who uses it, and the offer. Each has a code. The email may rephrase a
+  claim; it may never widen one.
+- PROSPECT RECORD: the only facts known about the recipient. A fact may say what it does NOT
+  establish; that limit is part of the fact.
+- Sometimes THE FIRST EMAIL we already sent them, as context. It is not evidence.
+- THE EMAIL TO CHECK. Its greeting, opt-out line and signature are fixed text and are not shown.
+
+Work through the email one sentence at a time, in order. The subject line, when given, counts
+as a sentence. Copy each sentence into "sentence" exactly as it appears. A sentence that makes
+several statements gets one entry per statement, each with the same "sentence" and its own
+"statement" (the words of the sentence that make that statement).
+
+Classify each statement:
+- "claim": anything about what we built, what it does or will do for them, the problem it
+  addresses, who uses it, or the offer (the demo).
+- "prospect": anything about the recipient -- their company, people, trials, work or website.
+- "none": a question that only asks, a reference back to our earlier email that adds nothing
+  new, or wording that asserts nothing.
+Words an approved claim itself uses about "you" -- your website, your team, your working
+hours -- belong to that claim. Judge them as part of the claim, not as prospect facts.
+The product's name in brackets, "(we call it Nova)", only names what the sentence describes:
+it is "none", not a claim. Judge the rest of that sentence as usual.
+
+Judge each statement:
+- claim: "supported" when an approved claim says the same thing or more -- rephrasing,
+  shortening and reordering are fine. "widened" when it rests on an approved claim but says
+  more: a broader scope, a stronger degree, a certainty or completeness the claim does not
+  state, or an added outcome, consequence or capability. "unsupported" when no approved claim
+  makes it.
+- prospect: "supported" when the record states it. "joined" when it links facts the record
+  keeps separate (a trial "in" their city, an area "of" a trial). "unsupported" when the record
+  does not state it.
+- none: "none".
+
+An example of widened, for a different claim. Approved: "It sends your capabilities deck the
+moment a sponsor asks for it." Email: "It sends your capabilities deck the moment a sponsor
+asks, so no request ever goes unanswered." The added clause claims an outcome -- every
+request answered -- that the approved claim does not make.
+
+When you are unsure whether a statement says more than its source, judge it widened or
+unsupported: a held email costs a person a minute, and a widened claim sent costs trust.
+Do not judge tone, length or style -- only whether each statement is supported.
+
+For every claim and prospect statement, "source" is the code of the approved claim, or the
+number of the record fact, you compared it with ("" when there is none). "why" is one short
+sentence.
+```
+
+The model judges statements; code decides. Apply Claim Check approves only if every `claim` is `supported` and names a code that is a confirmed line, every `prospect` fact is `supported`, every `none` is `none`, the quoted sentences (a leading "Subject:" label dropped) account for every word of the email, and a first email has at least one claim. The verdicts are kept in `drafts.claim_check`.
 

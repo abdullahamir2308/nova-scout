@@ -13,8 +13,10 @@ the code and the docs disagree.
 python build_workflow.py        # regenerate the workflow JSON
 node   test_grounding.js        # 140 cases -- the grounding guard (v1's 75) + the v3 library, prompt and request
 node   test_assemble.js         # 142 cases -- response handling, assembly, every skill v3 section 3 rule
-python test_drift_guards.py     # 55 cases -- each guard is made to fire
+node   test_approval.js         # 55 cases -- auto-approval: the Approval Gate and Apply Claim Check (migration 014)
+python test_drift_guards.py     # 66 cases -- each guard is made to fire
 python test_rule_mutations.py   # breaks every rule in turn; the unit suites must fail each time
+python test_approval_mutations.py   # breaks every auto-approval rule in turn; test_approval.js must fail each time
 python audit_drafts_vs_onepager.py   # read-only: the live queue and library vs nova-one-pager.docx
 python provision_anthropic_credential.py   # ANTHROPIC_API_KEY in .env -> n8n credential novascoutAnthropic01
 python write_drafting_review.py [exec_id]  # read-only: DRAFTING_REVIEW.md from what n8n has deployed
@@ -91,6 +93,61 @@ the write statement sets its earlier pending or approved first-touch drafts to
 always `pending`. A lead Workflow 6 has already emailed must be put back to
 `sent` after its redraft (2026-10-02 did this for leads 7, 91 and 104); its new
 email draft can never send, because Workflow 6 refuses `already-contacted`.
+
+## Auto-approval -- the review queue is the exceptions queue
+
+Since 2026-10-03 (migration 014) an email draft is approved by the workflow
+that wrote it when it passes every check below, and held for a person otherwise.
+Two Code nodes do it, and Follow-Ups (`../sendtrack/`) ships the same two
+verbatim, so a first touch and a follow-up are judged by the same functions:
+
+```
+Assemble Drafts / Build Low-Context Drafts -> Approval Gate -> Needs Claim Check? -> Claude Claim Check -> Apply Claim Check -> Write Drafts & Advance
+                                                                                \-> (held) ------------------------------------------> Write Drafts & Advance
+```
+
+| Rule | Where | Held as |
+|---|---|---|
+| `settings.auto_approve_email` is on (unset = on) | Approval Gate, from the batch query | `auto-approve-off` |
+| an email -- LinkedIn never auto-approves (Section 6) | Approval Gate | `linkedin` |
+| not a low-context note | Approval Gate | `low-context` |
+| no rule tag: nothing after `+` in `variant` | Approval Gate | `rule-tags: ...` |
+| every claim code in `variant` is active and confirmed | Approval Gate | `unconfirmed-claim: ...` / `no-claims` |
+| a second Sonnet 5.5 call finds every claim supported by a confirmed line and every prospect fact in the record -- a widened claim fails | Claude Claim Check -> Apply Claim Check | `claim-check: widened "..." (BEN-SEE)` and the like |
+
+`code_approval.js` is the Approval Gate (rules above its `// Node body` marker);
+Apply Claim Check is that rules section followed by `code_approval_apply.js`.
+The deterministic rules run first, so a draft they hold costs no API call. The
+check gets exactly what the drafter had: the lead's fact sheet (the
+ClinicalTrials.gov trial included -- it is looked up per run and stored nowhere)
+and the confirmed lines; for a follow-up, the enrichment record and the first
+email as context.
+
+**The model judges statements; code decides.** The check's schema has no
+overall verdict to trust. It returns every statement, sentence by sentence,
+with its kind (claim / prospect / none), the claim code or fact it compared it
+with, and a verdict. Apply Claim Check approves only if every claim is
+`supported` by a code that is really a confirmed line, every prospect fact is
+`supported`, and the sentences it quoted account for the whole email -- a
+sentence it skipped is a sentence nobody judged. Any failed call (HTTP error,
+refusal, cut-off, wrong schema) holds the draft. There is no fallback model: the
+check is Sonnet 5.5's or a person's.
+
+**The system prompt's widening example is not draft 99's sentence.** Draft 99's
+"..., so you know exactly what came in." is the held-out case the dry run proves
+the check catches (`../sendtrack/dryrun/approval_dryrun.py`); a check shown its
+own test case proves nothing. `test_approval_mutations.py` fails if it is ever
+added.
+
+**The table re-checks.** Migration 014's `drafts_approval_rules` trigger turns
+any `approved_by = 'auto'` approval that breaks the flag, the email-only rule,
+low-context, the tags, a claim code's confirmation, or lacks a passing
+`claim_check`, into a hold (`db-guard: ...`) -- so a bug here can make the
+workflow approve less, never more. It also sets `approved_by = 'human'` for
+every other approval, clears it when a draft leaves approved/sent, and sends an
+auto-approved draft back to a person if its text is rewritten underneath it.
+A confirmed claim whose text is edited is un-confirmed by a trigger on
+`claims_library`, until someone confirms the new text.
 
 ## The grounding guard
 
@@ -211,18 +268,20 @@ nothing is invented to fill the gap.
 
 ## Known gaps
 
-- **Every claim is unconfirmed.** Migration 012 seeded the v3 library with
-  `confirmed=false`, so every draft carries `unconfirmed-claim` until a human
-  confirms the lines. Read each row's `note` first: BEN-CAPTURE, BEN-BRIEF and
-  BEN-SEE were narrowed to the Nova Agent Kit code; D2, BEN-BOOK, BEN-247 and
-  BEN-ROUTE were settled by the operator on 2026-10-02 (migration 013: Nova sends
-  a booking link and does not book; it answers from the website, no SOPs; "not
-  in another dashboard" dropped).
-- **Drafts written before migration 013 still carry the old wording.** The
-  pending first-touch drafts of leads 7, 91 and 104 (89, 90, 93, 94, 95) say
-  "SOPs" / "books the call" and pair D2 with BEN-247; the audit fails on them.
-  Their emails can never send (`already-contacted`), but LinkedIn drafts 90 and
-  94 are sent by hand -- do not send them as they stand.
+- **Confirmation is per text.** The operator confirmed every active line on
+  2026-10-03 after reviewing them in `DRAFTING_REVIEW.md`. Editing a confirmed
+  line's text un-confirms it (migration 014), and a draft using it is held
+  until it is confirmed again -- in a second save, after reading it.
+- **A follow-up that names the prospect's trial is held.** Follow-Ups has no
+  ClinicalTrials.gov lookup, so the record its check gets says no trial is in
+  it; a person approves those.
+- **A pattern check is a pattern check, and the claim check is a model.** The
+  dry run measures it on real text (draft 99 held twice, a clean draft passed),
+  not on every possible widening. Every auto-approval lands in the Daily Digest
+  before its recipient's business hours open.
+- **Pending LinkedIn draft 90 still carries pre-013 wording** (D2 with
+  "books the call"). It is held for a person, like every LinkedIn draft, and is
+  sent by hand -- do not send it as it stands.
 - **A pattern check is a pattern check.** The claim rules catch the phrasings
   their patterns name (`DRAFTING_REVIEW.md` lists them). A forbidden claim worded
   some other way gets past them, and the human review is the backstop.

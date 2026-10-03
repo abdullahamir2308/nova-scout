@@ -701,6 +701,10 @@ return {
     library_link: linkPool,
     library_gap: libraryGap,
     warmup_week: warmupWeek,
+    // settings.auto_approve_email as this run's batch query read it (migration
+    // 014). Carried per item for the same reason the library is: a Postgres
+    // node replaces the items, so nothing set upstream survives otherwise.
+    auto_approve: lead.auto_approve_email === true,
     system_prompt: SYSTEM_PROMPT,
     prompt: fullPrompt,
     request: request,

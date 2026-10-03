@@ -264,4 +264,61 @@ t.check('a response missing a list (first_email_covers) writes nothing',
 t.check('an empty note is `empty`', has(flagsOf({ body: '' }), 'empty'), true);
 t.check('a merge tag is `merge-tag`', has(flagsOf(swap('Hi [First Name], over to you.')), 'merge-tag'), true);
 
+// ===================================================================================
+// Auto-approval (migration 014): what the shared Approval Gate and claim check get
+// ===================================================================================
+
+const ENRICHED = build([due({
+  auto_approve_email: true, company_name: 'BiTrial', city: 'Budapest', founder_name: 'Dr. Example',
+  therapeutic_areas: ['Oncology', 'Immunology'], phases: ['Phase II'], employee_estimate: 40,
+})])[0].json;
+t.check('the flag rides on the request item (and a row without it is off)',
+  [ENRICHED.auto_approve, B1.json.auto_approve], [true, false]);
+t.check('the prospect record is the enrichment record, worded with its boundaries',
+  ['Company: BiTrial (the email never names it)', 'Country: Poland',
+   '1. Therapeutic areas listed on their own website: Oncology, Immunology. This says nothing about which area any particular trial belongs to.',
+   'The company is based in Budapest. This says nothing about where any trial runs',
+   'Named on their own site as founder or MD: Dr. Example.',
+   'Their own site states a team of 40 people.'].every(function (s) { return ENRICHED.prospect_record.indexOf(s) !== -1; }), true);
+t.check('... and says outright that no trial is in it (Workflow 4 stores none), so a follow-up naming one is held',
+  ENRICHED.prospect_record.indexOf('No trial is part of this record.') !== -1, true);
+t.check('the record and the check claims never reach the composing model (build rule 6 still by construction)',
+  [ENRICHED.prompt.indexOf('Budapest'), ENRICHED.prompt.indexOf('Dr. Example'), ENRICHED.request.messages[0].content.indexOf('No trial')],
+  [-1, -1, -1]);
+t.check('the checker gets every description, angle, benefit and ask -- and only this lead\'s proof',
+  codes(ENRICHED.check_claims).sort(),
+  ['A1', 'A2', 'ANG-HOURS', 'ANG-STAKES', 'BEN-247', 'BEN-BOOK', 'BEN-BRIEF', 'BEN-CAPTURE', 'BEN-DECK', 'D1', 'D2', 'PR-TR']);
+t.check('... each with its confirmation', ENRICHED.check_claims.every(function (c) { return c.confirmed === true; }), true);
+t.check('the first email reaches the checker without greeting, opt-out or signature',
+  [ENRICHED.first_core.indexOf('Hello,'), ENRICHED.first_core.indexOf(OPT), ENRICHED.first_core.indexOf('Your site lists oncology')],
+  [-1, -1, 0]);
+
+const AP = assemble({}, { json: ENRICHED });
+t.check('Assemble Follow-Up hands the gate a follow-up context: the note and ask, no subject, no quoted email',
+  [AP.approval.kind, AP.approval.auto_approve, AP.approval.check.subject, AP.approval.check.text,
+   AP.approval.check.text.indexOf('wrote:')],
+  ['follow-up', true, null, CLEAN.body + '\n\n' + CLEAN.ask, -1]);
+t.check('... with the record, the claims and the first email from Build Follow-Up',
+  [AP.approval.record === ENRICHED.prospect_record, AP.approval.claims.length, AP.approval.first_email === ENRICHED.first_core],
+  [true, 12, true]);
+
+// The real shared gate (n8n/drafting/code_approval.js), on what Assemble Follow-Up wrote.
+const GATE = path.join(__dirname, '..', 'drafting', 'code_approval.js');
+const gateOf = (item) => runForEachItem(GATE, [{ json: item }], {})[0].json;
+let G = gateOf(AP);
+t.check('a clean follow-up with the flag on goes on to the claim check',
+  [G.needs_check, G.payload.draft.status, G.check_request.model], [true, 'pending', 'claude-sonnet-5-5']);
+t.check('... and the check is told it is a follow-up, with the first email as context only',
+  G.check_request.messages[0].content.indexOf('THE FIRST EMAIL, already sent to them -- context only') !== -1, true);
+G = gateOf(assemble({}, { json: Object.assign({}, ENRICHED, { auto_approve: false }) }));
+t.check('the flag off holds it', [G.needs_check, G.payload.draft.hold_reason], [false, 'auto-approve-off: settings.auto_approve_email is false']);
+G = gateOf(assemble({ body: CLEAN.body + ' It replies within 3 seconds.' }, { json: ENRICHED }));
+t.check('a follow-up with a rule tag is held with it, before any check is paid for',
+  [G.needs_check, /^rule-tags: /.test(G.payload.draft.hold_reason)], [false, true]);
+const UNCONFIRMED = build([due({ auto_approve_email: true, library: LIBRARY.map(function (r) {
+  return r.code === 'BEN-DECK' ? Object.assign({}, r, { confirmed: false }) : r; }) })])[0];
+G = gateOf(assemble({}, UNCONFIRMED));
+t.check('a follow-up using an unconfirmed line is held (the tag and the gate both say so)',
+  [G.needs_check, G.payload.draft.hold_reason], [false, 'rule-tags: unconfirmed-claim; unconfirmed-claim: BEN-DECK']);
+
 t.done();

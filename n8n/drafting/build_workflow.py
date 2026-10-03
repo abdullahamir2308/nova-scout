@@ -874,6 +874,10 @@ BATCH_SQL = """-- The queue for this stage: Section 9 Workflow 4's "batch where
 -- starts on the sender-day (Asia/Karachi) of the mailbox's first external send,
 -- counting the Sent-folder mirror and unconfirmed claims. NULL = none yet, i.e.
 -- the first send will be week 1. It decides the link rule (Section 9, Links).
+--
+-- auto_approve_email: settings.auto_approve_email (migration 014), read per run
+-- for the same reason as the library. Off, the Approval Gate holds every draft
+-- and no claim check is paid for; the database re-checks it on the write.
 WITH counted AS (
   SELECT m.sent_at AS at FROM mailbox_sent m WHERE m.external
   UNION ALL
@@ -906,7 +910,8 @@ SELECT l.id            AS lead_id,
          WHERE k.active)                  AS library,
        (SELECT (((now() AT TIME ZONE 'Asia/Karachi')::date
                  - (min(counted.at) AT TIME ZONE 'Asia/Karachi')::date) / 7) + 1
-          FROM counted)                   AS warmup_week
+          FROM counted)                   AS warmup_week,
+       auto_approve_email_enabled()       AS auto_approve_email
   FROM leads l
   JOIN scores      s ON s.lead_id = l.id
   JOIN contacts    c ON c.lead_id = l.id
@@ -935,11 +940,16 @@ WRITE_SQL = """-- Write both drafts and advance the lead in ONE statement, so a 
 -- Its earlier first-touch drafts that are still pending or approved become
 -- 'rejected' / 'bad draft' here, in the same statement. Left alone, an old
 -- APPROVED draft would go out first: the lead returns to 'drafted', which is
--- what Workflow 6 sends from, and it sends the oldest approved draft. The new
--- drafts are always 'pending' -- no approval carries over to copy nobody has
--- read. 'sent' drafts and follow-ups are never touched, and the body and any
--- human edit (edited_body) of a retired draft are kept. All CTEs share one
--- snapshot, so `retired` cannot see, and never retires, the rows `ins` adds.
+-- what Workflow 6 sends from, and it sends the oldest approved draft. No
+-- approval carries over to copy nobody has read: a new draft is 'pending', or
+-- 'approved' by this workflow when the Approval Gate and the claim check passed
+-- it (migration 014). Only an email draft the payload marks approved_by 'auto'
+-- can come out approved here, and the table's own trigger re-checks the flag,
+-- the tags, the low-context branch and every claim code against the live
+-- library, turning a bad approval into a hold. 'sent' drafts and follow-ups are
+-- never touched, and the body and any human edit (edited_body) of a retired
+-- draft are kept. All CTEs share one snapshot, so `retired` cannot see, and
+-- never retires, the rows `ins` adds.
 WITH payload AS (
   SELECT $1::jsonb AS p
 ), adv AS (
@@ -959,21 +969,30 @@ WITH payload AS (
      AND coalesce(d.variant, '') NOT LIKE 'follow-up-%'
   RETURNING d.id, d.status
 ), ins AS (
-  INSERT INTO drafts (lead_id, channel, variant, subject, body, status)
+  INSERT INTO drafts (lead_id, channel, variant, subject, body, status, approved_by, hold_reason, claim_check)
   SELECT a.id,
          d->>'channel',
          d->>'variant',
          d->>'subject',
          d->>'body',
-         'pending'
+         CASE WHEN d->>'channel' = 'email' AND d->>'status' = 'approved' AND d->>'approved_by' = 'auto'
+              THEN 'approved' ELSE 'pending' END,
+         CASE WHEN d->>'channel' = 'email' AND d->>'status' = 'approved' AND d->>'approved_by' = 'auto'
+              THEN 'auto' END,
+         nullif(d->>'hold_reason', ''),
+         nullif(d->'claim_check', 'null'::jsonb)
     FROM adv a
     CROSS JOIN LATERAL jsonb_array_elements((SELECT p->'drafts' FROM payload)) AS d
-  RETURNING id, lead_id, channel, variant
+  RETURNING id, lead_id, channel, variant, status, approved_by, hold_reason
 )
 SELECT ((SELECT p FROM payload)->>'lead_id')::bigint AS lead_id,
        (SELECT count(*) FROM adv) AS advanced,
        (SELECT count(*) FROM ins) AS drafts_written,
        (SELECT string_agg(channel || ':' || variant, ' | ' ORDER BY channel) FROM ins) AS wrote,
+       (SELECT string_agg(id::text || ':' || channel || ':' || status || coalesce(':' || approved_by, ''), ' | '
+                          ORDER BY id) FROM ins) AS decisions,
+       (SELECT string_agg(id::text || ': ' || hold_reason, ' | ' ORDER BY id) FROM ins
+         WHERE hold_reason IS NOT NULL) AS held,
        (SELECT string_agg(id::text, ',' ORDER BY id) FROM retired) AS retired_draft_ids;"""
 
 
@@ -1045,6 +1064,62 @@ assert "__CLAUDE_REQUEST__" not in _assess_js, "Claude request placeholder was n
 assert '"model": "%s"' % DRAFT_MODEL in _assess_js, "the shipped request does not name %s" % DRAFT_MODEL
 
 _assert_emitted_upstream(_assess_js, _claude_reads, "code_assess.js")
+
+
+# ---------------------------------------------------------------------------
+# Auto-approval (migration 014) -- code_approval.js, shared with Follow-Ups
+#
+# Approval Gate ships code_approval.js verbatim; Apply Claim Check ships its
+# rules section (everything above the 'Node body' marker) followed by
+# code_approval_apply.js. n8n/sendtrack/build_workflow.py embeds the same two,
+# so a first touch and a follow-up are judged by the same functions.
+# ---------------------------------------------------------------------------
+
+APPROVAL_JS = js("code_approval.js")
+_approval_at = APPROVAL_JS.find("// Node body")
+assert _approval_at != -1, "code_approval.js has no '// Node body' marker"
+APPROVAL_RULES = APPROVAL_JS[:_approval_at]
+assert "$(" not in APPROVAL_RULES and "$input" not in APPROVAL_RULES, (
+    "the rules section of code_approval.js reads n8n data -- node-body code has moved above its 'Node body' "
+    "marker, and Apply Claim Check (which embeds that section) would run it a second time")
+APPLY_JS = APPROVAL_RULES + "\n" + js("code_approval_apply.js")
+
+# The claim check is a second call to the drafting model, with its parameters
+# (Section 3). A cheaper or different model here would be a different check
+# than the one the operator asked for.
+_check_model = re.search(r"^const CHECK_MODEL = '([a-z0-9-]+)';", APPROVAL_RULES, re.M)
+_check_effort = re.search(r"^const CHECK_EFFORT = '([a-z]+)';", APPROVAL_RULES, re.M)
+assert _check_model and _check_model.group(1) == DRAFT_MODEL, (
+    "the claim check (code_approval.js CHECK_MODEL) is not Section 3's drafting model %s" % DRAFT_MODEL)
+assert _check_effort and _check_effort.group(1) == DRAFT_EFFORT, (
+    "the claim check's effort (code_approval.js CHECK_EFFORT) is not Section 3's %r" % DRAFT_EFFORT)
+assert not re.search(r"\b(temperature|top_p|top_k|budget_tokens)\b", re.sub(r"//.*", "", APPROVAL_RULES)), (
+    "the claim check request sets a sampling or thinking-budget parameter -- a 400 on %s (Section 3)" % DRAFT_MODEL)
+# Section 6: a LinkedIn draft never auto-approves. The gate's first test.
+assert re.search(r"if \(!draft \|\| draft\.channel !== 'email'\) \{\s*\n\s*reasons\.push\('linkedin", APPROVAL_RULES), (
+    "code_approval.js no longer holds every non-email draft first -- Section 6: LinkedIn is reviewed and sent "
+    "by hand, always")
+# The Write statement can only approve what the Apply node marks approved by
+# 'auto', and only an email.
+assert "target.approved_by = 'auto'" in js("code_approval_apply.js")
+
+CHECK_BODY = "={{ JSON.stringify($json.check_request) }}"
+_assert_emitted_upstream(APPROVAL_JS, set(re.findall(r"\$json\.(\w+)", CHECK_BODY)) | {"needs_check"},
+                         "code_approval.js (Approval Gate)")
+# What the gate reads off the item must be what both upstream nodes emit.
+_assert_emitted_upstream(_assemble_js, {"approval", "payload"}, "code_assemble.js (Assemble Drafts)")
+_assert_emitted_upstream(js("code_lowcontext.js"), {"payload"}, "code_lowcontext.js (Build Low-Context Drafts)")
+for _f in re.findall(r"\bctx\.(\w+)", APPROVAL_RULES):
+    assert re.search(r"^\s*%s:" % re.escape(_f), _assemble_js, re.M), (
+        "code_approval.js reads approval.%s, but Assemble Drafts' `approval` has no %s -- it would be "
+        "undefined at runtime, with no error" % (_f, _f))
+# Write Drafts & Advance reads these off each payload draft; the gate or the
+# apply node must set every one.
+for _f in re.findall(r"d->>?'(\w+)'", WRITE_SQL):
+    if _f in ("channel", "variant", "subject", "body"):
+        continue
+    assert re.search(r"\bd\.%s = |target\.%s = " % (_f, _f), APPROVAL_JS + js("code_approval_apply.js")), (
+        "Write Drafts & Advance reads d->>'%s', which neither Approval Gate nor Apply Claim Check sets" % _f)
 
 # The same class of bug one node earlier: every `lead.X` Assess Grounding reads
 # off the batch row must be a column Get Draft Batch returns. A missing one is
@@ -1317,6 +1392,76 @@ nodes = [
         ),
     },
     {
+        "parameters": {"mode": "runOnceForEachItem", "jsCode": APPROVAL_JS},
+        "name": "Approval Gate",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [1320, 130],
+        "notes": (
+            "Auto-approval, rules 1-4 (migration 014): an EMAIL draft goes on to the claim check only if "
+            "settings.auto_approve_email is on, it carries no rule tag, it is not low-context, and every claim "
+            "code it records is confirmed. Anything else is held -- written 'pending' with hold_reason -- and no "
+            "check is paid for. A LinkedIn draft is always held (Section 6). The database re-checks all of this "
+            "on the write.\n\n"
+            "Same code as Follow-Ups' node of the same name (n8n/drafting/code_approval.js)."
+        ),
+    },
+    {
+        "parameters": {
+            "conditions": boolean_condition("needscheck", "={{ $json.needs_check }}", True),
+            "options": {},
+        },
+        "name": "Needs Claim Check?",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.2,
+        "position": [1540, 130],
+        "notes": "true: an email draft that passed rules 1-4. false: everything is held; straight to the write.",
+    },
+    {
+        "parameters": {
+            "method": "POST",
+            "url": "https://api.anthropic.com/v1/messages",
+            "authentication": "predefinedCredentialType",
+            "nodeCredentialType": "anthropicApi",
+            "sendHeaders": True,
+            "headerParameters": {"parameters": [{"name": "anthropic-version", "value": "2023-06-01"}]},
+            "sendBody": True,
+            "specifyBody": "json",
+            "jsonBody": CHECK_BODY,
+            "options": {"timeout": 300000},
+        },
+        "name": "Claude Claim Check",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [1760, 20],
+        "credentials": ANTHROPIC_CRED,
+        "onError": "continueRegularOutput",
+        "retryOnFail": True,
+        "maxTries": 2,
+        "waitBetweenTries": 5000,
+        "notes": (
+            "Auto-approval, rule 5: a second %s call (effort %s, Section 3's parameters) that compares each "
+            "product claim in the email with the confirmed claims and each prospect fact with the record the "
+            "draft was written from, sentence by sentence. A widened claim fails. The body is $json.check_request, "
+            "built by Approval Gate.\n\n"
+            "Errors continue as items: Apply Claim Check holds the draft for a human. No fallback to another "
+            "model -- the check is Sonnet 5.5's or a person's."
+        ) % (DRAFT_MODEL, DRAFT_EFFORT),
+    },
+    {
+        "parameters": {"mode": "runOnceForEachItem", "jsCode": APPLY_JS},
+        "name": "Apply Claim Check",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [1980, 20],
+        "notes": (
+            "Approved by the workflow only if every statement the check found is supported AND its quotes cover "
+            "the whole email (a sentence it skipped is a sentence nobody judged). Anything else -- a widened or "
+            "unsupported claim, an unsupported or joined fact, a failed call -- is held with the reason. The "
+            "verdicts go into drafts.claim_check either way."
+        ),
+    },
+    {
         "parameters": {
             "operation": "executeQuery",
             "query": WRITE_SQL,
@@ -1325,7 +1470,7 @@ nodes = [
         "name": "Write Drafts & Advance",
         "type": "n8n-nodes-base.postgres",
         "typeVersion": 2.7,
-        "position": [1320, 130],
+        "position": [2200, 130],
         "credentials": PG_CRED,
         "notes": (
             "Both drafts and the status advance in one statement. The whole payload goes in as a "
@@ -1338,7 +1483,9 @@ nodes = [
             "A redraft retires what it replaces, in the same statement: a lead's earlier pending "
             "or approved first-touch drafts become rejected / 'bad draft'. An old APPROVED draft "
             "left alone would be the first thing Workflow 6 sends once the lead is back at "
-            "'drafted'. New drafts are always 'pending' -- no approval carries over."
+            "'drafted'. No approval carries over: a new draft is 'pending', or approved by this "
+            "workflow when the gate and the claim check passed it (migration 014) -- and the "
+            "table's trigger re-checks that approval against the live flag and library."
         ),
     },
 ]
@@ -1366,12 +1513,30 @@ connections = {
         "main": [[{"node": "Drop Failed Generations", "type": "main", "index": 0}]]
     },
     "Drop Failed Generations": {
-        "main": [[{"node": "Write Drafts & Advance", "type": "main", "index": 0}]]
+        "main": [[{"node": "Approval Gate", "type": "main", "index": 0}]]
     },
     "Build Low-Context Drafts": {
+        "main": [[{"node": "Approval Gate", "type": "main", "index": 0}]]
+    },
+    "Approval Gate": {"main": [[{"node": "Needs Claim Check?", "type": "main", "index": 0}]]},
+    "Needs Claim Check?": {
+        "main": [
+            [{"node": "Claude Claim Check", "type": "main", "index": 0}],
+            [{"node": "Write Drafts & Advance", "type": "main", "index": 0}],
+        ]
+    },
+    "Claude Claim Check": {"main": [[{"node": "Apply Claim Check", "type": "main", "index": 0}]]},
+    "Apply Claim Check": {
         "main": [[{"node": "Write Drafts & Advance", "type": "main", "index": 0}]]
     },
 }
+
+# Nothing reaches the write without passing the gate: both of the gate's exits
+# end at Write Drafts & Advance, and nothing else does.
+_into_write = sorted(src for src, outs in connections.items()
+                     for branch in outs["main"] for e in branch if e["node"] == "Write Drafts & Advance")
+assert _into_write == ["Apply Claim Check", "Needs Claim Check?"], (
+    "something reaches Write Drafts & Advance without the Approval Gate: %r" % _into_write)
 
 workflow = {
     "id": "drafting0001",

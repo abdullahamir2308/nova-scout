@@ -1,0 +1,296 @@
+// Unit tests for auto-approval (migration 014): code_approval.js (Approval Gate)
+// and code_approval_apply.js (Apply Claim Check, shipped as code_approval.js's
+// rules section + that file -- the same text build_workflow.py embeds).
+//
+// Every rule that holds a draft has a case that must HOLD and, where a check
+// could over-reach, a near miss that must PASS. test_approval_mutations.py then
+// breaks each rule in the source and proves this file fails.
+
+const fs = require('fs');
+const path = require('path');
+const { runForEachItem, runner } = require('./harness');
+
+const GATE = path.join(__dirname, 'code_approval.js');
+const APPLY = path.join(__dirname, 'code_approval_apply.js');
+const RULES = (function () {
+  const src = fs.readFileSync(GATE, 'utf8');
+  return src.slice(0, src.indexOf('// Node body'));
+})();
+const asShipped = function (src) { return RULES + '\n' + src; };
+
+const t = runner('Auto-approval -- Approval Gate and Apply Claim Check (migration 014)');
+
+// --- fixtures -------------------------------------------------------------------
+
+function claim(code, slot, body, confirmed) {
+  return { code: code, slot: slot, body: body, confirmed: confirmed !== false };
+}
+const CLAIMS = [
+  claim('D2', 'description', 'an AI intake assistant for your website that answers sponsors, qualifies them, and sends them your booking link'),
+  claim('ANG-HOURS', 'angle', 'Sponsors often research CROs outside your working hours, frequently from another time zone. An inquiry sent at 11pm waits until morning, and by then they may have moved on to the next CRO.'),
+  claim('BEN-SEE', 'benefit', 'You can see every sponsor lead it captured, and any question it passed to your team.'),
+  claim('BEN-DECK', 'benefit', 'It sends your capabilities deck the moment a sponsor asks for it.'),
+  claim('PR-BOTH', 'proof', "It's live at two CROs, in Türkiye and Mexico."),
+  claim('A1', 'ask', 'Would a 48-hour demo built on your own material be worth a look? One word back is enough.'),
+];
+const RECORD = 'Company: Innovate Research (the email never names it)\nCountry: India\n' +
+  '1. ClinicalTrials.gov lists 2 recruiting trials registered under your company. The ones named are: "Registry of X"; "Study Y".\n' +
+  '2. The company is based in Pune. This says nothing about where any trial runs or where any staff sit.';
+const SUBJECT = 'Your Registry of X trial and sponsor inquiries';
+const BODY = [
+  "You're running a recruiting trial, the Registry of X.",
+  'Sponsors often research CROs outside your working hours, so an inquiry sent at 11pm waits until morning.',
+  'We built an AI intake assistant for your website that answers sponsors, qualifies them, and sends them your booking link (we call it Nova).',
+  "You can see every sponsor lead it captured, and any question it passed to your team. It's live at two CROs, in Türkiye and Mexico.",
+  'Would a 48-hour demo built on your own material be worth a look? One word back is enough.',
+].join(' ');
+
+function ctx(over) {
+  return Object.assign({
+    kind: 'first-touch',
+    auto_approve: true,
+    country: 'India',
+    record: RECORD,
+    claims: CLAIMS,
+    first_email: null,
+    check: { subject: SUBJECT, text: BODY },
+  }, over || {});
+}
+const CLEAN = 'unnamed/D2.ANG-HOURS.BEN-SEE.PR-BOTH.A1';
+function firstTouch(emailVariant, approval, linkedinVariant) {
+  return {
+    json: {
+      lead_id: 50,
+      approval: approval === undefined ? ctx() : approval,
+      payload: {
+        lead_id: 50,
+        advance: true,
+        drafts: [
+          { channel: 'email', variant: emailVariant, subject: SUBJECT, body: 'Hello,\n\n' + BODY },
+          { channel: 'linkedin', variant: linkedinVariant || 'no-profile/D2.ANG-HOURS.A1', subject: null, body: 'Hello,\n\n...' },
+        ],
+      },
+    },
+  };
+}
+function gate(item) {
+  return runForEachItem(GATE, [item])[0].json;
+}
+
+// --- Approval Gate: rules 1-4 -----------------------------------------------------
+
+let g = gate(firstTouch(CLEAN));
+t.check('a clean email draft goes on to the claim check', [g.needs_check, g.check_target], [true, 0]);
+t.check('... and is still pending until the check passes it',
+  [g.payload.drafts[0].status, g.payload.drafts[0].approved_by, g.payload.drafts[0].hold_reason], ['pending', null, null]);
+t.check('its LinkedIn draft is held, always (Section 6)',
+  [g.payload.drafts[1].status, g.payload.drafts[1].hold_reason], ['pending', 'linkedin: always reviewed and sent by hand']);
+const req = g.check_request;
+t.check('the check is Sonnet 5.5 at effort high with a strict JSON schema (Section 3)',
+  [req.model, req.output_config.effort, req.output_config.format.type, req.max_tokens], ['claude-sonnet-5-5', 'high', 'json_schema', 16000]);
+t.check('no sampling parameter and no thinking budget (a 400 on this model)',
+  ['temperature', 'top_p', 'top_k', 'thinking'].filter(function (k) { return k in req; }), []);
+t.check('every object in the schema closes with additionalProperties:false',
+  [req.output_config.format.schema.additionalProperties, req.output_config.format.schema.properties.statements.items.additionalProperties], [false, false]);
+const prompt = req.messages[0].content;
+t.check('the prompt carries every confirmed claim, the record, the subject and the body',
+  [prompt.indexOf('[BEN-SEE] (benefit) You can see every sponsor lead') !== -1, prompt.indexOf('based in Pune') !== -1,
+   prompt.indexOf('Subject: ' + SUBJECT) !== -1, prompt.indexOf(BODY) !== -1], [true, true, true, true]);
+t.check('the system prompt\'s widening example is not draft 99\'s sentence (that one is the held-out test)',
+  req.system.indexOf('exactly what came in'), -1);
+t.check('a first touch has no FIRST EMAIL section', prompt.indexOf('THE FIRST EMAIL'), -1);
+
+const input = firstTouch(CLEAN);
+const before = JSON.stringify(input.json.payload);
+gate(input);
+t.check('the gate does not mutate the item it was handed', JSON.stringify(input.json.payload), before);
+
+g = gate(firstTouch(CLEAN, ctx({ auto_approve: false })));
+t.check('flag off: held, and no check is paid for',
+  [g.needs_check, g.check_request, g.payload.drafts[0].hold_reason], [false, null, 'auto-approve-off: settings.auto_approve_email is false']);
+g = gate(firstTouch(CLEAN, ctx({ auto_approve: undefined })));
+t.check('flag missing from the context counts as off (only an explicit true turns it on here)',
+  [g.needs_check, g.payload.drafts[0].hold_reason.indexOf('auto-approve-off')], [false, 0]);
+
+g = gate(firstTouch(CLEAN + '+long,claim-repeat'));
+t.check('a rule tag holds it, naming every tag', [g.needs_check, g.payload.drafts[0].hold_reason], [false, 'rule-tags: long, claim-repeat']);
+g = gate(firstTouch(CLEAN + '+unconfirmed-claim'));
+t.check('... unconfirmed-claim is a rule tag like any other', [g.needs_check, g.payload.drafts[0].hold_reason], [false, 'rule-tags: unconfirmed-claim']);
+
+g = gate(firstTouch('low-context/role-inbox', null, 'low-context/no-profile'));
+t.check('a low-context item (no approval context) holds both drafts, no check',
+  [g.needs_check, g.payload.drafts[0].hold_reason, g.payload.drafts[1].hold_reason],
+  [false, 'low-context: a note to a person, not an email to send', 'linkedin: always reviewed and sent by hand']);
+g = gate(firstTouch('low-context/role-inbox'));
+t.check('a low-context variant is held even with a full context and the flag on',
+  [g.needs_check, g.payload.drafts[0].hold_reason], [false, 'low-context: a note to a person, not an email to send']);
+
+const UNCONF = CLAIMS.map(function (c) { return c.code === 'BEN-SEE' ? claim(c.code, c.slot, c.body, false) : c; });
+g = gate(firstTouch(CLEAN, ctx({ claims: UNCONF })));
+t.check('a claim code that is not confirmed holds it, naming the code', [g.needs_check, g.payload.drafts[0].hold_reason], [false, 'unconfirmed-claim: BEN-SEE']);
+g = gate(firstTouch('unnamed/D2.ANG-HOURS.BEN-XYZ.PR-BOTH.A1'));
+t.check('a claim code the library does not hold counts as unconfirmed', g.payload.drafts[0].hold_reason, 'unconfirmed-claim: BEN-XYZ');
+g = gate(firstTouch('unnamed/'));
+t.check('no claim codes at all: held', g.payload.drafts[0].hold_reason, 'no-claims: the draft records no claim codes');
+g = gate(firstTouch(CLEAN, ctx({ claims: UNCONF.filter(function (c) { return c.code !== 'BEN-SEE'; }) .concat([claim('BEN-DECK2', 'benefit', 'x', false)]).concat([CLAIMS[2]]) })));
+t.check('near miss: an unconfirmed line the draft did NOT use does not hold it', g.needs_check, true);
+const unconfPrompt = gate(firstTouch(CLEAN, ctx({ claims: CLAIMS.concat([claim('BEN-FIT', 'benefit', 'Configured around you.', false)]) }))).check_request.messages[0].content;
+t.check('... and an unconfirmed line is never shown to the checker as approved', unconfPrompt.indexOf('BEN-FIT'), -1);
+
+g = gate(firstTouch(CLEAN + '+long', ctx({ auto_approve: false })));
+t.check('every reason is recorded, flag first', g.payload.drafts[0].hold_reason, 'auto-approve-off: settings.auto_approve_email is false; rule-tags: long');
+
+g = gate({ json: { lead_id: 50, payload: firstTouch(CLEAN).json.payload } });
+t.check('an email draft that arrives without its approval context is held, not approved',
+  [g.needs_check, g.payload.drafts[0].hold_reason], [false, 'no-context: the draft arrived without its approval context']);
+
+g = gate(firstTouch(CLEAN, undefined, CLEAN));
+g = gate({ json: { lead_id: 50, approval: ctx(), payload: { lead_id: 50, drafts: [
+  { channel: 'email', variant: CLEAN, body: 'a' }, { channel: 'email', variant: CLEAN, body: 'b' }] } } });
+t.check('two email drafts in one item: both held, nothing checked',
+  [g.needs_check, g.payload.drafts[0].hold_reason, g.payload.drafts[1].hold_reason],
+  [false, 'internal: more than one email draft in one item', 'internal: more than one email draft in one item']);
+
+// Follow-Ups' shape: payload.draft, no subject to check, the first email as context.
+const FU_TEXT = 'Following up on my note about after-hours sponsor inquiries. One more thing the assistant does: it sends your capabilities deck the moment a sponsor asks for it.\n\nWould a 48-hour demo built on your own material be worth a look? One word back is enough.';
+function followUp(variant, over) {
+  return {
+    json: {
+      lead_id: 7,
+      approval: ctx(Object.assign({ kind: 'follow-up', first_email: 'Your recruiting trial INM004 ...', check: { subject: null, text: FU_TEXT } }, over || {})),
+      payload: { lead_id: 7, action: 'draft-follow-up', draft: { channel: 'email', variant: variant, subject: 'Re: x', body: 'Hello,\n\n' + FU_TEXT } },
+    },
+  };
+}
+g = gate(followUp('follow-up-1/BEN-DECK.A1'));
+t.check('a clean follow-up goes on to the check', [g.needs_check, g.check_target, g.payload.draft.status], [true, 0, 'pending']);
+const fuPrompt = g.check_request.messages[0].content;
+t.check('... with the first email as context only, and no subject line to check',
+  [fuPrompt.indexOf('THE FIRST EMAIL, already sent to them -- context only') !== -1, fuPrompt.indexOf('Subject:'),
+   fuPrompt.indexOf('a follow-up to the first email') !== -1], [true, -1, true]);
+g = gate(followUp('follow-up-1/BEN-DECK.A1+fu-no-new-claim'));
+t.check('a follow-up rule tag holds it', g.payload.draft.hold_reason, 'rule-tags: fu-no-new-claim');
+
+// --- Apply Claim Check: rule 5 ----------------------------------------------------
+
+function response(statements, over) {
+  return Object.assign({
+    model: 'claude-sonnet-5-5',
+    stop_reason: 'end_turn',
+    usage: { input_tokens: 2000, output_tokens: 900 },
+    content: [{ type: 'thinking', thinking: '' }, { type: 'text', text: JSON.stringify({ statements: statements }) }],
+  }, over || {});
+}
+function st(sentence, kind, source, verdict, statement) {
+  return { sentence: sentence, statement: statement || sentence, kind: kind, source: source, why: 'because', verdict: verdict };
+}
+const SENTENCES = [
+  st(SUBJECT, 'prospect', '1', 'supported'),
+  st("You're running a recruiting trial, the Registry of X.", 'prospect', '1', 'supported'),
+  st('Sponsors often research CROs outside your working hours, so an inquiry sent at 11pm waits until morning.', 'claim', 'ANG-HOURS', 'supported'),
+  st('We built an AI intake assistant for your website that answers sponsors, qualifies them, and sends them your booking link (we call it Nova).', 'claim', 'D2', 'supported'),
+  st('You can see every sponsor lead it captured, and any question it passed to your team.', 'claim', 'BEN-SEE', 'supported'),
+  st("It's live at two CROs, in Türkiye and Mexico.", 'claim', 'PR-BOTH', 'supported'),
+  st('Would a 48-hour demo built on your own material be worth a look?', 'claim', 'A1', 'supported'),
+  st('One word back is enough.', 'none', '', 'none'),
+];
+function apply(gateItem, resp) {
+  const g0 = gate(gateItem);
+  return runForEachItem(APPLY, [{ json: resp }], { 'Approval Gate': [{ json: g0 }] }, asShipped)[0].json;
+}
+function emailOf(a) {
+  return a.payload.drafts ? a.payload.drafts[a.check_target] : a.payload.draft;
+}
+
+let a = apply(firstTouch(CLEAN), response(SENTENCES));
+let d = emailOf(a);
+t.check('every statement supported and the whole email covered: APPROVED by the workflow',
+  [d.status, d.approved_by, d.hold_reason, d.claim_check.result, a.check_result], ['approved', 'auto', null, 'pass', 'pass']);
+t.check('... the verdicts, model and usage are kept on the draft',
+  [d.claim_check.statements.length, d.claim_check.model, d.claim_check.usage.output_tokens], [8, 'claude-sonnet-5-5', 900]);
+t.check('... and its LinkedIn draft is still held', [a.payload.drafts[1].status, a.payload.drafts[1].approved_by], ['pending', null]);
+t.check('the apply node drops the request body from its output', a.check_request, null);
+
+const DRAFT99 = 'You can see every sponsor lead it captured, and any question it passed to your team, so you know exactly what came in.';
+const widened = SENTENCES.slice(0, 4).concat([
+  st(DRAFT99, 'claim', 'BEN-SEE', 'supported', 'You can see every sponsor lead it captured, and any question it passed to your team'),
+  st(DRAFT99, 'claim', 'BEN-SEE', 'widened', 'so you know exactly what came in'),
+]).concat(SENTENCES.slice(5));
+a = apply(firstTouch(CLEAN, ctx({ check: { subject: SUBJECT, text: BODY.replace(
+  'You can see every sponsor lead it captured, and any question it passed to your team.', DRAFT99) } })), response(widened));
+d = emailOf(a);
+t.check('one widened statement holds the draft, naming the statement and its claim',
+  [d.status, d.approved_by, d.hold_reason], ['pending', null, 'claim-check: widened "so you know exactly what came in" (BEN-SEE)']);
+t.check('... two statements quoting the same sentence count once for coverage', d.hold_reason.indexOf('never reviewed'), -1);
+
+function holdWith(statements, over, gateItem) {
+  return emailOf(apply(gateItem || firstTouch(CLEAN), response(statements, over))).hold_reason;
+}
+function swap(i, s) {
+  const out = SENTENCES.slice();
+  out[i] = s;
+  return out;
+}
+t.check('an unsupported claim holds it',
+  holdWith(swap(4, st(SENTENCES[4].sentence, 'claim', '', 'unsupported'))), 'claim-check: unsupported "You can see every sponsor lead it captured, and any question it passed to your team."');
+t.check('a joined prospect fact holds it',
+  holdWith(swap(1, st(SENTENCES[1].sentence, 'prospect', '1, 2', 'joined'))), 'claim-check: joined fact "You\'re running a recruiting trial, the Registry of X." (1, 2)');
+t.check('an unsupported prospect fact holds it',
+  holdWith(swap(0, st(SUBJECT, 'prospect', '', 'unsupported'))), 'claim-check: unsupported fact "' + SUBJECT + '"');
+t.check('a claim called "supported" that names no claim code is held',
+  holdWith(swap(4, st(SENTENCES[4].sentence, 'claim', '', 'supported'))), 'claim-check: no confirmed claim behind "You can see every sponsor lead it captured, and any question it passed to your team."');
+t.check('... or names a code that is not a confirmed claim',
+  holdWith(swap(4, st(SENTENCES[4].sentence, 'claim', 'BEN-CAPTURE', 'supported'))), 'claim-check: no confirmed claim behind "You can see every sponsor lead it captured, and any question it passed to your team." (BEN-CAPTURE)');
+t.check('near miss: a claim citing two confirmed codes, bracketed, is fine',
+  emailOf(apply(firstTouch(CLEAN), response(swap(3, st(SENTENCES[3].sentence, 'claim', '[D2], [BEN-SEE]', 'supported'))))).status, 'approved');
+t.check('a "none" statement with any other verdict is held (inconsistent answer)',
+  holdWith(swap(7, st('One word back is enough.', 'none', '', 'widened'))), 'claim-check: widened "One word back is enough."');
+
+t.check('a sentence the check skipped holds it: nobody judged it',
+  holdWith(SENTENCES.filter(function (_, i) { return i !== 5; })), 'claim-check-incomplete: 10 words never reviewed ("it s live at two cros in turkiye and mexico")');
+t.check('a quote that is not in the email holds it',
+  holdWith(SENTENCES.concat([st('It answers every sponsor instantly.', 'claim', 'D2', 'supported')])),
+  'claim-check-incomplete: quoted text that is not in the email ("It answers every sponsor instantly.")');
+const typographic = SENTENCES.map(function (s) {
+  return Object.assign({}, s, { sentence: s.sentence.replace(/'/g, '’').replace('Türkiye', 'Turkiye').toUpperCase() });
+});
+t.check('near miss: curly quotes, a dropped accent and case changes still cover the email',
+  emailOf(apply(firstTouch(CLEAN), response(typographic))).status, 'approved');
+t.check('near miss: the subject quoted WITH the prompt\'s "Subject:" label still covers the subject (measured, dry run 1)',
+  emailOf(apply(firstTouch(CLEAN), response(swap(0, st('Subject: ' + SUBJECT, 'prospect', '1', 'supported'))))).status, 'approved');
+t.check('... but "Subject:" is only dropped when the quote leads with it -- a made-up quote is still foreign',
+  holdWith(SENTENCES.concat([st('We built a Subject: line generator.', 'claim', 'D2', 'supported')])).indexOf('claim-check-incomplete: quoted text that is not in the email'), 0);
+t.check('the checker is told the bracketed product name is a name, not a claim (measured, dry run 1: "we call it Nova" judged unsupported)',
+  gate(firstTouch(CLEAN)).check_request.system.indexOf('"(we call it Nova)", only names what the sentence describes') !== -1, true);
+t.check('a first email in which the check found no product claim at all is held',
+  holdWith([st(SUBJECT + ' ' + BODY, 'none', '', 'none')]), 'claim-check-incomplete: no product claim found in a first email');
+
+t.check('an HTTP error holds it for a human',
+  holdWith([], { error: { message: 'overloaded', status: 529 } }), 'claim-check-failed: {"message":"overloaded","status":529}');
+t.check('a refusal holds it, with the category',
+  holdWith([], { stop_reason: 'refusal', stop_details: { type: 'refusal', category: 'cyber' }, content: [] }), 'claim-check-failed: stop_reason "refusal" (cyber)');
+t.check('a cut-off answer holds it', holdWith(SENTENCES, { stop_reason: 'max_tokens' }), 'claim-check-failed: stop_reason "max_tokens"');
+t.check('an answer that is not the schema holds it',
+  holdWith([], { content: [{ type: 'text', text: '{"statements": [{"sentence": "x", "kind": "maybe"}]}' }] }),
+  'claim-check-failed: the answer was not the check schema: {"statements": [{"sentence": "x", "kind": "maybe"}]}');
+t.check('... and a model summary verdict is never read: there is no such field to trust',
+  holdWith([], { content: [{ type: 'text', text: '{"pass": true}' }] }), 'claim-check-failed: the answer was not the check schema: {"pass": true}');
+
+const FU_SENTENCES = [
+  st('Following up on my note about after-hours sponsor inquiries.', 'none', '', 'none'),
+  st('One more thing the assistant does: it sends your capabilities deck the moment a sponsor asks for it.', 'claim', 'BEN-DECK', 'supported'),
+  st('Would a 48-hour demo built on your own material be worth a look?', 'claim', 'A1', 'supported'),
+  st('One word back is enough.', 'none', '', 'none'),
+];
+a = apply(followUp('follow-up-1/BEN-DECK.A1'), response(FU_SENTENCES));
+t.check('a clean follow-up is approved by the workflow (payload.draft shape)',
+  [a.payload.draft.status, a.payload.draft.approved_by, a.payload.draft.claim_check.result], ['approved', 'auto', 'pass']);
+a = apply(followUp('follow-up-1/BEN-DECK.A1'), response([FU_SENTENCES[0], FU_SENTENCES[1], FU_SENTENCES[3]]));
+t.check('a follow-up whose ask was never reviewed is held',
+  [a.payload.draft.status, a.payload.draft.hold_reason], ['pending', 'claim-check-incomplete: 14 words never reviewed ("would a 48 hour demo built on your own material be worth a …")']);
+a = apply(followUp('follow-up-1/BEN-DECK.A1'), response([FU_SENTENCES[0], FU_SENTENCES[3]].concat([
+  st(FU_SENTENCES[1].sentence, 'none', '', 'none'), st(FU_SENTENCES[2].sentence, 'none', '', 'none')])));
+t.check('near miss: a follow-up with no claim statement is not held for that (only a first email must have one)',
+  a.payload.draft.status, 'approved');
+
+t.done();

@@ -30,6 +30,10 @@ COMPOSE = os.path.join(REPO, "docker-compose.yml")
 # gets its own copy of both.
 SKILL = os.path.join(REPO, "NovaScout_DraftingSkill.md")
 RULES = os.path.join(REPO, "n8n", "drafting", "code_assemble.js")
+# Auto-approval (migration 014): Follow-Ups embeds drafting's Approval Gate and
+# Apply Claim Check verbatim, so each case gets its own copy of those too.
+APPROVAL = os.path.join(REPO, "n8n", "drafting", "code_approval.js")
+APPROVAL_APPLY = os.path.join(REPO, "n8n", "drafting", "code_approval_apply.js")
 
 PASSED = []
 FAILED = []
@@ -73,10 +77,15 @@ def run_build(tmp, env_overrides=None):
     return p.returncode, p.stderr.decode("utf-8", "replace")
 
 
-def setup(mutate_doc=None, mutate_compose=None, mutate_file=None, mutate_skill=None, mutate_rules=None):
+def setup(mutate_doc=None, mutate_compose=None, mutate_file=None, mutate_skill=None, mutate_rules=None,
+          mutate_approval=None):
     tmp = tempfile.mkdtemp(prefix="novascout-sendtrack-drift-")
     for src, dst, fn, label in ((SKILL, "DraftingSkill.md", mutate_skill, "the skill"),
-                                (RULES, os.path.join("drafting", "code_assemble.js"), mutate_rules, "code_assemble.js")):
+                                (RULES, os.path.join("drafting", "code_assemble.js"), mutate_rules, "code_assemble.js"),
+                                (APPROVAL, os.path.join("drafting", "code_approval.js"), mutate_approval,
+                                 "code_approval.js"),
+                                (APPROVAL_APPLY, os.path.join("drafting", "code_approval_apply.js"), None,
+                                 "code_approval_apply.js")):
         text = read(src)
         if fn:
             new = fn(text)
@@ -109,8 +118,8 @@ def setup(mutate_doc=None, mutate_compose=None, mutate_file=None, mutate_skill=N
 
 
 def case(label, expect_in, mutate_doc=None, mutate_compose=None, mutate_file=None, env_overrides=None,
-         mutate_skill=None, mutate_rules=None):
-    tmp = setup(mutate_doc, mutate_compose, mutate_file, mutate_skill, mutate_rules)
+         mutate_skill=None, mutate_rules=None, mutate_approval=None):
+    tmp = setup(mutate_doc, mutate_compose, mutate_file, mutate_skill, mutate_rules, mutate_approval)
     try:
         rc, err = run_build(tmp, env_overrides)
         if rc == 0:
@@ -123,8 +132,8 @@ def case(label, expect_in, mutate_doc=None, mutate_compose=None, mutate_file=Non
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def positive(label, check, mutate_doc=None, env_overrides=None, files=None, mutate_skill=None):
-    tmp = setup(mutate_doc, mutate_skill=mutate_skill)
+def positive(label, check, mutate_doc=None, env_overrides=None, files=None, mutate_skill=None, mutate_approval=None):
+    tmp = setup(mutate_doc, mutate_skill=mutate_skill, mutate_approval=mutate_approval)
     try:
         for name, content in (files or {}).items():
             write(os.path.join(tmp, name), content)
@@ -268,11 +277,54 @@ def _fu_code(tmp, name):
 
 
 positive(
-    "Section 3's drafting model flows straight into the follow-up request",
+    "Section 3's drafting model flows straight into the follow-up request (and the claim check, once it agrees)",
     lambda tmp: None if '"model": "claude-test-9"' in _fu_code(tmp, "Build Follow-Up")
-    else "the follow-up request does not name the doc's model",
+    and "const CHECK_MODEL = 'claude-test-9';" in _fu_code(tmp, "Apply Claim Check")
+    else "the follow-up request or the claim check does not name the doc's model",
     mutate_doc=lambda d: d.replace("**Drafting model: `claude-sonnet-5-5`**", "**Drafting model: `claude-test-9`**", 1),
+    mutate_approval=lambda s: s.replace("const CHECK_MODEL = 'claude-sonnet-5-5';", "const CHECK_MODEL = 'claude-test-9';", 1),
 )
+
+# --- auto-approval (migration 014): the shared gate in Follow-Ups -------------
+case("Section 3 changes model but the claim check does not -> refuses", "the claim check is not Section 3's",
+     mutate_doc=lambda d: d.replace("**Drafting model: `claude-sonnet-5-5`**", "**Drafting model: `claude-test-9`**", 1))
+case("the claim check is moved to a cheaper model -> refuses", "the claim check is not Section 3's",
+     mutate_approval=lambda s: s.replace("const CHECK_MODEL = 'claude-sonnet-5-5';", "const CHECK_MODEL = 'claude-haiku-4-5';", 1))
+case("node-body code moves above code_approval.js's 'Node body' marker -> refuses", "node-body code has moved",
+     mutate_approval=lambda s: s.replace("const KINDS = ['claim', 'prospect', 'none'];",
+                                         "const KINDS = ['claim', 'prospect', 'none'];\nconst early = $input.item.json;", 1))
+case("a composed follow-up reaches Write Follow-Up without the Approval Gate -> refuses",
+     "something reaches Write Follow-Up without the Approval Gate",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         '"Drop Failed Generations": edge("Approval Gate"),', '"Drop Failed Generations": edge("Write Follow-Up"),', 1)))
+case("Write Follow-Up reads a draft field nothing upstream produces -> refuses", "never emits ['reviewed_by']",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "nullif(p.p->'draft'->>'hold_reason', ''),", "nullif(p.p->'draft'->>'hold_reason', ''), p.p->'draft'->>'reviewed_by',", 1)))
+case("the shared gate reads an approval field Assemble Follow-Up never builds -> refuses",
+     "Assemble Follow-Up's `approval` has no",
+     mutate_approval=lambda s: s.replace("if (ctx.auto_approve !== true)", "if (ctx.auto_approve !== true || ctx.reviewer)", 1))
+positive(
+    "Follow-Ups ships drafting's Approval Gate verbatim, and Apply Claim Check as its rules + the apply body",
+    lambda tmp: None if _fu_code(tmp, "Approval Gate") == read(APPROVAL)
+    and _fu_code(tmp, "Apply Claim Check") == read(APPROVAL)[:read(APPROVAL).index("// Node body")] + "\n" + read(APPROVAL_APPLY)
+    else "the follow-up approval nodes are not drafting's code, verbatim",
+)
+
+# --- the Daily Digest --------------------------------------------------------
+case("Build Digest reads a field Load Digest does not return -> refuses", "Load Digest does not produce",
+     mutate_file=("code_digest.js", lambda s: s.replace("row.already_sent === true", "row.already_sent_today === true", 1)))
+case("Record Digest writes a digest_log column Section 8 does not define -> refuses", "Section 8 does not define",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "INSERT INTO digest_log (digest_day, covers_from, covers_to, summary)",
+         "INSERT INTO digest_log (digest_day, covers_from, covers_to, summary, message_id)", 1)))
+case("the digest's clock override is left set in the shipped workflow -> refuses", "Daily Digest workflow has a clock override",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         'DIGEST_CONFIG = {"now_override": "", "digest_hour": 8}',
+         'DIGEST_CONFIG = {"now_override": "2026-10-05T03:00:00Z", "digest_hour": 8}', 1)))
+case("the digest goes back to a once-a-day schedule tick of 2 days -> refuses", "recurrenceCheck",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         '{"parameters": {"rule": {"interval": [{"field": "minutes", "minutesInterval": 30}]}},\n     "name": DIGEST_TRIGGER',
+         '{"parameters": {"rule": {"interval": [{"field": "days", "daysInterval": 2}]}},\n     "name": DIGEST_TRIGGER', 1)))
 positive(
     "the skill's follow-up numbers reach the prompt the model sees",
     lambda tmp: None if "40-70 words" in _fu_code(tmp, "Build Follow-Up") and "at most 40 words" in _fu_code(tmp, "Build Follow-Up")

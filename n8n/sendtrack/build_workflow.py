@@ -952,6 +952,11 @@ FOLLOWUP_DUE_SQL = """-- Find Due Follow-Ups -- Section 9: "if no reply after N 
 -- (read per run, like Workflow 4's batch query, so an operator's edit reaches
 -- the next follow-up with no rebuild), and the last follow-up that went out
 -- (follow-up #2 must not repeat it).
+--
+-- Auto-approval (migration 014) adds the flag and the enrichment record: the
+-- claim check compares each prospect fact in a follow-up with it. The record
+-- never reaches the composing model -- Build Follow-Up hands that model only
+-- the first email, as before -- it goes to the checker alone.
 WITH clk AS (
   SELECT coalesce(nullif($1, '')::timestamptz, now()) AS now
 ),
@@ -977,9 +982,13 @@ last_follow_up AS (
 last_send AS (
   SELECT lead_id, max(sent_at) AS sent_at FROM sends GROUP BY lead_id
 ),
+-- created counts follow-up NUMBERS, not rows: a #1 the operator rejected and
+-- had regenerated (2026-10-03, leads 7, 91, 104) is still one slot, the way
+-- Write Follow-Up's dedupe already reads it. Counted as rows, the second #1
+-- took #2's slot and the lead was marked lost instead of followed up again.
 fu AS (
   SELECT d.lead_id,
-         count(*)::int                                                  AS created,
+         count(DISTINCT regexp_replace(d.variant, '[/+].*$', ''))::int  AS created,
          count(*) FILTER (WHERE d.status IN ('pending', 'approved'))::int AS open,
          max(d.created_at)                                              AS last_created
     FROM drafts d
@@ -1002,10 +1011,18 @@ SELECT l.id                                                             AS lead_
                   'confirmed', k.confirmed, 'capabilities', to_jsonb(k.capabilities))
                   ORDER BY k.code), '[]'::jsonb)
           FROM claims_library k
-         WHERE k.active)                                                AS library
+         WHERE k.active)                                                AS library,
+       auto_approve_email_enabled()                                     AS auto_approve_email,
+       l.company_name                                                   AS company_name,
+       e.therapeutic_areas                                              AS therapeutic_areas,
+       e.phases                                                         AS phases,
+       e.raw_extraction->>'city'                                        AS city,
+       e.founder_name                                                   AS founder_name,
+       e.employee_estimate                                              AS employee_estimate
   FROM leads l
   JOIN first_touch ft ON ft.lead_id = l.id
   JOIN last_send ls   ON ls.lead_id = l.id
+  LEFT JOIN enrichments e ON e.lead_id = l.id
   LEFT JOIN last_follow_up lf ON lf.lead_id = l.id
   LEFT JOIN fu        ON fu.lead_id = l.id
   CROSS JOIN clk
@@ -1025,19 +1042,30 @@ SELECT l.id                                                             AS lead_
     "__LEAD_BLOCKED__", BLOCKED_DOMAIN.format(d="lower(l.domain)")
 )
 
-FOLLOWUP_WRITE_SQL = """-- Write Follow-Up: insert the follow-up draft as 'pending' (the reviewer's
--- queue), or mark the lead lost. Both guarded so a repeated run is a no-op: a
--- lead gets each follow-up NUMBER at most once, and only a lead still at
--- 'sent' moves. A composed follow-up's variant carries its claim codes and tags
--- ('follow-up-1/BEN-DECK.A1+unconfirmed-claim'), and a template one from before
--- 2026-10-02 is the bare 'follow-up-1', so the number is compared, not the variant.
+FOLLOWUP_WRITE_SQL = """-- Write Follow-Up: insert the follow-up draft, or mark the lead lost. Both
+-- guarded so a repeated run is a no-op: a lead gets each follow-up NUMBER at
+-- most once, and only a lead still at 'sent' moves. A composed follow-up's
+-- variant carries its claim codes and tags ('follow-up-1/BEN-DECK.A1+...'), and
+-- a template one from before 2026-10-02 is the bare 'follow-up-1', so the
+-- number is compared, not the variant.
+--
+-- The draft is 'pending' -- the reviewer's queue, with hold_reason -- unless the
+-- Approval Gate and the claim check approved it (migration 014): only a payload
+-- marked approved_by 'auto' comes out approved, and the table's trigger
+-- re-checks that against the live flag and library.
 WITH p AS (
   SELECT $1::jsonb AS p
 ),
 ins AS (
-  INSERT INTO drafts (lead_id, channel, variant, subject, body, status)
+  INSERT INTO drafts (lead_id, channel, variant, subject, body, status, approved_by, hold_reason, claim_check)
   SELECT (p.p->>'lead_id')::bigint, 'email', p.p->'draft'->>'variant', p.p->'draft'->>'subject',
-         p.p->'draft'->>'body', 'pending'
+         p.p->'draft'->>'body',
+         CASE WHEN p.p->'draft'->>'status' = 'approved' AND p.p->'draft'->>'approved_by' = 'auto'
+              THEN 'approved' ELSE 'pending' END,
+         CASE WHEN p.p->'draft'->>'status' = 'approved' AND p.p->'draft'->>'approved_by' = 'auto'
+              THEN 'auto' END,
+         nullif(p.p->'draft'->>'hold_reason', ''),
+         nullif(p.p->'draft'->'claim_check', 'null'::jsonb)
     FROM p
    WHERE p.p->>'action' = 'draft-follow-up'
      AND p.p->'draft'->>'channel' = 'email'
@@ -1046,7 +1074,7 @@ ins AS (
                         AND regexp_replace(coalesce(d.variant, ''), '[/+].*$', '')
                             = regexp_replace(p.p->'draft'->>'variant', '[/+].*$', ''))
      AND EXISTS (SELECT 1 FROM leads l WHERE l.id = (p.p->>'lead_id')::bigint AND l.status = 'sent')
-  RETURNING id, variant
+  RETURNING id, variant, status, approved_by, hold_reason
 ),
 lost AS (
   UPDATE leads l
@@ -1061,6 +1089,9 @@ SELECT (p.p->>'lead_id')::bigint   AS lead_id,
        p.p->>'action'              AS action,
        (SELECT id FROM ins)        AS draft_id,
        (SELECT variant FROM ins)   AS variant,
+       (SELECT status FROM ins)    AS status,
+       (SELECT approved_by FROM ins) AS approved_by,
+       (SELECT hold_reason FROM ins) AS hold_reason,
        (SELECT count(*) FROM lost)::int AS marked_lost
   FROM p;"""
 
@@ -1194,6 +1225,86 @@ SELECT up.healthy                AS healthy,
        p.s->>'alert_kind'        AS alert_kind,
        v.alert_sent              AS alert_sent
   FROM up, p, v;""")
+
+
+DIGEST_LOAD_SQL = with_iso("""-- Load Digest: everything the operator's daily digest says, in one snapshot
+-- (migration 014). Read-only.
+--
+-- $1 now_override ('' in the shipped workflow)
+--
+-- The window starts where the last digest that went out stopped (digest_log),
+-- so a day the host was off is folded into the next digest instead of lost;
+-- the first digest ever covers the last 24 hours. The day and hour are the
+-- operator's (__ZONE__, docker-compose's GENERIC_TIMEZONE).
+--   auto_approved  every draft the workflows approved themselves in the window,
+--                  with what became of it since
+--   sent           every email SMTP accepted in the window, with who approved it
+--   held           EVERY pending draft -- the exceptions queue -- with its
+--                  hold_reason; `new` marks the ones drafted in the window
+WITH clk AS (
+  SELECT coalesce(nullif($1, '')::timestamptz, now()) AS now
+),
+win AS (
+  SELECT clk.now AS to_ts,
+         coalesce((SELECT max(g.covers_to) FROM digest_log g), clk.now - interval '24 hours') AS from_ts,
+         (clk.now AT TIME ZONE '__ZONE__')::date AS day,
+         extract(hour FROM clk.now AT TIME ZONE '__ZONE__')::int AS hour
+    FROM clk
+)
+SELECT win.day::text                                                     AS digest_day,
+       win.hour                                                          AS local_hour,
+       ISO(win.from_ts)                                                  AS covers_from,
+       ISO(win.to_ts)                                                    AS covers_to,
+       EXISTS (SELECT 1 FROM digest_log g WHERE g.digest_day = win.day)  AS already_sent,
+       (SELECT value FROM settings WHERE key = 'operator_email')         AS operator_email,
+       auto_approve_email_enabled()                                      AS auto_approve_email,
+       (SELECT coalesce(json_agg(x ORDER BY x.approved_at, x.draft_id), '[]'::json) FROM (
+          SELECT d.id AS draft_id, d.lead_id, l.company_name, l.domain, l.country, d.channel, d.variant, d.status,
+                 ISO(d.approved_at) AS approved_at
+            FROM drafts d JOIN leads l ON l.id = d.lead_id
+           WHERE d.approved_by = 'auto' AND d.approved_at >= win.from_ts AND d.approved_at < win.to_ts) x)
+                                                                         AS auto_approved,
+       (SELECT coalesce(json_agg(x ORDER BY x.sent_at, x.draft_id), '[]'::json) FROM (
+          SELECT o.draft_id, o.lead_id, l.company_name, l.domain, c.email AS to_addr, d.variant, d.approved_by,
+                 ISO(o.sent_at) AS sent_at
+            FROM outreach_log o
+            JOIN leads l ON l.id = o.lead_id
+            LEFT JOIN drafts d ON d.id = o.draft_id
+            LEFT JOIN contacts c ON c.lead_id = o.lead_id
+           WHERE o.channel = 'email' AND o.message_id IS NOT NULL
+             AND o.sent_at >= win.from_ts AND o.sent_at < win.to_ts) x)
+                                                                         AS sent,
+       (SELECT coalesce(json_agg(x ORDER BY x.created_at, x.draft_id), '[]'::json) FROM (
+          SELECT d.id AS draft_id, d.lead_id, l.company_name, l.domain, d.channel, d.variant, d.hold_reason,
+                 ISO(d.created_at) AS created_at, d.created_at >= win.from_ts AS new
+            FROM drafts d JOIN leads l ON l.id = d.lead_id
+           WHERE d.status = 'pending') x)
+                                                                         AS held
+  FROM win;""".replace("__ZONE__", SENDER_ZONE))
+
+DIGEST_RECORD_SQL = """-- Record Digest: the digest is recorded only once SMTP accepted it, so one that
+-- failed goes out on the next tick. One row per operator day; a repeat is a no-op.
+--
+-- $1 Build Digest's `record`; $2 Send Digest's output (nodemailer's info, or
+--    {error} -- the node continues on error)
+WITH p AS (
+  SELECT $1::jsonb AS d, $2::jsonb AS r
+),
+ins AS (
+  INSERT INTO digest_log (digest_day, covers_from, covers_to, summary)
+  SELECT (p.d->>'digest_day')::date, (p.d->>'covers_from')::timestamptz, (p.d->>'covers_to')::timestamptz,
+         p.d->'summary'
+    FROM p
+   WHERE p.r->>'error' IS NULL
+     AND jsonb_typeof(p.r->'accepted') = 'array'
+     AND jsonb_array_length(p.r->'accepted') > 0
+  ON CONFLICT (digest_day) DO NOTHING
+  RETURNING digest_day
+)
+SELECT p.d->>'digest_day'             AS digest_day,
+       (SELECT count(*) FROM ins)::int AS recorded,
+       p.r->>'error'                  AS error
+  FROM p;"""
 
 
 # ---------------------------------------------------------------------------
@@ -1343,9 +1454,26 @@ _assert_js_emits("Claude Follow-Up ($json.request) / Needs Model? ($json.needs_m
 _assert_js_emits("Assemble Follow-Up (src.*)", _reads(_fu_assemble, "src"), _followup, "code_followup.js")
 _assert_js_emits("Drop Failed Generations ($json.write)", FOLLOWUP_FILTER_READS, _fu_assemble,
                  "code_followup_assemble.js")
-_fu_write_reads = _sql_payload_reads(FOLLOWUP_WRITE_SQL) | set(re.findall(r"p\.p->'draft'->>'(\w+)'", FOLLOWUP_WRITE_SQL))
-_assert_js_emits("Write Follow-Up (a composed follow-up)", _fu_write_reads | {"payload", "draft"}, _fu_assemble,
+_fu_write_reads = _sql_payload_reads(FOLLOWUP_WRITE_SQL) | set(re.findall(r"p\.p->'draft'->>?'(\w+)'", FOLLOWUP_WRITE_SQL))
+# Auto-approval (migration 014): Assemble Follow-Up -> Approval Gate ->
+# [Needs Claim Check?] -> Claude Claim Check -> Apply Claim Check -> Write. The
+# decision fields are set on the draft by the gate and the apply node (shared
+# with Workflow 4, n8n/drafting/code_approval*.js); everything else is
+# Assemble Follow-Up's.
+FOLLOWUP_DECISION_FIELDS = {"status", "approved_by", "hold_reason", "claim_check"}
+_approval_all = _read(os.path.join(DRAFTING_DIR, "code_approval.js")) + _read(
+    os.path.join(DRAFTING_DIR, "code_approval_apply.js"))
+for _f in sorted(_fu_write_reads & FOLLOWUP_DECISION_FIELDS):
+    assert re.search(r"\b(?:d|target)\.%s = " % _f, _approval_all), (
+        "Write Follow-Up reads draft.%s, which neither Approval Gate nor Apply Claim Check sets" % _f)
+_assert_js_emits("Write Follow-Up (a composed follow-up)", (_fu_write_reads - FOLLOWUP_DECISION_FIELDS) |
+                 {"payload", "draft"}, _fu_assemble, "code_followup_assemble.js")
+_assert_js_emits("Approval Gate (item.approval / item.payload)", {"approval", "payload"}, _fu_assemble,
                  "code_followup_assemble.js")
+for _f in sorted(set(re.findall(r"\bctx\.(\w+)", _approval_all))):
+    assert re.search(r"^\s*%s:" % re.escape(_f), _fu_assemble, re.M), (
+        "the shared Approval Gate reads approval.%s, but Assemble Follow-Up's `approval` has no %s -- it would be "
+        "undefined at runtime, with no error" % (_f, _f))
 _assert_js_emits("Write Follow-Up (mark-lost)", _sql_payload_reads(FOLLOWUP_WRITE_SQL) | {"payload", "draft"},
                  _followup, "code_followup.js")
 
@@ -1365,6 +1493,21 @@ _assert_wired("Load Health State (x->>'...')", set(re.findall(r"x->>'(\w+)'", HE
 _assert_js_emits("Record Health", _sql_payload_reads(HEALTH_RECORD_SQL, prefix="p.s"), _health, "code_health.js")
 HEALTH_EMAIL_READS = {"notify", "notify_to", "subject", "text"}
 _assert_js_emits("Alert? / Send Alert", HEALTH_EMAIL_READS, _health, "code_health.js")
+
+# Daily Digest: Load Digest -> Build Digest -> [Send Digest?] -> Send Digest ->
+# Record Digest.
+_digest = js("code_digest.js")
+_assert_wired("Build Digest (row.*)", _reads(_digest, "row"), final_select_aliases(DIGEST_LOAD_SQL), "Load Digest")
+_assert_wired("Build Digest (cfg.*)", _reads(_digest, "cfg"), {"digest_hour", "now_override"}, "Config")
+DIGEST_EMAIL_READS = {"send", "notify_to", "subject", "text", "record"}
+_assert_js_emits("Send Digest? / Send Digest / Record Digest", DIGEST_EMAIL_READS, _digest, "code_digest.js")
+_assert_js_emits("Record Digest ($1)", set(re.findall(r"p\.d->>?'(\w+)'", DIGEST_RECORD_SQL)), _digest,
+                 "code_digest.js's record")
+assert "AT TIME ZONE '%s'" % SENDER_ZONE in DIGEST_LOAD_SQL, (
+    "the digest's day is not the operator's (%s) -- it would go out at the wrong hour" % SENDER_ZONE)
+_insert_cols = [c.strip() for c in re.search(r"INSERT INTO digest_log \(([^)]+)\)", DIGEST_RECORD_SQL).group(1).split(",")]
+_unknown = [c for c in _insert_cols if c not in load_columns(DOC, "digest_log", must="digest_day")]
+assert not _unknown, "Record Digest writes digest_log.%r, which Section 8 does not define." % _unknown
 
 _found = re.findall(r"^\s*'([a-z-]+)':", _js_block(_health, "PROBLEMS", "code_health.js"), re.M)
 assert _found == HEALTH_PROBLEMS, (
@@ -1505,6 +1648,24 @@ FOLLOWUP_ASSEMBLE_JS = (
     + RULES_JS + "\n" + bake("code_followup_assemble.js", SIGNATURE=SIGNATURE, SENDER_NAME=SENDER_NAME)
 )
 HEALTH_JS = bake("code_health.js")
+DIGEST_JS = bake("code_digest.js", SENDER_ZONE=SENDER_ZONE, SENDER_OFFSET=SENDER_OFFSET)
+
+# Auto-approval (migration 014): Workflow 4's Approval Gate and Apply Claim
+# Check, verbatim -- drafting's code_approval.js, and its rules section followed
+# by code_approval_apply.js -- so a follow-up is judged by the same functions as
+# a first touch.
+APPROVAL_JS = _read(os.path.join(DRAFTING_DIR, "code_approval.js"))
+_approval_at = APPROVAL_JS.find("// Node body")
+assert _approval_at != -1, "drafting's code_approval.js has no '// Node body' marker"
+APPROVAL_RULES = APPROVAL_JS[:_approval_at]
+assert "$(" not in APPROVAL_RULES and "$input" not in APPROVAL_RULES, (
+    "the rules section of drafting's code_approval.js reads n8n data -- node-body code has moved above its "
+    "'Node body' marker")
+APPLY_JS = APPROVAL_RULES + "\n" + _read(os.path.join(DRAFTING_DIR, "code_approval_apply.js"))
+_check_model = re.search(r"^const CHECK_MODEL = '([a-z0-9-]+)';", APPROVAL_RULES, re.M)
+_check_effort = re.search(r"^const CHECK_EFFORT = '([a-z]+)';", APPROVAL_RULES, re.M)
+assert _check_model and _check_model.group(1) == DRAFT_MODEL and _check_effort and _check_effort.group(1) == DRAFT_EFFORT, (
+    "the claim check is not Section 3's drafting model and effort (%s, %s)" % (DRAFT_MODEL, DRAFT_EFFORT))
 
 
 # ---------------------------------------------------------------------------
@@ -1813,8 +1974,41 @@ followup_nodes = [
         "name": "Drop Failed Generations", "type": "n8n-nodes-base.filter", "typeVersion": 2.2, "position": [660, 30],
         "notes": "A failed Claude call writes nothing; the lead is due again on the next run.",
     },
-    pg_node("Write Follow-Up", FOLLOWUP_WRITE_SQL, "={{ [JSON.stringify($json.payload)] }}", [880, 130],
-            "Into drafts as 'pending' -- the review queue. Nothing follows up without a human."),
+    code_node("Approval Gate", APPROVAL_JS, "runOnceForEachItem", [880, 30],
+              "Auto-approval, rules 1-4 (migration 014): the follow-up goes on to the claim check only if "
+              "settings.auto_approve_email is on, it carries no rule tag, and every claim code it records is "
+              "confirmed. Anything else is held -- written 'pending' with hold_reason -- and no check is paid for. "
+              "Same code as Workflow 4's node of the same name (n8n/drafting/code_approval.js)."),
+    if_node("Needs Claim Check?", "needscheck", "={{ $json.needs_check }}", [1100, 30],
+            "true: a follow-up that passed rules 1-4. false: held; straight to the write."),
+    {
+        "parameters": {
+            "method": "POST",
+            "url": "https://api.anthropic.com/v1/messages",
+            "authentication": "predefinedCredentialType",
+            "nodeCredentialType": "anthropicApi",
+            "sendHeaders": True,
+            "headerParameters": {"parameters": [{"name": "anthropic-version", "value": "2023-06-01"}]},
+            "sendBody": True,
+            "specifyBody": "json",
+            "jsonBody": "={{ JSON.stringify($json.check_request) }}",
+            "options": {"timeout": 300000},
+        },
+        "name": "Claude Claim Check", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [1320, -60],
+        "credentials": ANTHROPIC_CRED, "onError": "continueRegularOutput", "retryOnFail": True, "maxTries": 2,
+        "waitBetweenTries": 5000,
+        "notes": ("Auto-approval, rule 5: a second %s call (effort %s, Section 3) that compares each claim in the "
+                  "follow-up with the confirmed claims and each prospect fact with the enrichment record. A widened "
+                  "claim fails. Errors continue as items and hold the follow-up for a human; no fallback model."
+                  % (DRAFT_MODEL, DRAFT_EFFORT)),
+    },
+    code_node("Apply Claim Check", APPLY_JS, "runOnceForEachItem", [1540, -60],
+              "Approved by the workflow only if every statement the check found is supported and its quotes cover "
+              "the whole note. Anything else is held with the reason; the verdicts go into drafts.claim_check."),
+    pg_node("Write Follow-Up", FOLLOWUP_WRITE_SQL, "={{ [JSON.stringify($json.payload)] }}", [1760, 130],
+            "Into drafts as 'pending' with hold_reason -- the exceptions queue -- or approved by this workflow "
+            "when the gate and the claim check passed it (migration 014; the table re-checks). Or the lead "
+            "marked lost."),
 ]
 
 followup_connections = {
@@ -1826,8 +2020,20 @@ followup_connections = {
     "Needs Model?": branch("Claude Follow-Up", "Write Follow-Up"),
     "Claude Follow-Up": edge("Assemble Follow-Up"),
     "Assemble Follow-Up": edge("Drop Failed Generations"),
-    "Drop Failed Generations": edge("Write Follow-Up"),
+    "Drop Failed Generations": edge("Approval Gate"),
+    "Approval Gate": edge("Needs Claim Check?"),
+    "Needs Claim Check?": branch("Claude Claim Check", "Write Follow-Up"),
+    "Claude Claim Check": edge("Apply Claim Check"),
+    "Apply Claim Check": edge("Write Follow-Up"),
 }
+
+# A composed follow-up reaches the write only through the gate; the only other
+# way in is a mark-lost row, which carries no draft.
+_into_write = sorted(src for src, outs in followup_connections.items()
+                     for br in outs["main"] for e in br if e["node"] == "Write Follow-Up")
+assert _into_write == ["Apply Claim Check", "Needs Claim Check?", "Needs Model?"], (
+    "something reaches Write Follow-Up without the Approval Gate: %r" % _into_write)
+assert followup_connections["Needs Model?"]["main"][1] == [{"node": "Write Follow-Up", "type": "main", "index": 0}]
 
 # ---------------------------------------------------------------------------
 # Workflow: IMAP Health
@@ -1899,6 +2105,59 @@ health_connections = {
     "Send Alert": edge("Record Health"),
 }
 
+# ---------------------------------------------------------------------------
+# Workflow: Daily Digest (migration 014)
+# ---------------------------------------------------------------------------
+
+# The first tick at or after this hour on the operator's clock: before any
+# recipient's business hours open (India, the earliest, opens 08:30 PKT), so
+# the operator can reject an overnight auto-approval before it goes out.
+DIGEST_CONFIG = {"now_override": "", "digest_hour": 8}
+DIGEST_TRIGGER = "Every 30 Minutes"
+
+digest_nodes = [
+    {"parameters": {"rule": {"interval": [{"field": "minutes", "minutesInterval": 30}]}},
+     "name": DIGEST_TRIGGER, "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2, "position": [-1100, 40],
+     "notes": ("Every 30 minutes, sending at most once per operator day, at the first tick at or after digest_hour. "
+               "Not one daily tick: the host is often asleep, and n8n's day/hour schedules gate on the clock value of "
+               "the last run (Follow-Ups, 2026-10-02). A digest that could not go out today goes at the next tick.")},
+    {"parameters": {}, "name": "Manual Trigger", "type": "n8n-nodes-base.manualTrigger", "typeVersion": 1,
+     "position": [-1100, 220]},
+    {
+        "parameters": {"assignments": {"assignments": [
+            {"id": "nowoverride", "name": "now_override", "value": DIGEST_CONFIG["now_override"], "type": "string"},
+            {"id": "hour", "name": "digest_hour", "value": DIGEST_CONFIG["digest_hour"], "type": "number"},
+        ]}, "options": {}},
+        "name": "Config", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [-880, 130],
+        "notes": ("digest_hour: the operator's hour (%s) from which today's digest is due. now_override must stay "
+                  "empty (dry-run only)." % SENDER_ZONE),
+    },
+    pg_node("Load Digest", DIGEST_LOAD_SQL, "={{ [$json.now_override] }}", [-660, 130],
+            "One snapshot: drafts auto-approved and emails sent since the last digest, and every pending draft "
+            "with its hold_reason -- the exceptions queue. Plus the operator's address and the flag."),
+    code_node("Build Digest", DIGEST_JS, "runOnceForAllItems", [-440, 130],
+              "Due once per operator day from digest_hour, if the settings table holds an operator address. The "
+              "plain-text digest: AUTO-APPROVED, SENT, HELD FOR A PERSON (with reasons)."),
+    if_node("Send Digest?", "send", "={{ $json.send }}", [-220, 130],
+            "False ends the tick; Build Digest's `reason` says why (already sent today, before the hour, no address)."),
+    email_node("Send Digest", "={{ $json.notify_to }}", "={{ $json.subject }}", "={{ $json.text }}", [0, 40],
+               "To the operator's own inbox, never the outreach mailbox. Sent only to that address, so it counts "
+               "toward no warm-up ceiling (Section 9)."),
+    pg_node("Record Digest", DIGEST_RECORD_SQL,
+            "={{ [JSON.stringify($('Build Digest').first().json.record), JSON.stringify($json)] }}", [220, 40],
+            "Recorded only if SMTP accepted the digest; a failed one is sent again on the next tick."),
+]
+
+digest_connections = {
+    DIGEST_TRIGGER: edge("Config"),
+    "Manual Trigger": edge("Config"),
+    "Config": edge("Load Digest"),
+    "Load Digest": edge("Build Digest"),
+    "Build Digest": edge("Send Digest?"),
+    "Send Digest?": branch("Send Digest"),
+    "Send Digest": edge("Record Digest"),
+}
+
 # The Load Health State payload is built in an expression: every field its SQL
 # reads must be put there.
 for _f in _sql_payload_reads(HEALTH_LOAD_SQL):
@@ -1932,7 +2191,7 @@ def _config_values(nodes):
     return {a["name"]: a["value"] for a in cfg["parameters"]["assignments"]["assignments"]}
 
 
-for _nodes in (send_nodes, mailwatch_nodes, followup_nodes, health_nodes):
+for _nodes in (send_nodes, mailwatch_nodes, followup_nodes, health_nodes, digest_nodes):
     for _n in _nodes:
         if _n["type"] == "n8n-nodes-base.emailSend":
             p = _n["parameters"]
@@ -1970,6 +2229,9 @@ assert _cfg["min_gap_min"] > 0 and 0 < _cfg["send_probability"] < 1, (
 _cfg = _config_values(followup_nodes)
 assert _cfg["now_override"] == "", "the shipped Follow-Ups workflow has a clock override set"
 assert (_cfg["follow_up_days"], _cfg["max_follow_ups"]) == (FOLLOW_UP_DAYS, MAX_FOLLOW_UPS)
+_cfg = _config_values(digest_nodes)
+assert _cfg["now_override"] == "", "the shipped Daily Digest workflow has a clock override set"
+assert 0 <= _cfg["digest_hour"] <= 23, "digest_hour is an hour of the operator's day"
 _cfg = _config_values(health_nodes)
 assert set(_cfg) == HEALTH_CONFIG_FIELDS and _cfg["checker_url"] == HEALTH_CONFIG["checker_url"], (
     "the shipped IMAP Health Config is not what the build asserts against: %r" % _cfg)
@@ -1988,6 +2250,7 @@ SHIPPED = [
     ("mailbox-watch.json", workflow("mailwatch0001", "Send & Track - Mailbox Watch", mailwatch_nodes, mailwatch_connections)),
     ("follow-ups.json", workflow("followup0001", "Send & Track - Follow-Ups", followup_nodes, followup_connections)),
     ("imap-health.json", workflow("imaphealth0001", "Send & Track - IMAP Health", health_nodes, health_connections)),
+    ("daily-digest.json", workflow("digest0001", "Send & Track - Daily Digest", digest_nodes, digest_connections)),
 ]
 
 # No literal email address in a committed workflow except the sender's own From.
@@ -2176,6 +2439,15 @@ if VARIANTS_OUT:
                    ("Send Alert", "credentials"), ("Record Health", "credentials")])
     assert sorted(got) == want, "the dry-run IMAP Health variant drifted: %r" % sorted(got)
     VARIANTS.append(("imaphealth-dryrun.json", dry_health))
+
+    digest_wf = SHIPPED[4][1]
+    dry_digest = dry_variant(digest_wf, "digest0001dry", "DRY RUN - Daily Digest (scratch DB, SMTP sink)",
+                             {"now_override": DRYRUN_NOW}, {DIGEST_TRIGGER})
+    got = _node_diff(digest_wf, dry_digest)
+    want = sorted([(DIGEST_TRIGGER, "removed"), ("Config", "config:now_override"), ("Load Digest", "credentials"),
+                   ("Send Digest", "credentials"), ("Record Digest", "credentials")])
+    assert sorted(got) == want, "the dry-run Daily Digest variant drifted: %r" % sorted(got)
+    VARIANTS.append(("digest-dryrun.json", dry_digest))
 
     for _file, _wf in VARIANTS:
         _write(os.path.join(VARIANTS_OUT, _file), _wf)

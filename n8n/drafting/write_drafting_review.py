@@ -12,6 +12,8 @@ Reads, read-only:
     model under the same claim rules since 2026-10-02, skill section 8) and its
     latest execution that called the model;
   * the novascout database -- the live claims_library and its CHECKs.
+  * the deployed Approval Gate and Apply Claim Check (auto-approval, migration
+    014) in both workflows, and the live settings.auto_approve_email -- section 8.
 
 Every tag the deployed Assemble Drafts can put on a draft must have a
 description in TAG_DOCS below, or this refuses to write: an undocumented rule
@@ -164,12 +166,27 @@ if undocumented or stale:
              % (undocumented, stale))
 
 # ---- one real execution: the per-lead prompt as sent ---------------------------------------------------
-exec_id = sys.argv[1] if len(sys.argv) > 1 else psql(
-    "n8n", "SELECT id FROM execution_entity WHERE \"workflowId\" = '%s' AND status = 'success' ORDER BY id DESC LIMIT 1;" % WF)
-ex = json.loads(psql("n8n", "SELECT row_to_json(t) FROM (SELECT e.id, e.mode, e.\"startedAt\", e.\"workflowVersionId\", d.data "
-                            "FROM execution_entity e JOIN execution_data d ON d.\"executionId\" = e.id WHERE e.id = %s) t;"
-                     % int(exec_id)))
-run = unflat(ex["data"])["resultData"]["runData"]
+# The latest that actually called the model: a published Drafting ticks every
+# 30 minutes, and a tick with an empty queue runs nothing past Get Draft Batch.
+def _execution(eid):
+    e = json.loads(psql("n8n", "SELECT row_to_json(t) FROM (SELECT e.id, e.mode, e.\"startedAt\", e.\"workflowVersionId\", d.data "
+                               "FROM execution_entity e JOIN execution_data d ON d.\"executionId\" = e.id WHERE e.id = %d) t;"
+                        % int(eid)))
+    return e, unflat(e["data"])["resultData"]["runData"]
+
+
+if len(sys.argv) > 1:
+    ex, run = _execution(sys.argv[1])
+else:
+    ex = None
+    for _eid in psql("n8n", "SELECT id FROM execution_entity WHERE \"workflowId\" = '%s' AND status = 'success' "
+                            "ORDER BY id DESC LIMIT 400;" % WF).split():
+        _e, _run = _execution(_eid)
+        if "Claude Draft" in _run:
+            ex, run = _e, _run
+            break
+    if ex is None:
+        sys.exit("no execution of %s in the last 400 called the model -- pass an execution id" % WF)
 sent = [it["json"] for r in run["Assess Grounding"] for br in r["data"]["main"] for it in (br or []) if it["json"].get("request")]
 sample = sent[-1]
 used = [it["json"] for r in run["Assemble Drafts"] for br in r["data"]["main"] for it in (br or [])]
@@ -207,7 +224,9 @@ L.append("| Assemble Drafts code | sha256 `%s…` |" % sha(assemble))
 L.append("| Sample execution | #%s (%s, %s, workflow version `%s`) |" % (ex["id"], ex["mode"], ex["startedAt"], ex["workflowVersionId"]))
 L.append("| claims_library | %d rows, %d active, %d confirmed |" % (len(lib), sum(r["active"] for r in lib), sum(r["confirmed"] for r in lib)))
 L.append("")
-L.append("A human approves every draft before it can send. Nothing below changes that gate.")
+L.append("**Auto-approval (migration 014):** an email draft that passes every rule below, uses only confirmed claims and "
+         "passes a second Sonnet 5.5 claim check is approved by the workflow that wrote it; anything else, and every "
+         "LinkedIn DM, waits for a human with its `hold_reason`. Section 8 has the gate and the check as deployed.")
 L.append("")
 
 L.append("## 1. The model call")
@@ -295,14 +314,15 @@ L.append("`claims_library` refuses a line that breaks these, for every writer (N
 L.append("")
 L.append(fence("\n".join(checks), "sql"))
 L.append("")
-L.append("`drafts` (migration 006): status must be pending/approved/rejected/sent; a rejection needs one of four reasons.")
+L.append("`drafts` (migration 006): status must be pending/approved/rejected/sent; a rejection needs one of four reasons. "
+         "Migration 014's trigger turns an `approved_by = 'auto'` approval that breaks a section 8 rule into a hold.")
 L.append("")
 
 L.append("## 5. The live claims library — all %d rows" % len(lib))
 L.append("")
-L.append("Only **active** rows reach the model; every row is `confirmed=false` until a human confirms it, and every "
-         "draft built from an unconfirmed line is tagged `unconfirmed-claim`. Read the `note` before confirming: it "
-         "records what the Nova Agent Kit code showed.")
+L.append("Only **active** rows reach the model. A row is confirmed by a human; a draft built from an unconfirmed line is "
+         "tagged `unconfirmed-claim` and never auto-approves, and editing a confirmed line's text un-confirms it "
+         "(migration 014). Read the `note` before confirming: it records what the Nova Agent Kit code showed.")
 L.append("")
 L.append("`Capabilities` is what a description or benefit line asserts (migration 013). Two lines in one message that "
          "share one say the same thing twice: the prompt names every such pair, and Assemble Drafts tags a message that "
@@ -439,6 +459,71 @@ if fu_ex:
              % ((fin * 2 + fout * 10) / 1e6, len(fu_used), fin, fout))
 else:
     L.append("*No execution of `%s` has called the model yet.*" % FU)
+L.append("")
+
+# ---- 8. auto-approval (migration 014) ---------------------------------------------------------------------
+gate_src = nodes["Approval Gate"]["parameters"]["jsCode"]
+apply_src = nodes["Apply Claim Check"]["parameters"]["jsCode"]
+rules_src = gate_src[:gate_src.index("// Node body")]
+probe = subprocess.run(["node", "-e", rules_src + "\nprocess.stdout.write(JSON.stringify({model: CHECK_MODEL, effort: "
+                        "CHECK_EFFORT, max_tokens: CHECK_MAX_TOKENS, schema: CHECK_SCHEMA, system: CHECK_SYSTEM_PROMPT}));"],
+                       capture_output=True, encoding="utf-8")
+if probe.returncode:
+    sys.exit("could not evaluate the deployed Approval Gate's rules: " + probe.stderr)
+CHECK = json.loads(probe.stdout)
+check_node = nodes["Claude Claim Check"]
+fu_same = (fu_nodes["Approval Gate"]["parameters"]["jsCode"] == gate_src
+           and fu_nodes["Apply Claim Check"]["parameters"]["jsCode"] == apply_src
+           and fu_nodes["Claude Claim Check"]["parameters"] == check_node["parameters"])
+flag = psql("novascout", "SELECT coalesce((SELECT value FROM settings WHERE key = 'auto_approve_email'), '(no row -- on)');")
+held = psql("novascout", "SELECT count(*) || ' pending, ' || count(*) FILTER (WHERE hold_reason IS NOT NULL) || ' with a reason' "
+                         "FROM drafts WHERE status = 'pending';")
+L.append("## 8. Auto-approval — the gate and the claim check, as deployed")
+L.append("")
+L.append("| | |")
+L.append("|---|---|")
+L.append("| settings.auto_approve_email | `%s` (live) |" % flag)
+L.append("| Approval Gate code | sha256 `%s…` |" % sha(gate_src))
+L.append("| Apply Claim Check code | sha256 `%s…` (the gate's rules section + the apply body) |" % sha(apply_src))
+L.append("| Follow-Ups (`%s`) | %s |" % (FU, "the same three nodes, identical code and request" if fu_same
+                                         else "**DIFFERS** from drafting0001's -- rebuild and re-import both"))
+L.append("| The exceptions queue now | %s |" % held)
+L.append("")
+L.append("An email draft is approved by the workflow (`approved_by = 'auto'`) only if all of these hold; anything else is "
+         "written `pending` with `hold_reason`:")
+L.append("")
+for line in [
+    "`settings.auto_approve_email` is on (`auto-approve-off`) -- off, no claim check is called at all;",
+    "it is an email: a LinkedIn DM never auto-approves (`linkedin`, Section 6);",
+    "it is not a low-context note (`low-context`);",
+    "no rule tag from section 4b on its `variant` (`rule-tags: ...`);",
+    "every claim code on its `variant` is an active, confirmed line (`unconfirmed-claim: ...`, `no-claims`);",
+    "the claim check below finds every claim supported by a confirmed line and every prospect fact in the record, and "
+    "its quoted sentences cover the whole email (`claim-check: ...`, `claim-check-incomplete: ...`); a failed call "
+    "holds it (`claim-check-failed: ...`) -- no fallback model.",
+]:
+    L.append("- " + line)
+L.append("")
+L.append("Node **%s**: `%s %s`, credential `%s`, on error `%s`, retry %s × %s ms. The body is the per-draft "
+         "`$json.check_request` the Approval Gate builds from this fixed part, plus the confirmed lines, the prospect "
+         "record (the fact sheet above; for a follow-up, the enrichment record and the first email as context) and the "
+         "generated text:" % (check_node["name"], check_node["parameters"]["method"], check_node["parameters"]["url"],
+                              check_node["credentials"]["anthropicApi"]["id"], check_node.get("onError"),
+                              check_node.get("maxTries"), check_node.get("waitBetweenTries")))
+L.append("")
+L.append(fence(json.dumps({"model": CHECK["model"], "max_tokens": CHECK["max_tokens"],
+                           "output_config": {"effort": CHECK["effort"],
+                                             "format": {"type": "json_schema", "schema": CHECK["schema"]}}},
+                          indent=2, ensure_ascii=False), "json"))
+L.append("")
+L.append("The check's system prompt, exactly:")
+L.append("")
+L.append(fence(CHECK["system"]))
+L.append("")
+L.append("The model judges statements; code decides. Apply Claim Check approves only if every `claim` is `supported` "
+         "and names a code that is a confirmed line, every `prospect` fact is `supported`, every `none` is `none`, the "
+         "quoted sentences (a leading \"Subject:\" label dropped) account for every word of the email, and a first email "
+         "has at least one claim. The verdicts are kept in `drafts.claim_check`.")
 L.append("")
 
 with io.open(OUT, "w", encoding="utf-8", newline="\n") as fh:

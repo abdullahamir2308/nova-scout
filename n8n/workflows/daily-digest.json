@@ -1,0 +1,271 @@
+{
+  "id": "digest0001",
+  "name": "Send & Track - Daily Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "name": "Every 30 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1100,
+        40
+      ],
+      "notes": "Every 30 minutes, sending at most once per operator day, at the first tick at or after digest_hour. Not one daily tick: the host is often asleep, and n8n's day/hour schedules gate on the clock value of the last run (Follow-Ups, 2026-10-02). A digest that could not go out today goes at the next tick."
+    },
+    {
+      "parameters": {},
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1100,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "nowoverride",
+              "name": "now_override",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "hour",
+              "name": "digest_hour",
+              "value": 8,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -880,
+        130
+      ],
+      "notes": "digest_hour: the operator's hour (Asia/Karachi) from which today's digest is due. now_override must stay empty (dry-run only)."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Load Digest: everything the operator's daily digest says, in one snapshot\n-- (migration 014). Read-only.\n--\n-- $1 now_override ('' in the shipped workflow)\n--\n-- The window starts where the last digest that went out stopped (digest_log),\n-- so a day the host was off is folded into the next digest instead of lost;\n-- the first digest ever covers the last 24 hours. The day and hour are the\n-- operator's (Asia/Karachi, docker-compose's GENERIC_TIMEZONE).\n--   auto_approved  every draft the workflows approved themselves in the window,\n--                  with what became of it since\n--   sent           every email SMTP accepted in the window, with who approved it\n--   held           EVERY pending draft -- the exceptions queue -- with its\n--                  hold_reason; `new` marks the ones drafted in the window\nWITH clk AS (\n  SELECT coalesce(nullif($1, '')::timestamptz, now()) AS now\n),\nwin AS (\n  SELECT clk.now AS to_ts,\n         coalesce((SELECT max(g.covers_to) FROM digest_log g), clk.now - interval '24 hours') AS from_ts,\n         (clk.now AT TIME ZONE 'Asia/Karachi')::date AS day,\n         extract(hour FROM clk.now AT TIME ZONE 'Asia/Karachi')::int AS hour\n    FROM clk\n)\nSELECT win.day::text                                                     AS digest_day,\n       win.hour                                                          AS local_hour,\n       to_char((win.from_ts) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')                                                  AS covers_from,\n       to_char((win.to_ts) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')                                                    AS covers_to,\n       EXISTS (SELECT 1 FROM digest_log g WHERE g.digest_day = win.day)  AS already_sent,\n       (SELECT value FROM settings WHERE key = 'operator_email')         AS operator_email,\n       auto_approve_email_enabled()                                      AS auto_approve_email,\n       (SELECT coalesce(json_agg(x ORDER BY x.approved_at, x.draft_id), '[]'::json) FROM (\n          SELECT d.id AS draft_id, d.lead_id, l.company_name, l.domain, l.country, d.channel, d.variant, d.status,\n                 to_char((d.approved_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS approved_at\n            FROM drafts d JOIN leads l ON l.id = d.lead_id\n           WHERE d.approved_by = 'auto' AND d.approved_at >= win.from_ts AND d.approved_at < win.to_ts) x)\n                                                                         AS auto_approved,\n       (SELECT coalesce(json_agg(x ORDER BY x.sent_at, x.draft_id), '[]'::json) FROM (\n          SELECT o.draft_id, o.lead_id, l.company_name, l.domain, c.email AS to_addr, d.variant, d.approved_by,\n                 to_char((o.sent_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS sent_at\n            FROM outreach_log o\n            JOIN leads l ON l.id = o.lead_id\n            LEFT JOIN drafts d ON d.id = o.draft_id\n            LEFT JOIN contacts c ON c.lead_id = o.lead_id\n           WHERE o.channel = 'email' AND o.message_id IS NOT NULL\n             AND o.sent_at >= win.from_ts AND o.sent_at < win.to_ts) x)\n                                                                         AS sent,\n       (SELECT coalesce(json_agg(x ORDER BY x.created_at, x.draft_id), '[]'::json) FROM (\n          SELECT d.id AS draft_id, d.lead_id, l.company_name, l.domain, d.channel, d.variant, d.hold_reason,\n                 to_char((d.created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS created_at, d.created_at >= win.from_ts AS new\n            FROM drafts d JOIN leads l ON l.id = d.lead_id\n           WHERE d.status = 'pending') x)\n                                                                         AS held\n  FROM win;",
+        "options": {
+          "queryReplacement": "={{ [$json.now_override] }}"
+        }
+      },
+      "name": "Load Digest",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -660,
+        130
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "One snapshot: drafts auto-approved and emails sent since the last digest, and every pending draft with its hold_reason -- the exceptions queue. Plus the operator's address and the flag."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Build Digest -- n8n Code node (Run Once for All Items).\n//\n// The operator's daily digest (migration 014): what the workflows approved on\n// their own, what went out, and what is waiting for a person and why. Since\n// auto-approval, the review queue is the exceptions queue; this email is how\n// the operator sees the rest without opening it.\n//\n// Runs every 30 minutes and sends at most once per operator day (Asia/Karachi),\n// at the first tick at or after DIGEST_HOUR -- not on one exact tick, because\n// the host is often asleep (Section 9, Workflow 6: a schedule that must catch\n// one moment misses it). Each digest covers from where the last one stopped, so\n// a day the host was off is folded into the next digest, not lost.\n//\n// It goes only to settings.operator_email, so like a reply notification it is\n// not external and uses no warm-up slot. No operator address, no digest.\n\n// docker-compose's GENERIC_TIMEZONE (no DST), baked at build time.\nconst SENDER_ZONE = \"Asia/Karachi\";\nconst SENDER_OFFSET_MIN = 300;\n\nfunction dStr(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\n// '2026-10-05T03:00:00.000Z' -> '2026-10-05 08:00 PKT' on the sender's clock.\nfunction local(iso, label) {\n  const t = new Date(iso);\n  if (isNaN(t.getTime())) return '?';\n  const s = new Date(t.getTime() + SENDER_OFFSET_MIN * 60000).toISOString();\n  return s.slice(0, 10) + ' ' + s.slice(11, 16) + ' ' + label;\n}\n\nfunction kindOf(variant) {\n  const v = dStr(variant);\n  const fu = /^follow-up-(\\d+)/.exec(v);\n  if (fu) return 'follow-up ' + fu[1];\n  if (/^low-context/.test(v)) return 'low-context note';\n  return 'first touch';\n}\n\nfunction company(r) {\n  return dStr(r.company_name) || dStr(r.domain) || ('lead ' + r.lead_id);\n}\n\nfunction zoneLabel() {\n  return SENDER_ZONE === 'Asia/Karachi' ? 'PKT' : SENDER_ZONE;\n}\n\n// row: Load Digest's one row. cfg: { digest_hour }.\nfunction buildDigest(row, cfg) {\n  const z = zoneLabel();\n  const autoApproved = Array.isArray(row.auto_approved) ? row.auto_approved : [];\n  const sent = Array.isArray(row.sent) ? row.sent : [];\n  const held = Array.isArray(row.held) ? row.held : [];\n  const notifyTo = dStr(row.operator_email);\n  const hour = Number(row.local_hour);\n  const at = Number(cfg && cfg.digest_hour);\n\n  let reason = null;\n  if (!notifyTo) reason = 'no-operator-address';\n  else if (row.already_sent === true) reason = 'already-sent-today';\n  else if (!(hour >= at)) reason = 'before-digest-hour';\n\n  const newHeld = held.filter(function (h) { return h.new === true; }).length;\n  const subject = '[Nova Scout] Digest ' + dStr(row.digest_day) + ': ' + autoApproved.length + ' auto-approved, ' +\n    sent.length + ' sent, ' + held.length + ' held';\n\n  const lines = [\n    'Nova Scout daily digest for ' + dStr(row.digest_day) + '.',\n    'Covers ' + local(row.covers_from, z) + ' to ' + local(row.covers_to, z) + '.',\n    'Auto-approval of email drafts: ' + (row.auto_approve_email === true ? 'ON' : 'OFF') +\n      ' (settings.auto_approve_email).',\n    '',\n    'AUTO-APPROVED (' + autoApproved.length + ') -- no person read these. Each goes out in its recipient\\'s',\n    'business hours; reject it in the review queue to stop it.',\n  ];\n  if (!autoApproved.length) lines.push('  none');\n  autoApproved.forEach(function (r) {\n    lines.push('  #' + r.draft_id + '  ' + company(r) + ' (' + dStr(r.domain) + ', ' + dStr(r.country) + ')  ' +\n      kindOf(r.variant) + '  approved ' + local(r.approved_at, z) + '  -- now ' + dStr(r.status));\n  });\n  lines.push('', 'SENT (' + sent.length + ')');\n  if (!sent.length) lines.push('  none');\n  sent.forEach(function (r) {\n    lines.push('  #' + r.draft_id + '  ' + company(r) + ' -> ' + dStr(r.to_addr) + '  ' + kindOf(r.variant) + '  ' +\n      local(r.sent_at, z) + '  approved by ' + (dStr(r.approved_by) || 'unknown'));\n  });\n  lines.push('', 'HELD FOR A PERSON (' + held.length + (newHeld ? ', ' + newHeld + ' new' : '') +\n    ') -- the exceptions queue: every pending draft, and why.');\n  if (!held.length) lines.push('  none');\n  held.forEach(function (r) {\n    lines.push('  #' + r.draft_id + '  ' + company(r) + '  ' + dStr(r.channel) + ' ' + kindOf(r.variant) +\n      (r.new === true ? '  [new]' : '') + '  since ' + local(r.created_at, z));\n    lines.push('        ' + (dStr(r.hold_reason) || 'no reason recorded (drafted before auto-approval existed)'));\n  });\n  lines.push('', '-- Nova Scout (Workflow 6, Daily Digest). Sent only to this address; it uses no warm-up slot.');\n\n  return {\n    send: reason === null,\n    reason: reason || 'due',\n    notify_to: notifyTo,\n    subject: subject,\n    text: lines.join('\\n'),\n    record: {\n      digest_day: dStr(row.digest_day),\n      covers_from: row.covers_from,\n      covers_to: row.covers_to,\n      summary: {\n        auto_approved: autoApproved.map(function (r) { return r.draft_id; }),\n        sent: sent.map(function (r) { return r.draft_id; }),\n        held: held.length,\n        held_new: newHeld,\n        auto_approve_email: row.auto_approve_email === true,\n      },\n    },\n  };\n}\n\n// ---------------------------------------------------------------------------\n// Node body (Run Once for All Items)\n// ---------------------------------------------------------------------------\n\nconst row = $input.first().json;\nconst cfg = $('Config').first().json;\nreturn [{ json: buildDigest(row, cfg) }];\n"
+      },
+      "name": "Build Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -440,
+        130
+      ],
+      "notes": "Due once per operator day from digest_hour, if the settings table holds an operator address. The plain-text digest: AUTO-APPROVED, SENT, HELD FOR A PERSON (with reasons)."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "send",
+              "leftValue": "={{ $json.send }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Send Digest?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -220,
+        130
+      ],
+      "notes": "False ends the tick; Build Digest's `reason` says why (already sent today, before the hour, no address)."
+    },
+    {
+      "parameters": {
+        "fromEmail": "\"Abdullah Amir\" <abdullah@amitrixlabs.com>",
+        "toEmail": "={{ $json.notify_to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "name": "Send Digest",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        40
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "novascoutSmtp01",
+          "name": "SMTP - outreach mailbox"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "To the operator's own inbox, never the outreach mailbox. Sent only to that address, so it counts toward no warm-up ceiling (Section 9)."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Record Digest: the digest is recorded only once SMTP accepted it, so one that\n-- failed goes out on the next tick. One row per operator day; a repeat is a no-op.\n--\n-- $1 Build Digest's `record`; $2 Send Digest's output (nodemailer's info, or\n--    {error} -- the node continues on error)\nWITH p AS (\n  SELECT $1::jsonb AS d, $2::jsonb AS r\n),\nins AS (\n  INSERT INTO digest_log (digest_day, covers_from, covers_to, summary)\n  SELECT (p.d->>'digest_day')::date, (p.d->>'covers_from')::timestamptz, (p.d->>'covers_to')::timestamptz,\n         p.d->'summary'\n    FROM p\n   WHERE p.r->>'error' IS NULL\n     AND jsonb_typeof(p.r->'accepted') = 'array'\n     AND jsonb_array_length(p.r->'accepted') > 0\n  ON CONFLICT (digest_day) DO NOTHING\n  RETURNING digest_day\n)\nSELECT p.d->>'digest_day'             AS digest_day,\n       (SELECT count(*) FROM ins)::int AS recorded,\n       p.r->>'error'                  AS error\n  FROM p;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($('Build Digest').first().json.record), JSON.stringify($json)] }}"
+        }
+      },
+      "name": "Record Digest",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        220,
+        40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Recorded only if SMTP accepted the digest; a failed one is sent again on the next tick."
+    }
+  ],
+  "connections": {
+    "Every 30 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Load Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Digest": {
+      "main": [
+        [
+          {
+            "node": "Build Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Digest": {
+      "main": [
+        [
+          {
+            "node": "Send Digest?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Digest?": {
+      "main": [
+        [
+          {
+            "node": "Send Digest",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Send Digest": {
+      "main": [
+        [
+          {
+            "node": "Record Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

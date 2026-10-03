@@ -531,6 +531,77 @@ case(
     expect_in="returns no such column",
 )
 
+# --- auto-approval (migration 014) -------------------------------------------
+case(
+    "the batch query stops returning auto_approve_email -> build refuses",
+    mutate_js=lambda s: s.replace("AS auto_approve_email", "AS auto_approve", 1),
+    js_file="build_workflow.py",
+    expect_in="returns no such column",
+)
+case(
+    "the claim check moves to a cheaper model than Section 3's -> build refuses",
+    mutate_js=lambda s: s.replace("const CHECK_MODEL = 'claude-sonnet-5-5';", "const CHECK_MODEL = 'claude-haiku-4-5';", 1),
+    js_file="code_approval.js",
+    expect_in="is not Section 3's drafting model",
+)
+case(
+    "Section 3 changes model and the claim check does not follow -> build refuses",
+    mutate_doc=lambda d: d.replace("**Drafting model: `claude-sonnet-5-5`**", "**Drafting model: `claude-test-9`**", 1),
+    mutate_skill=lambda s: s.replace("- Drafting node: `claude-sonnet-5-5`", "- Drafting node: `claude-test-9`", 1),
+    expect_in="is not Section 3's drafting model",
+)
+case(
+    "the claim check sends a sampling parameter -> build refuses",
+    mutate_js=lambda s: s.replace("    model: CHECK_MODEL,\n", "    model: CHECK_MODEL,\n    temperature: 0,\n", 1),
+    js_file="code_approval.js",
+    expect_in="sets a sampling or thinking-budget parameter",
+)
+case(
+    "the Approval Gate stops holding non-email drafts first (Section 6) -> build refuses",
+    mutate_js=lambda s: s.replace("if (!draft || draft.channel !== 'email') {", "if (!draft) {", 1),
+    js_file="code_approval.js",
+    expect_in="LinkedIn is reviewed and sent by hand",
+)
+case(
+    "node-body code moves above code_approval.js's 'Node body' marker -> build refuses",
+    mutate_js=lambda s: s.replace("const KINDS = ['claim', 'prospect', 'none'];",
+                                  "const KINDS = ['claim', 'prospect', 'none'];\nconst early = $input.item.json;", 1),
+    js_file="code_approval.js",
+    expect_in="node-body code has moved",
+)
+case(
+    "the gate reads an approval field Assemble Drafts never builds -> build refuses",
+    mutate_js=lambda s: s.replace("if (ctx.auto_approve !== true)", "if (ctx.auto_approve !== true || ctx.reviewer)", 1),
+    js_file="code_approval.js",
+    expect_in="Assemble Drafts' `approval` has no reviewer",
+)
+case(
+    "Assemble Drafts stops building `approval` -> build refuses",
+    mutate_js=lambda s: s.replace("    approval: {\n      kind: 'first-touch',", "    approval_ctx: {\n      kind: 'first-touch',", 1),
+    js_file="code_assemble.js",
+    expect_in="does not emit ['approval']",
+)
+case(
+    "Write Drafts & Advance reads a decision the gate never sets -> build refuses",
+    mutate_js=lambda s: s.replace("nullif(d->>'hold_reason', ''),", "nullif(d->>'hold_reason', ''), d->>'reviewed_by',", 1),
+    js_file="build_workflow.py",
+    expect_in="neither Approval Gate nor Apply Claim Check sets",
+)
+case(
+    "a draft reaches Write Drafts & Advance without the Approval Gate -> build refuses",
+    mutate_js=lambda s: s.replace(
+        '"Drop Failed Generations": {\n        "main": [[{"node": "Approval Gate", "type": "main", "index": 0}]]',
+        '"Drop Failed Generations": {\n        "main": [[{"node": "Write Drafts & Advance", "type": "main", "index": 0}]]', 1),
+    js_file="build_workflow.py",
+    expect_in="without the Approval Gate",
+)
+case(
+    "the drafts INSERT writes an approval column Section 8 does not define -> build refuses",
+    mutate_doc=lambda d: d.replace("  approved_by (auto|human), approved_at, hold_reason, claim_check jsonb\n",
+                                   "  approved_by (auto|human), approved_at, claim_check jsonb\n", 1),
+    expect_in="which Section 8",
+)
+
 print("drift guards for Workflow 4\n")
 for label in PASSED:
     print("  ok   " + label)
