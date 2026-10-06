@@ -211,6 +211,10 @@ with tempfile.TemporaryDirectory() as tmp:
     check("A: report: Germany tier extended, 2 found, 1 new unique (shared-cro.com went to Poland)",
           germany["tier"] == "extended" and germany["found"] == 2 and germany["new_unique"] == 1)
     check("A: report: purged_excluded == 2", rep["totals"]["purged_excluded"] == 2)
+    # Old Poland Co and Old Germany Co are gone from the directory; polcro.pl was
+    # dropped for refresh and re-added, which is NOT a removal.
+    check("A: report: removed_from_directory counts net removals only (2, not 3)",
+          rep["totals"]["removed_from_directory"] == 2)
     md = open(os.path.join(tmp, "summary.md"), encoding="utf-8").read()
     check("A: the Action step summary was written, with the per-country table and the totals line",
           "| Country | Tier |" in md and "| Germany | extended |" in md and "new unique leads" in md)

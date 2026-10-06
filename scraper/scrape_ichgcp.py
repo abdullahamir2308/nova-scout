@@ -660,12 +660,13 @@ def merge_results(existing: list[LeadRow], scraped: list[LeadRow], completed: se
     """
     stats = {"purged_excluded": 0, "removed_from_directory": 0}
     kept: list[LeadRow] = []
+    dropped_for_refresh: list[LeadRow] = []
     for row in existing:
         if geography.excluded_as(row.country) or geography.domain_nexus(row.domain):
             stats["purged_excluded"] += 1
             continue
         if row.country in completed and row.profile_url not in failed_profile_urls:
-            stats["removed_from_directory"] += 1
+            dropped_for_refresh.append(row)
             continue
         kept.append(row)
 
@@ -680,6 +681,10 @@ def merge_results(existing: list[LeadRow], scraped: list[LeadRow], completed: se
             by_domain[row.domain] = row
         else:
             _backfill(cur, row)
+    # A row dropped for refresh and put straight back is not a removal. The
+    # first real run (europe, 2026-10-06) reported 20 "removed" for 20 rows that
+    # were all re-added, with 0 leads actually lost.
+    stats["removed_from_directory"] = sum(1 for r in dropped_for_refresh if r.domain not in by_domain)
     return list(by_domain.values()), stats
 
 
