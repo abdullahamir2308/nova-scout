@@ -3,10 +3,36 @@ name: Scrape ICH GCP Directory
 # Runs from GitHub's IP range because ichgcp.net 403s the dev machine and
 # the local n8n container (see ichgcp_scrape_findings.md). n8n picks up the
 # result from raw.githubusercontent.com instead of touching ichgcp.net.
+#
+# One REGION per weekday (MasterRef Section 9, Workflow 1). Every country on
+# ichgcp.net/cro-list is scraped except the sanctioned jurisdictions in
+# scraper/geography.py, split into five shards so each run is small, polite and
+# far inside GitHub's 6-hour job limit. Each shard is MERGED into
+# data/ichgcp_leads.csv; other shards' rows are left as they are.
+#
+# The shard comes from the cron expression that fired (github.event.schedule),
+# not from the date: GitHub starts scheduled runs hours late (observed 5-7 h),
+# and a late run must not drift into the next day's shard.
+#   Mon europe · Tue asia-pacific · Wed americas · Thu middle-east · Fri africa
+# test_geography.py fails if this table and scraper/geography.py SHARDS disagree.
 on:
   schedule:
-    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC
-  workflow_dispatch: {}
+    - cron: "0 6 * * 1"
+    - cron: "0 6 * * 2"
+    - cron: "0 6 * * 3"
+    - cron: "0 6 * * 4"
+    - cron: "0 6 * * 5"
+  workflow_dispatch:
+    inputs:
+      shard:
+        description: "Shard to scrape"
+        type: choice
+        default: europe
+        options: [europe, asia-pacific, americas, middle-east, africa, all]
+      plan_only:
+        description: "Plan only: read the country index, classify every country and count its listings (one request each). Fetches no profile, commits nothing."
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -18,6 +44,10 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    # Hard backstop under GitHub's 6 h limit. The scraper stops starting new work
+    # at ICHGCP_MAX_RUNTIME_SECONDS (4.5 h) so it can still merge and commit; a
+    # job killed at the limit commits nothing.
+    timeout-minutes: 345
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,19 +60,85 @@ jobs:
       - name: Install dependencies
         run: pip install -r scraper/requirements.txt
 
+      # Fails closed: if the sanctions exclusions, the core geographies or the
+      # shard table drift from the Master Ref, nothing is scraped.
+      - name: Offline tests
+        run: |
+          python scraper/test_parse_fixture.py
+          python scraper/test_geography.py
+          python scraper/test_shards.py
+
+      - name: Pick the shard
+        id: shard
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_SHARD: ${{ inputs.shard }}
+          INPUT_PLAN: ${{ inputs.plan_only }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            shard="$INPUT_SHARD"
+            plan="$INPUT_PLAN"
+          else
+            plan=false
+            case "$SCHEDULE" in
+              "0 6 * * 1") shard=europe ;;
+              "0 6 * * 2") shard=asia-pacific ;;
+              "0 6 * * 3") shard=americas ;;
+              "0 6 * * 4") shard=middle-east ;;
+              "0 6 * * 5") shard=africa ;;
+              *) echo "::error::no shard for schedule '$SCHEDULE'"; exit 1 ;;
+            esac
+          fi
+          echo "shard=$shard" >> "$GITHUB_OUTPUT"
+          echo "plan=$plan" >> "$GITHUB_OUTPUT"
+          echo "Shard: $shard (plan only: $plan)"
+
       - name: Run scraper
+        id: scrape
         env:
           OUTPUT_CSV_PATH: data/ichgcp_leads.csv
+          ICHGCP_SHARD: ${{ steps.shard.outputs.shard }}
+          ICHGCP_PLAN_ONLY: ${{ steps.shard.outputs.plan }}
+          ICHGCP_REPORT_PATH: scrape_report.json
+          ICHGCP_MAX_RUNTIME_SECONDS: "16200"
         run: python scraper/scrape_ichgcp.py
 
+      - name: Upload report
+        if: always() && steps.scrape.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrape-report-${{ steps.shard.outputs.shard }}${{ steps.shard.outputs.plan == 'true' && '-plan' || '' }}
+          path: scrape_report.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # always(): a run the circuit breaker aborted (exit 3) still merged its
+      # completed countries, and those should be kept. A scraper that crashed
+      # before writing leaves the CSV untouched, so the diff below is empty.
+      # The push retries after a rebase: on 2026-09-02 a run that sat queued for
+      # six hours lost its push to a commit made meanwhile ("fetch first").
       - name: Commit CSV if changed
+        if: always() && steps.scrape.outcome != 'skipped' && steps.shard.outputs.plan != 'true'
+        env:
+          SHARD: ${{ steps.shard.outputs.shard }}
+          BRANCH: ${{ github.ref_name }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/ichgcp_leads.csv
           if git diff --cached --quiet; then
             echo "No changes to data/ichgcp_leads.csv — nothing to commit."
-          else
-            git commit -m "chore(data): update ICH GCP scrape results"
-            git push
+            exit 0
           fi
+          git commit -m "chore(data): ICH GCP scrape, shard ${SHARD}"
+          for attempt in 1 2 3 4; do
+            if git pull --rebase origin "$BRANCH" && git push origin "HEAD:$BRANCH"; then
+              exit 0
+            fi
+            echo "push attempt $attempt failed; retrying"
+            git rebase --abort 2>/dev/null || true
+            sleep $((attempt * 5))
+          done
+          echo "::error::could not push the CSV after 4 attempts"
+          exit 1

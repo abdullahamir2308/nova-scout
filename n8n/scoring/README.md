@@ -58,14 +58,16 @@ scoring run.
 
 ## What the spec locks, and how drift is caught
 
-Three locked lists live in `NovaScout_MasterRef.md` and are needed inside an n8n
+Several locked lists live in `NovaScout_MasterRef.md` and are needed inside an n8n
 Code node, which cannot import a shared module. `build_workflow.py` parses each
 one out of the doc and asserts `code_evaluate.js` matches, refusing to generate
 the workflow on any divergence:
 
 | Locked in | What | Guarded against |
 |---|---|---|
-| Section 12 | 13 target geographies | 25 points, the largest single weight |
+| Section 12 | the 13 core geographies | the full geography weight (10) |
+| Section 12 | extended geographies, N points (5) | what every other directory country earns; must be strictly between 0 and the geography weight |
+| Section 12 | excluded jurisdictions (10 names) | 0 points; must not overlap the core list; every alias in `EXCLUDED_ALIASES` must resolve to one of them |
 | Section 9 | the six fit-score weights | the formula itself; also asserted to sum to 100 |
 | Section 9 | the therapeutic-area enum | how `Oncology` is recognised |
 | Section 12 | employee band 5–100 | the `employees` factor |

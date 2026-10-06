@@ -33,6 +33,45 @@ const TARGET_GEOGRAPHIES = [
   'Argentina',
 ];
 
+// Section 12, "Extended geographies (N points)": what every OTHER included
+// country earns of the geography weight below. The core 13 above earn all of it.
+const EXTENDED_GEOGRAPHY_POINTS = 5;
+
+// Section 12, "Excluded jurisdictions": sanctioned, never scraped, earn nothing.
+// The scraper already keeps them out of the CSV; this is the second line of
+// control for a row that arrives another way (a manual CSV import, say).
+const EXCLUDED_JURISDICTIONS = [
+  'Afghanistan',
+  'Belarus',
+  'Cuba',
+  'Iran',
+  'Myanmar',
+  'Nicaragua',
+  'North Korea',
+  'Russia',
+  'Syria',
+  'Venezuela',
+];
+
+// Spellings of those names that a directory or a spreadsheet uses. A matching
+// aid, not a locked list: every value must resolve to an EXCLUDED_JURISDICTIONS
+// entry (test_fit_score.js checks it).
+const EXCLUDED_ALIASES = {
+  'burma': 'Myanmar',
+  'russian federation': 'Russia',
+  'islamic republic of iran': 'Iran',
+  'iran, islamic republic of': 'Iran',
+  'korea, north': 'North Korea',
+  'north korea (dprk)': 'North Korea',
+  'dprk': 'North Korea',
+  'democratic people\'s republic of korea': 'North Korea',
+  'korea, democratic people\'s republic of': 'North Korea',
+  'syrian arab republic': 'Syria',
+  'bolivarian republic of venezuela': 'Venezuela',
+  'venezuela, bolivarian republic of': 'Venezuela',
+  'byelorussia': 'Belarus',
+};
+
 // Section 9, Workflow 3, "Weighted fit score (0-100)".
 const WEIGHTS = {
   geography: 10,
@@ -100,6 +139,19 @@ function canonicalAreas(raw) {
 function inTargetGeography(country) {
   if (country === null || country === undefined) return false;
   return Object.prototype.hasOwnProperty.call(GEO_BY_KEY, String(country).trim().toLowerCase());
+}
+
+const EXCLUDED_BY_KEY = {};
+for (const e of EXCLUDED_JURISDICTIONS) EXCLUDED_BY_KEY[e.toLowerCase()] = e;
+for (const k of Object.keys(EXCLUDED_ALIASES)) EXCLUDED_BY_KEY[k] = EXCLUDED_ALIASES[k];
+
+// The excluded jurisdiction `country` names, or null. Case-insensitive exact
+// match on the canonical name or a known alias; like canonicalAreas, a value
+// that is not on the list is not guessed into a neighbour.
+function excludedJurisdiction(country) {
+  if (country === null || country === undefined) return null;
+  const key = String(country).trim().toLowerCase().replace(/\s+/g, ' ');
+  return Object.prototype.hasOwnProperty.call(EXCLUDED_BY_KEY, key) ? EXCLUDED_BY_KEY[key] : null;
 }
 
 // Did any fetch rung get an HTTP status line back?
@@ -221,15 +273,38 @@ function hardDisqualifiers(lead) {
 // half-weight neutral for an honest unknown, and a below-neutral score for a
 // confirmed miss.
 
+// Three tiers (Section 12), never unknown-neutral:
+//   core 13            -> the full geography weight
+//   excluded           -> 0 (a sanctioned jurisdiction is a miss, however it scores elsewhere)
+//   any other country  -> EXTENDED_GEOGRAPHY_POINTS (it is on the directory, so it is in scope)
+//   no country         -> 0
 function scoreGeography(lead) {
-  const hit = inTargetGeography(lead.country);
+  const country = lead.country === null || lead.country === undefined ? '' : String(lead.country).trim();
+  if (inTargetGeography(country)) {
+    return {
+      points: WEIGHTS.geography,
+      max: WEIGHTS.geography,
+      basis: 'confirmed',
+      detail: country + ' is a target geography',
+    };
+  }
+  if (!country) {
+    return { points: 0, max: WEIGHTS.geography, basis: 'miss', detail: 'no country recorded' };
+  }
+  const excluded = excludedJurisdiction(country);
+  if (excluded) {
+    return {
+      points: 0,
+      max: WEIGHTS.geography,
+      basis: 'miss',
+      detail: country + ' is an excluded jurisdiction (' + excluded + ')',
+    };
+  }
   return {
-    points: hit ? WEIGHTS.geography : 0,
+    points: EXTENDED_GEOGRAPHY_POINTS,
     max: WEIGHTS.geography,
-    basis: hit ? 'confirmed' : 'miss',
-    detail: hit
-      ? lead.country + ' is a target geography'
-      : (lead.country ? lead.country + ' is outside the target geographies' : 'no country recorded'),
+    basis: 'confirmed',
+    detail: country + ' is an extended geography (half credit; the core geographies earn the full weight)',
   };
 }
 

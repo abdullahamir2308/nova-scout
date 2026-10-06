@@ -121,6 +121,58 @@ case(
     expect_in="geography list not found",
 )
 
+# --- extended geographies and excluded jurisdictions (Section 12) ----------
+case(
+    "doc drops an excluded jurisdiction -> build refuses",
+    mutate_doc=lambda d: d.replace("Afghanistan, Belarus, Cuba,", "Afghanistan, Cuba,", 1),
+    expect_in="excluded jurisdictions drifted",
+)
+case(
+    "doc excludes another country the JS does not know -> build refuses",
+    mutate_doc=lambda d: d.replace("Russia, Syria, Venezuela.", "Russia, Sudan, Syria, Venezuela.", 1),
+    expect_in="excluded jurisdictions drifted",
+)
+case(
+    "JS excludes a country the doc does not -> build refuses",
+    mutate_js=lambda s: s.replace("  'Venezuela',\n];", "  'Venezuela',\n  'Sudan',\n];", 1),
+    expect_in="excluded jurisdictions drifted",
+)
+case(
+    "the '**Excluded jurisdictions' anchor is renamed -> build refuses loudly",
+    mutate_doc=lambda d: d.replace("**Excluded jurisdictions (checked", "**Embargoed (checked", 1),
+    expect_in="excluded jurisdictions not found",
+)
+case(
+    "a country is both core and excluded -> build refuses",
+    mutate_doc=lambda d: d.replace("Geographies:** Turkey, Mexico,", "Geographies:** Turkey, Iran, Mexico,", 1),
+    expect_in="both a core geography and an excluded jurisdiction",
+)
+case(
+    "doc changes the extended award -> build refuses",
+    mutate_doc=lambda d: d.replace("**Extended geographies (5 points):**", "**Extended geographies (6 points):**", 1),
+    expect_in="extended-geography points drifted",
+)
+case(
+    "JS changes the extended award -> build refuses",
+    mutate_js=lambda s: s.replace("const EXTENDED_GEOGRAPHY_POINTS = 5;", "const EXTENDED_GEOGRAPHY_POINTS = 4;", 1),
+    expect_in="extended-geography points drifted",
+)
+case(
+    "an extended award equal to the full weight would void the core/extended split -> build refuses",
+    mutate_doc=lambda d: d.replace("**Extended geographies (5 points):**", "**Extended geographies (10 points):**", 1),
+    expect_in="must be between 0 and the geography weight",
+)
+case(
+    "the '**Extended geographies' anchor is renamed -> build refuses loudly",
+    mutate_doc=lambda d: d.replace("**Extended geographies (5 points):**", "**Other markets (5 points):**", 1),
+    expect_in="extended-geography points not found",
+)
+case(
+    "an alias that points at a jurisdiction the doc never excluded -> build refuses",
+    mutate_js=lambda s: s.replace("'burma': 'Myanmar',", "'burma': 'Thailand',", 1),
+    expect_in="does not exclude",
+)
+
 # --- weights ---------------------------------------------------------------
 case(
     "doc reweights a factor -> build refuses",

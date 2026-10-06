@@ -71,6 +71,37 @@ def load_target_geographies(doc=None):
     return geos
 
 
+def load_extended_geography_points(doc=None):
+    """Section 12, '**Extended geographies (N points):**' -- what every
+    non-core, non-excluded country earns of the geography weight."""
+    doc = doc if doc is not None else _doc()
+    m = re.search(r"\*\*Extended geographies \((\d+) points\):\*\*", doc)
+    if not m:
+        raise AssertionError(
+            "extended-geography points not found in %s -- expected "
+            "'**Extended geographies (N points):** ...' in Section 12" % MASTER_REF
+        )
+    return int(m.group(1))
+
+
+def load_excluded_jurisdictions(doc=None):
+    """Section 12, '**Excluded jurisdictions (checked <date>):** A, B, C.'"""
+    doc = doc if doc is not None else _doc()
+    m = re.search(r"\*\*Excluded jurisdictions[^*\n]*\*\*\s*([^\n]+)", doc)
+    if not m:
+        raise AssertionError(
+            "excluded jurisdictions not found in %s -- expected a line "
+            "'**Excluded jurisdictions (checked ...):** ...' in Section 12" % MASTER_REF
+        )
+    raw = m.group(1).strip().rstrip(".")
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    if len(names) < 2:
+        raise AssertionError("excluded-jurisdictions list in %s looks empty: %r" % (MASTER_REF, names))
+    if len(set(names)) != len(names):
+        raise AssertionError("excluded-jurisdictions list in %s contains duplicates: %r" % (MASTER_REF, names))
+    return names
+
+
 # Maps a weights-table row label to the factor key used in the JS. Matching on a
 # distinctive substring rather than the full label so a wording tweak in the doc
 # does not fail the build, while a row that disappears entirely still does.
@@ -158,8 +189,21 @@ def load_therapeutic_areas(doc=None):
 
 
 TARGET_GEOGRAPHIES = load_target_geographies()
+EXTENDED_GEOGRAPHY_POINTS = load_extended_geography_points()
+EXCLUDED_JURISDICTIONS = load_excluded_jurisdictions()
 WEIGHTS = load_weights()
 THERAPEUTIC_AREAS = load_therapeutic_areas()
+
+# An extended country is worth less than a core one and more than nothing -- an
+# award at or above the full weight would make the core/extended split void.
+assert 0 < EXTENDED_GEOGRAPHY_POINTS < WEIGHTS["geography"], (
+    "extended-geography points (%d) must be between 0 and the geography weight (%d) in %s"
+    % (EXTENDED_GEOGRAPHY_POINTS, WEIGHTS["geography"], MASTER_REF)
+)
+_overlap = sorted(set(TARGET_GEOGRAPHIES) & set(EXCLUDED_JURISDICTIONS))
+assert not _overlap, (
+    "a country is both a core geography and an excluded jurisdiction in %s: %r" % (MASTER_REF, _overlap)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +224,32 @@ def _assert_evaluate_matches_spec():
         "target geographies drifted between the Master Ref and code_evaluate.js:\n"
         "  doc (%s): %r\n  js:  %r"
         % (os.path.basename(MASTER_REF), TARGET_GEOGRAPHIES, found_geo)
+    )
+
+    found_excluded = _js_string_array(src, "EXCLUDED_JURISDICTIONS")
+    assert found_excluded == EXCLUDED_JURISDICTIONS, (
+        "excluded jurisdictions drifted between the Master Ref and code_evaluate.js:\n"
+        "  doc (%s): %r\n  js:  %r"
+        % (os.path.basename(MASTER_REF), EXCLUDED_JURISDICTIONS, found_excluded)
+    )
+
+    m = re.search(r"const EXTENDED_GEOGRAPHY_POINTS = (\d+);", src)
+    assert m, "EXTENDED_GEOGRAPHY_POINTS not found in code_evaluate.js"
+    assert int(m.group(1)) == EXTENDED_GEOGRAPHY_POINTS, (
+        "extended-geography points drifted between the Master Ref and code_evaluate.js:\n"
+        "  doc (%s): %d\n  js:  %s"
+        % (os.path.basename(MASTER_REF), EXTENDED_GEOGRAPHY_POINTS, m.group(1))
+    )
+
+    # Every alias must resolve to a locked name, or an alias could quietly
+    # introduce a jurisdiction the doc never excluded.
+    am = re.search(r"const EXCLUDED_ALIASES = \{(.*?)\n\};", src, re.S)
+    assert am, "EXCLUDED_ALIASES object not found in code_evaluate.js"
+    alias_targets = set(re.findall(r":\s*'((?:[^'\\]|\\.)*)'\s*,", am.group(1)))
+    stray = sorted(alias_targets - set(EXCLUDED_JURISDICTIONS))
+    assert not stray, (
+        "EXCLUDED_ALIASES in code_evaluate.js points at jurisdictions the Master Ref does not "
+        "exclude: %r" % (stray,)
     )
 
     found_areas = _js_string_array(src, "THERAPEUTIC_AREAS")

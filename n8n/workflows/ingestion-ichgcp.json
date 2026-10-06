@@ -7,19 +7,18 @@
         "rule": {
           "interval": [
             {
-              "field": "weeks",
-              "weeksInterval": 1,
-              "triggerAtDay": [1],
-              "triggerAtHour": 12
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 23
             }
           ]
         }
       },
-      "name": "Weekly Schedule",
+      "name": "Daily Schedule",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [-160, 100],
-      "notes": "Fires Monday 12:00 in the workflow timezone (Asia/Karachi, set via GENERIC_TIMEZONE) -- a few hours after the GitHub Action's Monday 06:00 UTC scrape, so the CSV it fetches is always this week's."
+      "notes": "Fires daily at 23:00 in the workflow timezone (Asia/Karachi, set via GENERIC_TIMEZONE) = 18:00 UTC. The GitHub Action scrapes one region per weekday at 06:00 UTC, but GitHub starts scheduled runs 5-7 hours late (13:18 UTC at the latest in the run history), so 18:00 UTC is after that day's shard has merged into the CSV. Daily, not weekly: five shards land on five different days, and the upsert is idempotent. (It was weekly Monday 12:00 = 07:00 UTC, which fetched the previous week's file.)"
     },
     {
       "parameters": {},
@@ -77,7 +76,7 @@
     }
   ],
   "connections": {
-    "Weekly Schedule": {
+    "Daily Schedule": {
       "main": [[{ "node": "Fetch ICH GCP CSV", "type": "main", "index": 0 }]]
     },
     "Manual Trigger": {

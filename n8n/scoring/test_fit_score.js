@@ -15,7 +15,8 @@ const F = extractFunctions(
   path.join(__dirname, 'code_evaluate.js'),
   '// Node body',
   [
-    'WEIGHTS', 'TARGET_GEOGRAPHIES', 'canonicalAreas', 'inTargetGeography',
+    'WEIGHTS', 'TARGET_GEOGRAPHIES', 'EXTENDED_GEOGRAPHY_POINTS', 'EXCLUDED_JURISDICTIONS',
+    'EXCLUDED_ALIASES', 'excludedJurisdiction', 'canonicalAreas', 'inTargetGeography',
     'scoreGeography', 'scoreFounder', 'scoreOncology', 'scoreEmployees', 'scoreSite',
   ]
 );
@@ -37,12 +38,52 @@ t.check('a multi-word target country matches',
   F.scoreGeography({ country: 'South Africa' }).points, F.WEIGHTS.geography);
 t.check('surrounding whitespace is tolerated',
   F.scoreGeography({ country: '  Poland  ' }).points, F.WEIGHTS.geography);
-t.check('a non-target country scores zero',
-  F.scoreGeography({ country: 'Germany' }).points, 0);
 t.check('a null country scores zero, not half -- geography is never unknown-neutral',
   F.scoreGeography({ country: null }).points, 0);
+t.check('a blank country scores zero', F.scoreGeography({ country: '   ' }).points, 0);
+t.check('an undefined country scores zero', F.scoreGeography({}).points, 0);
 t.check('all 13 spec geographies are recognised',
   F.TARGET_GEOGRAPHIES.filter((g) => !F.inTargetGeography(g)).length, 0);
+
+// Extended geographies (Section 12): any other included country earns the
+// extended points -- half the weight, strictly between a miss and a core country.
+t.check('the extended award is 5 of the 10', [F.EXTENDED_GEOGRAPHY_POINTS, F.WEIGHTS.geography], [5, 10]);
+t.check('an extended country scores the extended points',
+  F.scoreGeography({ country: 'Germany' }).points, F.EXTENDED_GEOGRAPHY_POINTS);
+t.check('an extended country is judged against the full weight (5/10, not 5/5)',
+  F.scoreGeography({ country: 'Germany' }).max, F.WEIGHTS.geography);
+t.check('extended matching ignores case and whitespace',
+  F.scoreGeography({ country: '  united states ' }).points, F.EXTENDED_GEOGRAPHY_POINTS);
+t.check('ordering: excluded/none < extended < core',
+  [F.scoreGeography({ country: 'Iran' }).points < F.scoreGeography({ country: 'Germany' }).points,
+   F.scoreGeography({ country: 'Germany' }).points < F.scoreGeography({ country: 'India' }).points],
+  [true, true]);
+t.check('an extended country is a confirmed (counted) factor, not a miss or an unknown',
+  F.scoreGeography({ country: 'Japan' }).basis, 'confirmed');
+t.check('the detail says it is half credit, so the rationale does not call it a core win',
+  /extended geography/.test(F.scoreGeography({ country: 'Japan' }).detail), true);
+t.check('a core country is still described as a target geography',
+  F.scoreGeography({ country: 'Mexico' }).detail, 'Mexico is a target geography');
+
+// Excluded jurisdictions: sanctioned, so they earn nothing and say why.
+for (const c of F.EXCLUDED_JURISDICTIONS) {
+  const g = F.scoreGeography({ country: c });
+  t.check('excluded ' + c + ' scores zero as a miss', [g.points, g.basis], [0, 'miss']);
+}
+t.check('the excluded list is the ten the doc names', F.EXCLUDED_JURISDICTIONS.length, 10);
+t.check('an excluded country says it is excluded, not "outside the target"',
+  /excluded jurisdiction \(Russia\)/.test(F.scoreGeography({ country: 'Russia' }).detail), true);
+t.check('exclusion ignores case', F.scoreGeography({ country: 'IRAN' }).points, 0);
+for (const alias of Object.keys(F.EXCLUDED_ALIASES)) {
+  t.check('alias "' + alias + '" resolves to an excluded jurisdiction',
+    F.EXCLUDED_JURISDICTIONS.indexOf(F.EXCLUDED_ALIASES[alias]) !== -1, true);
+  t.check('alias "' + alias + '" scores zero', F.scoreGeography({ country: alias }).points, 0);
+}
+// Names that a careless matcher would catch -- each must stay in scope.
+for (const ok of ['South Korea', 'Korea', 'Guinea', 'Papua New Guinea', 'Niger', 'Nigeria', 'Ukraine',
+                  'Iraq', 'Lebanon', 'China', 'Hong Kong', 'Mali']) {
+  t.check('not excluded: ' + ok, F.scoreGeography({ country: ok }).points, F.EXTENDED_GEOGRAPHY_POINTS);
+}
 
 // --- founder: miss < unknown < confirmed ----------------------------------
 const founderFull = F.scoreFounder({
