@@ -366,6 +366,21 @@ t.check('"you\'re losing sponsor inquiries" is not calling them a sponsor',
   has(emailFlags({ email_body: bodyWith("You're losing sponsor inquiries after hours.") }), 'prospect-sponsor'), false);
 
 // ===========================================================================
+// A contact with no email address (a LinkedIn-only contact, Workflow 3b)
+// ===========================================================================
+
+t.check('an email to a contact with no address is `no-address`',
+  has(emailFlags({}, { email_addressing: 'unaddressed' }), 'no-address'), true);
+t.check('...so it carries the tag in its variant, where the Approval Gate reads it',
+  /\+.*\bno-address\b/.test(draftOf(assemble({}, { email_addressing: 'unaddressed' }), 'email').variant), true);
+t.check('the LinkedIn DM to the same contact is not tagged',
+  has(linkedinFlags({}, { email_addressing: 'unaddressed' }), 'no-address'), false);
+t.check('a role inbox is addressed', has(emailFlags({}, { email_addressing: 'role-inbox' }), 'no-address'), false);
+t.check('a named mailbox is addressed', has(emailFlags({}, { email_addressing: 'named' }), 'no-address'), false);
+t.check('a personal-shaped address with no named owner is addressed',
+  has(emailFlags({}, { email_addressing: 'unnamed' }), 'no-address'), false);
+
+// ===========================================================================
 // Forbidden claims
 // ===========================================================================
 

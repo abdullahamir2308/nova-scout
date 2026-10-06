@@ -3,6 +3,9 @@
 // The zero-credit branch. Everything written here came from a source already on
 // disk: the address from the company's own ichgcp profile page, the person from
 // the Workflow 2 site extraction. No API was called and no field is inferred.
+// Resolve Contact sends two kinds of lead here: one with a scraped address, and
+// one with no address but the founder's LinkedIn profile (email null, written
+// LinkedIn-only). `source` says which.
 
 const r = $input.item.json;
 const c = r.contact || {};
@@ -18,7 +21,7 @@ return {
     write: true,
     lead_id: r.lead_id,
     domain: r.domain,
-    source: 'ichgcp_scrape',
+    source: r.source || 'ichgcp_scrape',
     credits_spent: 0,
     payload: {
       lead_id: r.lead_id,

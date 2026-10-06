@@ -1205,7 +1205,7 @@ nodes = [
         "notes": (
             "Oldest-first queue read (Section 7 idempotency rule). Ranking by fit_score is "
             "Workflow 5's job, not this one's -- draining the queue best-first would starve "
-            "lower-scoring leads that still cleared the >=60 gate.\n\n"
+            "lower-scoring leads that still cleared Section 9's contact-lookup gate.\n\n"
             "Also carries, on every row, the active claims library (migration 010 -- the operator's "
             "table, read per run, never baked in) and the warm-up week the skill's link rule needs.\n\n"
             "Query parameters are passed as an array so a value containing a comma is never split."

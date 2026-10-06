@@ -679,6 +679,11 @@ function checkEmail() {
   flags = flags.concat(linkFlags(emailCore + '\n' + emailSubject, week, link));
   flags = flags.concat(subjectFlags(emailSubject, factCorpus, src.headcount, titles, src.absent_areas));
   if (prospectSponsor(emailSubject)) flags.push('prospect-sponsor');
+  // A contact written from the site's own founder LinkedIn (Workflow 3b) has no
+  // email address. The LinkedIn DM is the draft that matters; this email has
+  // nowhere to go (Send refuses it as no-valid-address), so it is tagged to be
+  // held rather than auto-approved and listed as ready.
+  if (src.email_addressing === 'unaddressed') flags.push('no-address');
   return unique(flags.concat(claimTags(emailClaims, link)));
 }
 

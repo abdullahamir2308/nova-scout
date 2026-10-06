@@ -107,6 +107,9 @@ STRUCTURAL = [
     ("[v3] a lead missing a v3 slot is held back before any API call", "code_assess.js",
      "const libraryHolds = groundable && libraryGap !== null;",
      "const libraryHolds = false;"),
+    ("[2026-10-06] an honorific is not a first name (\"Hi Dr.,\")", "code_assess.js",
+     "while (parts.length > 1 && HONORIFICS.indexOf(parts[0].toLowerCase().replace(/\\.+$/, '')) !== -1) parts.shift();",
+     ""),
 ]
 
 

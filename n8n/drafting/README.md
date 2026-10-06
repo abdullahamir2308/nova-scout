@@ -61,6 +61,12 @@ as its source (`claim-sop` -- it answers from the website), and **no repeats**:
 each description and benefit line names its `capabilities`, Assess Grounding
 tells the model which pairs share one (D2 with BEN-247 or BEN-BOOK), and a
 message whose claim codes repeat a capability is tagged `claim-repeat`.
+Since 2026-10-06, an **email to a contact with no email address** -- a
+LinkedIn-only contact written by Workflow 3b from the site's own founder
+LinkedIn -- is tagged `no-address`. The Approval Gate holds it like any other
+tag (no claim check is paid for); Send would refuse it anyway (`contact-unverified`,
+`no-valid-address`), so the tag only keeps it out of the "auto-approved" list.
+The LinkedIn DM to that contact is drafted normally.
 
 **The rules section is shared.** Workflow 6's follow-ups (`../sendtrack/`,
 skill section 8) embed everything in `code_assemble.js` above its `// Node body`

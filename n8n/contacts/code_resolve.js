@@ -3,14 +3,20 @@
 // Decides, per qualified lead, whether Apollo needs to be called at all.
 //
 // Section 7's ordering rule keeps Apollo on the free tier by spending only on
-// leads that already scored >= 60. This node applies the same principle one
-// level further in: of those, spend only on the ones we do not already have an
-// address for. Two free sources are checked first, both already on disk:
+// leads that already cleared Section 9's score gate (Config.min_fit_score,
+// parsed from the doc). This node applies the same principle one level further
+// in: of those, spend only on the ones we do not already have a way to reach.
+// Two free sources are checked first, both already on disk:
 //
 //   1. contacts.email  <- the ichgcp profile-page email, via the CSV index
 //   2. name/title/linkedin <- enrichments, harvested in Workflow 2
 //
-// A lead with a scraped email skips the Apollo call entirely.
+// A lead with a scraped email skips the Apollo call entirely. So does a lead
+// with no address but a founder LinkedIn profile the company's own site gave
+// (2026-10-06): it is written as a LinkedIn-only contact -- no email, not
+// verified -- so Workflow 4 drafts the DM Section 6 has a human send. Apollo's
+// free plan cannot answer anyway (Section 9), and a profile that regex-matched
+// the named founder (code_normalise.js) is a channel nobody had to buy.
 //
 // Note what is NOT inferred here. A role inbox (info@, contact@) is a company
 // address, not a person's, and pairing it with the founder's name would assert
@@ -88,7 +94,41 @@ if (scrapedEmail) {
   };
 }
 
-// No free address. This is the only path that reaches Apollo.
+// No address, but the site named its founder and gave a LinkedIn profile for
+// them. Only a personal profile counts (/in/...): enrichment can also see a
+// company page, which is not a person to write to. Nothing is inferred -- the
+// email stays null, so the row says exactly what the sources said, and it is not
+// `verified` (that flag means a confirmed address; there is none).
+const PROFILE_URL = /^https?:\/\/(?:[a-z0-9-]+\.)?linkedin\.com\/in\/[^\s/?#]+/i;
+if (founderLinkedin && PROFILE_URL.test(founderLinkedin)) {
+  return {
+    json: {
+      needs_apollo: false,
+      source: 'enrichment_linkedin',
+      lead_id: lead.lead_id,
+      domain: lead.domain,
+      company_name: lead.company_name,
+      country: lead.country,
+      fit_score: lead.fit_score,
+      contact: {
+        name: founderName,
+        title: founderTitle,
+        email: null,
+        linkedin_url: founderLinkedin,
+        apollo_id: null,
+        verified: false,
+      },
+      evidence:
+        'no email on the ichgcp profile page; LinkedIn profile' +
+        (founderName ? ', name' : '') + (founderTitle ? ' and title' : '') +
+        ' from the Workflow 2 site extraction -- written LinkedIn-only, Apollo not called',
+      role_inbox: false,
+      credits_saved: 1,
+    },
+  };
+}
+
+// Nothing free to reach them with. This is the only path that reaches Apollo.
 return {
   json: {
     needs_apollo: true,

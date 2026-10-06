@@ -1,14 +1,14 @@
 # Drafting review — Workflow 4, skill v3, as deployed
 
-Generated 2026-10-03 07:41 UTC by `n8n/drafting/write_drafting_review.py`, read-only, from the live n8n and novascout databases — not from the repo.
+Generated 2026-10-06 08:09 UTC by `n8n/drafting/write_drafting_review.py`, read-only, from the live n8n and novascout databases — not from the repo.
 
 | Source | Value |
 |---|---|
-| n8n workflow | `drafting0001`, versionId `a133bc9f-61a1-4dc7-8f0f-e71bd9d74a75`, updated 2026-10-03T07:38:15.67+00:00 |
+| n8n workflow | `drafting0001`, versionId `6165018a-3b90-4ab3-ad74-25a344ea02a4`, updated 2026-10-06T08:08:57.131+00:00 |
 | Published | **no** — publish it in the n8n UI; this document describes the saved version |
-| Assess Grounding code | sha256 `80f3510f77446d56…` |
-| Assemble Drafts code | sha256 `3ee0574d2fda37a8…` |
-| Sample execution | #845 (cli, 2026-10-02T11:13:34.297+00:00, workflow version `364fa8d7-c3c7-48e4-9041-704d8f6d44b1`) |
+| Assess Grounding code | sha256 `56a6119a897fa722…` |
+| Assemble Drafts code | sha256 `f0ed4face74b757d…` |
+| Sample execution | #1683 (cli, 2026-10-06T08:09:01.381+00:00, workflow version `6165018a-3b90-4ab3-ad74-25a344ea02a4`) |
 | claims_library | 23 rows, 20 active, 20 confirmed |
 
 **Auto-approval (migration 014):** an email draft that passes every rule below, uses only confirmed claims and passes a second Sonnet 5.5 claim check is approved by the workflow that wrote it; anything else, and every LinkedIn DM, waits for a human with its `hold_reason`. Section 8 has the gate and the check as deployed.
@@ -170,21 +170,23 @@ linkedin_claims (the code of every approved claim each message used).
 
 ## 3. The per-lead prompt — a real one, as sent
 
-Built per lead by Assess Grounding: the numbered facts (each with what it does not establish), which fact opens each message, what the subject is built from, and the approved claims for this lead — every active description, angle, benefit and ask, and only the proof line matched to its country. This is lead 50 (Innovate Research, India) from execution #845:
+Built per lead by Assess Grounding: the numbered facts (each with what it does not establish), which fact opens each message, what the subject is built from, and the approved claims for this lead — every active description, angle, benefit and ask, and only the proof line matched to its country. This is lead 55 (JSS Medical Research, India) from execution #1683:
 
 ```
-Company: Innovate Research
+Company: JSS Medical Research
 Country: India
 
 VERIFIED FACTS. These are the only facts about this company that exist.
 Each one is numbered. Read the whole bullet, including the sentence saying
 what it does NOT establish:
-1. ClinicalTrials.gov lists 2 recruiting trials registered under your company. The ones named are: "Registry of Minimally Invasive Cancer Treatment Using Spectral Angio-CT Image Guidance"; "Hyperbaric Oxygen Brain Injury Treatment Trial". Nothing else about them is known -- not their phase, their therapeutic area, nor where they run.
-2. The company is based in Noida. This says nothing about where any trial runs or where any staff sit.
+1. Therapeutic areas listed on their own website: Oncology and Immunology. This says nothing about which area any particular trial belongs to.
+2. ClinicalTrials.gov lists 2 recruiting trials registered under your company. The ones named are: "Kodo Millet Porridge and Its Effects on Gut Health and Metabolic Syndrome"; "Yoga Based Cardiac Rehabilitation in Heart Failure Failure". Nothing else about them is known -- not their phase, their therapeutic area, nor where they run.
+3. The company is based in Laval. This says nothing about where any trial runs or where any staff sit.
+4. Named on their own site as founder or MD: Dr. John S. Sampalis (Founder & Advisor). This says nothing about which trials or clients this person personally handles.
 
-Open the email from fact 1. Open the LinkedIn DM from fact 1.
-Build the email subject from fact 1 too -- the same fact the email opens with.
-In the subject, call the trial "Minimally Invasive".
+Open the email from fact 2. Open the LinkedIn DM from fact 1.
+Build the email subject from fact 2 too -- the same fact the email opens with.
+In the subject, call the trial "Kodo Millet".
 A hook built from the trial fact says "Your recruiting trial ..." or "You're
 running ..." -- about them, not about ClinicalTrials.gov, and never "sponsoring".
 
@@ -293,6 +295,7 @@ A violation **tags** the draft's `variant` (`addressing/claim codes+tag,tag`); t
 | `ungrounded-area` | Prospect facts only from enrichment | a therapeutic area the lead does not have is named |
 | `claim-code` | Claims only from the approved list | the message reported a claim code this lead was not offered, or reported none |
 | `unconfirmed-claim` | Every claim confirmed by a human | the message used a claims_library line with confirmed=false |
+| `no-address` | An email needs an address (2026-10-06) | the contact has no email -- a LinkedIn-only contact from Workflow 3b -- so the email goes nowhere; held, never auto-approved (email only) |
 
 The constants and patterns those rows name, as deployed:
 
@@ -395,13 +398,13 @@ Only **active** rows reach the model. A row is confirmed by a human; a draft bui
 
 | Lead | Email words | DM words | Email claims | DM claims | Email tags | DM tags | Input tok | Output tok (thinking) |
 |---|---|---|---|---|---|---|---|---|
-| 50 | 111 | 94 | D2.ANG-HOURS.BEN-SEE.PR-BOTH.A1 | D1.ANG-HOURS.BEN-247.PR-BOTH.A2 | unconfirmed-claim | unconfirmed-claim | 3805 | 2995 (2432) |
+| 55 | 97 | 63 | D1.ANG-HOURS.BEN-247.PR-BOTH.A1 | D2.ANG-STAKES.PR-BOTH.A2 | no-address | — | 3908 | 2420 (1983) |
 
-API cost of that execution at $2 / $10 per MTok: **$0.0376** for 1 leads (3805 input + 2995 output tokens).
+API cost of that execution at $2 / $10 per MTok: **$0.0320** for 1 leads (3908 input + 2420 output tokens).
 
 ## 7. Follow-ups — Workflow 6, composed under the same rules
 
-Drafting skill v3 §8 (2026-10-02): a follow-up is no longer a template. Workflow `followup0001` (versionId `3e1a26a0-bebb-42b5-ba59-d5294ac8fde4`, **not published** — publish it in the n8n UI) asks the same model for it, with the same request parameters, and checks it with the same rule functions.
+Drafting skill v3 §8 (2026-10-02): a follow-up is no longer a template. Workflow `followup0001` (versionId `39abc9ec-55b3-4050-bf5d-72c1caff4055`, published) asks the same model for it, with the same request parameters, and checks it with the same rule functions.
 
 | | |
 |---|---|
@@ -542,67 +545,7 @@ Tags Assemble Follow-Up adds on top of the inherited ones (§4b: the ask, produc
 | `fu-new-claim` | #2, the final note, added an angle or benefit |
 | `unconfirmed-claim` | the message used a claims_library line with confirmed=false |
 
-A real per-lead prompt, as sent — lead 7, follow-up #1, from execution #843 (cli, 2026-10-02T11:11:42.666+00:00, workflow version `7c8cb148-f3b7-49e2-9e3b-f03808c3b45d` — an earlier version than the one described above; the system prompt and rules above are the deployed ones):
-
-```
-Country: Argentina
-
-THE FIRST EMAIL, sent 22 Sep 2026 with the subject "INM004 trial — a quick question". The prospect has not
-replied. It is everything you may say about them, and only what it says:
----
-You're sponsoring a recruiting trial — Efficacy of INM004 in Children With STEC-HUS. How many pharma-team inquiries reach you only after that team has already moved on?
-
-We built Nova so an 11pm pharma-team inquiry is answered in real time and qualified, not the next morning — and lands in the tools you already use. It's live at Vertex Clinical Research in Mexico.
-
-Would a demo on your material be worth 48 hours of our time? One word back is enough.
----
-
-The first email was written before the current claims list, so its claims cannot be read off codes.
-Read it, and in first_email_covers list the code of every angle and benefit below whose point it
-already made -- in any words. Never add one of those.
-
-APPROVED CLAIMS FOR THIS NOTE. Nothing about the product, the problem or the proof may come from
-anywhere else. Rephrase freely; never widen what a line says.
-
-PAIN AND STAKES ANGLES the first email did not use:
-  [ANG-HOURS] Sponsors often research CROs outside your working hours, frequently from another time zone. An inquiry sent at 11pm waits until morning, and by then they may have moved on to the next CRO.
-  [ANG-SILENT] How many sponsors visit your site and leave without ever contacting you?
-  [ANG-SPEED] Sponsors choosing a CRO notice how quickly you respond, and a small CRO can't staff a BD desk around the clock.
-  [ANG-STAKES] A single sponsor inquiry can be a multi-million-dollar study.
-  [ANG-TIME] Your BD time should go to qualified sponsors, not to sorting every inquiry that arrives.
-
-BENEFITS the first email did not use:
-  [BEN-247] It answers sponsors from your own website, in real time, at any hour.  (about: answers)
-  [BEN-BOOK] It sends qualified sponsors your booking link, so they can book a call with your team.  (about: booking-link)
-  [BEN-BRIEF] It collects the therapeutic area and study phase before your first call.  (about: study-details)
-  [BEN-CAPTURE] A sponsor who shares their details becomes a named lead: company, contact, therapeutic area and study phase.  (about: captures-lead, study-details)
-  [BEN-DECK] It sends your capabilities deck the moment a sponsor asks for it.  (about: deck)
-  [BEN-FIT] It's configured around your services and your process, not a template.  (about: configured)
-  [BEN-ROUTE] Leads land where your team already works.  (about: routes-leads)
-  [BEN-SEE] You can see every sponsor lead it captured, and any question it passed to your team.  (about: dashboard)
-
-PROOF -- only if you mention a deployment; it is matched to their country:
-  [PR-MX] It's live at Vertex Clinical Research in Mexico.
-
-ASK -- end with ONE of these, rephrased if you like:
-  [A1] Would a 48-hour demo built on your own material be worth a look? One word back is enough.
-  [A2] Worth a 48-hour demo on your own material? Reply yes and I'll set it up.
-
-This is follow-up 1 of 2.
-Open by referring back to the first email in a few words, then add exactly ONE angle or benefit from
-the lists above that the first email did not make, and build the note around it. Then the one ask.
-The body plus the ask is 40-70 words. Put the added line's code in added_claim.
-Write no greeting, no sign-off and no opt-out line -- those are added afterwards. In claims, list the
-code of every approved claim the note used.
-```
-
-| Lead | # | Words | Claims | First email covers (model) | Tags | Input tok | Output tok (thinking) |
-|---|---|---|---|---|---|---|---|
-| 7 | 1 | 56 | BEN-SEE.A1 | ANG-HOURS, BEN-247, BEN-ROUTE | unconfirmed-claim | 2677 | 1377 (1206) |
-| 91 | 1 | 66 | BEN-SEE.A1 | ANG-HOURS, BEN-247, BEN-ROUTE | unconfirmed-claim | 2658 | 1138 (952) |
-| 104 | 1 | 55 | BEN-DECK.A2 | ANG-HOURS, BEN-247, BEN-ROUTE, BEN-CAPTURE | unconfirmed-claim | 2671 | 1173 (977) |
-
-API cost of that execution at $2 / $10 per MTok: **$0.0529** for 3 follow-ups (8006 input + 3688 output tokens).
+*No execution of `followup0001` has called the model yet.*
 
 ## 8. Auto-approval — the gate and the claim check, as deployed
 
@@ -613,7 +556,7 @@ API cost of that execution at $2 / $10 per MTok: **$0.0529** for 3 follow-ups (8
 | Apply Claim Check code | sha256 `4def4b421479ba69…` (the gate's rules section + the apply body) |
 | Repair rounds | 2 (`MAX_REPAIRS`), deployed as Claude Repair 1, Claude Repair 2 |
 | Follow-Ups (`followup0001`) | the same gate, check and repair nodes, identical code and request |
-| The exceptions queue now | 5 pending, 5 with a reason |
+| The exceptions queue now | 29 pending, 29 with a reason |
 
 An email draft is approved by the workflow (`approved_by = 'auto'`) only if all of these hold; anything else is written `pending` with `hold_reason`:
 

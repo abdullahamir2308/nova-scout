@@ -120,6 +120,9 @@ g = gate(firstTouch(CLEAN + '+long,claim-repeat'));
 t.check('a rule tag holds it, naming every tag', [g.needs_check, g.payload.drafts[0].hold_reason], [false, 'rule-tags: long, claim-repeat']);
 g = gate(firstTouch(CLEAN + '+unconfirmed-claim'));
 t.check('... unconfirmed-claim is a rule tag like any other', [g.needs_check, g.payload.drafts[0].hold_reason], [false, 'rule-tags: unconfirmed-claim']);
+g = gate(firstTouch('unaddressed/D2.ANG-HOURS.BEN-SEE.PR-BOTH.A1+no-address'));
+t.check('an email to a contact with no address is held by its `no-address` tag, and no check is paid for',
+  [g.needs_check, g.check_request, g.payload.drafts[0].hold_reason], [false, null, 'rule-tags: no-address']);
 
 g = gate(firstTouch('low-context/role-inbox', null, 'low-context/no-profile'));
 t.check('a low-context item (no approval context) holds both drafts, no check',

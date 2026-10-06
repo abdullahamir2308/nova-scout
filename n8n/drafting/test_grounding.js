@@ -276,6 +276,18 @@ t.check(
   'named'
 );
 
+// An honorific is not a first name (lead 55, 2026-10-06: "Hi Dr.,").
+function greetedAs(contactName) {
+  return assess(lead({ contact_name: contactName, linkedin_url: 'https://www.linkedin.com/in/x', email: null }), ctgov(0, []))
+    .linkedin_greeting;
+}
+t.check('"Dr. John S. Sampalis" is greeted by first name, not "Dr."', greetedAs('Dr. John S. Sampalis'), 'Hi John,');
+t.check('a title without a dot too, in any case', greetedAs('DR Maria Lopez'), 'Hi Maria,');
+t.check('stacked titles are all skipped', greetedAs('Prof. Dr. Anna Nowak'), 'Hi Anna,');
+t.check('a name with no title is unchanged', greetedAs('Claudia Rodriguez Verde'), 'Hi Claudia,');
+t.check('a first name that merely starts like a title is kept', greetedAs('Drew Parker'), 'Hi Drew,');
+t.check('a one-word name is never emptied', greetedAs('Dr.'), 'Hi Dr.,');
+
 ['info@x.com', 'contact@x.com', 'connect@x.com', 'office@x.com', 'no-reply@x.com'].forEach(
   function (e) {
     t.check(

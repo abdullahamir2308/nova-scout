@@ -8,9 +8,11 @@ introduces exactly one divergence, and asserts the build refuses to run.
 
 Exits non-zero on the first guard that failed to fire.
 
-Workflow 3b's guards protect spend, not just correctness. The >= 60 gate and the
-status='scored' filter are the whole of what keeps Apollo on the free tier; if
-either drifts without a build failure, the first symptom is a bill.
+Workflow 3b's guards protect spend, not just correctness. The score gate (>= 50
+since 2026-10-06, >= 60 before) and the status='scored' filter are the whole of
+what keeps Apollo on the free tier; if either drifts without a build failure,
+the first symptom is a bill. The expected value below is the literal number in
+Section 9's gate sentence, so changing the doc means changing it here too.
 """
 import io
 import json
@@ -137,14 +139,14 @@ def _threshold_in_build(doc_mutator):
 
 
 _base_threshold, _ = _threshold_in_build(None)
-if _base_threshold != 60:
-    FAILED.append(("Section 9's >= 60 gate reaches Config",
-                   "generated min_fit_score was %r, expected 60" % (_base_threshold,)))
+if _base_threshold != 50:
+    FAILED.append(("Section 9's >= 50 gate reaches Config",
+                   "generated min_fit_score was %r, expected 50" % (_base_threshold,)))
 else:
-    PASSED.append("Section 9's >= 60 gate reaches Config")
+    PASSED.append("Section 9's >= 50 gate reaches Config")
 
 _moved, _ = _threshold_in_build(
-    lambda d: d.replace("Apollo lookup for leads scoring ≥ 60 only",
+    lambda d: d.replace("Apollo lookup for leads scoring ≥ 50 only",
                         "Apollo lookup for leads scoring ≥ 45 only", 1)
 )
 if _moved != 45:
@@ -156,7 +158,7 @@ else:
 case(
     "the Apollo gate sentence is reworded away -> build refuses loudly",
     mutate_doc=lambda d: d.replace(
-        "**Then** Apollo lookup for leads scoring ≥ 60 only.",
+        "**Then** Apollo lookup for leads scoring ≥ 50 only.",
         "**Then** look up contacts for the good ones.", 1),
     expect_in="apollo score gate not found",
 )

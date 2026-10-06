@@ -158,6 +158,8 @@ TAG_DOCS = {
                   "\"standard operating procedures\", \"your documents/documentation\" -- it answers from their website"),
     "claim-repeat": ("No repeats: the description and benefits never share a capability", "two claim codes the message "
                      "used share a capability (claims_library.capabilities, migration 013)"),
+    "no-address": ("An email needs an address (2026-10-06)", "the contact has no email -- a LinkedIn-only contact "
+                   "from Workflow 3b -- so the email goes nowhere; held, never auto-approved (email only)"),
 }
 undocumented = [t for t in TAGS if t not in TAG_DOCS]
 stale = [t for t in TAG_DOCS if t not in TAGS]

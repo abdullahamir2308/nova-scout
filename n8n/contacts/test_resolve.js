@@ -50,19 +50,26 @@ const leads = [
   { json: { lead_id: 7, domain: 'klixar.com', company_name: 'KLIXAR', country: 'Argentina', fit_score: 71, founder_name: 'Enrique Gaubeca', founder_linkedin: 'https://www.linkedin.com/in/enriquegaubeca', founder_title: 'General Manager, Founder and Co-owner' } },
   // A named mailbox, no founder on the site.
   { json: { lead_id: 50, domain: 'innovate-research.com', company_name: 'Innovate Research', country: 'India', fit_score: 63, founder_name: null, founder_linkedin: null, founder_title: null } },
-  // No scraped address: the only path that may reach Apollo.
+  // No scraped address, but the site named its founder AND gave a LinkedIn profile:
+  // written LinkedIn-only, Apollo not called (2026-10-06).
   { json: { lead_id: 55, domain: 'jssresearch.com', company_name: 'JSS Medical Research', country: 'India', fit_score: 71, founder_name: 'Dr. John S. Sampalis', founder_linkedin: 'https://ca.linkedin.com/in/johnsampalis', founder_title: 'Founder & Advisor' } },
-  // Same, and the site named nobody either.
+  // No scraped address and the site named nobody: the only path that may reach Apollo.
   { json: { lead_id: 92, domain: 'cebisinternational.com', company_name: 'CEBIS International', country: 'Romania', fit_score: 63, founder_name: null, founder_linkedin: null, founder_title: null } },
+  // No scraped address, a founder LinkedIn profile on a www host, no title.
+  { json: { lead_id: 14, domain: 'rarascro.com', company_name: 'Rara SCRO', country: 'Brazil', fit_score: 66, founder_name: 'Claudia Rodriguez Verde', founder_linkedin: 'https://www.linkedin.com/in/claudia-rodriguez-49236754', founder_title: null } },
+  // A founder named, but no LinkedIn: Apollo is still the only way to learn more.
+  { json: { lead_id: 998, domain: 'namedonly.example', company_name: 'Named Only', country: 'India', fit_score: 55, founder_name: 'Jane Roe', founder_linkedin: null, founder_title: 'Managing Director' } },
+  // A LinkedIn COMPANY page is not a person to write to: not a channel, so Apollo.
+  { json: { lead_id: 997, domain: 'companypage.example', company_name: 'Company Page', country: 'India', fit_score: 55, founder_name: 'John Doe', founder_linkedin: 'https://www.linkedin.com/company/company-page', founder_title: null } },
 ];
 
 const up = { 'Index Scraped Emails': index };
 const resolved = runForEachItem(RESOLVE, leads, up).map(function (r) { return r.json; });
 
-t.check('scraped address short-circuits the Apollo call',
-  resolved.map(function (r) { return r.needs_apollo; }), [false, false, false, true, true]);
+t.check('a scraped address, or a founder LinkedIn profile, short-circuits the Apollo call',
+  resolved.map(function (r) { return r.needs_apollo; }), [false, false, false, false, true, false, true, true]);
 t.check('credits saved is counted per skipped lookup',
-  resolved.reduce(function (n, r) { return n + r.credits_saved; }, 0), 3);
+  resolved.reduce(function (n, r) { return n + r.credits_saved; }, 0), 5);
 t.check('role inbox is flagged', resolved[0].role_inbox, true);
 t.check('named mailbox is not flagged as a role inbox', resolved[2].role_inbox, false);
 t.check('role inbox with no named person carries no name', resolved[0].contact.name, null);
@@ -73,9 +80,27 @@ t.check('site-named founder rides along with the role inbox', resolved[1].contac
 t.check('so does the title', resolved[1].contact.title, 'General Manager, Founder and Co-owner');
 t.check('so does the LinkedIn URL', resolved[1].contact.linkedin_url, 'https://www.linkedin.com/in/enriquegaubeca');
 t.check('a name is never invented for a bare mailbox', resolved[2].contact.name, null);
-t.check('Apollo branch carries the known founder forward', resolved[3].known_founder_name, 'Dr. John S. Sampalis');
+t.check('Apollo branch carries the known founder forward', resolved[6].known_founder_name, 'Jane Roe');
 t.check('Apollo branch with no known founder passes null', resolved[4].known_founder_name, null);
-t.check('Apollo branch claims no credit saving', resolved[3].credits_saved, 0);
+t.check('Apollo branch claims no credit saving', resolved[6].credits_saved, 0);
+
+// --- the LinkedIn-only branch (2026-10-06) ---------------------------------------
+t.check('a scraped address wins over a LinkedIn profile: the email branch is used', resolved[1].source, 'ichgcp_scrape');
+t.check('a lead with no address and a founder profile is the LinkedIn branch', resolved[3].source, 'enrichment_linkedin');
+t.check('...with no email at all, never inferred', resolved[3].contact.email, null);
+t.check('...the profile URL the site gave', resolved[3].contact.linkedin_url, 'https://ca.linkedin.com/in/johnsampalis');
+t.check('...the name and title the site gave', [resolved[3].contact.name, resolved[3].contact.title],
+  ['Dr. John S. Sampalis', 'Founder & Advisor']);
+t.check('...not verified: that flag means a confirmed address, and there is none', resolved[3].contact.verified, false);
+t.check('...scrape-sourced: a null apollo_id', resolved[3].contact.apollo_id, null);
+t.check('...not a role inbox', resolved[3].role_inbox, false);
+t.check('...the evidence says it was written LinkedIn-only', /LinkedIn-only, Apollo not called/.test(resolved[3].evidence), true);
+t.check('a regional subdomain and a www host of linkedin.com/in/ are both profiles',
+  [resolved[3].source, resolved[5].source], ['enrichment_linkedin', 'enrichment_linkedin']);
+t.check('a title is optional', resolved[5].contact.title, null);
+t.check('a LinkedIn company page is not a channel: the lead goes to Apollo', resolved[7].needs_apollo, true);
+t.check('...and its URL is still handed to Pick Best Contact', resolved[7].known_founder_linkedin, 'https://www.linkedin.com/company/company-page');
+t.check('a lead with nothing free to reach them with still goes to Apollo', resolved[4].source, 'apollo');
 
 // ---------------------------------------------------------------------------
 // Build Contact Payload (Scraped)
@@ -87,14 +112,20 @@ const scraped = resolved
 const payloads = runForEachItem(PAYLOAD, scraped).map(function (r) { return r.json; });
 
 t.check('every scraped lead is written',
-  payloads.map(function (p) { return p.write; }), [true, true, true]);
+  payloads.map(function (p) { return p.write; }), [true, true, true, true, true]);
 t.check('no credit is attributed to the scrape branch',
-  payloads.map(function (p) { return p.credits_spent; }), [0, 0, 0]);
-t.check('an address is a channel, so the lead advances',
-  payloads.map(function (p) { return p.payload.advance; }), [true, true, true]);
+  payloads.map(function (p) { return p.credits_spent; }), [0, 0, 0, 0, 0]);
+t.check('an address or a LinkedIn profile is a channel, so the lead advances',
+  payloads.map(function (p) { return p.payload.advance; }), [true, true, true, true, true]);
 t.check('provenance survives as a null apollo_id',
-  payloads.map(function (p) { return p.payload.apollo_id; }), [null, null, null]);
+  payloads.map(function (p) { return p.payload.apollo_id; }), [null, null, null, null, null]);
 t.check('payload carries the founder through', payloads[1].payload.name, 'Enrique Gaubeca');
+t.check('the payload says which source it came from',
+  payloads.map(function (p) { return p.source; }),
+  ['ichgcp_scrape', 'ichgcp_scrape', 'ichgcp_scrape', 'enrichment_linkedin', 'enrichment_linkedin']);
+t.check('a LinkedIn-only contact is written with a null email, the profile, and verified false',
+  [payloads[3].payload.email, payloads[3].payload.linkedin_url, payloads[3].payload.verified],
+  [null, 'https://ca.linkedin.com/in/johnsampalis', false]);
 
 // A lead with neither channel must not be advanced into the drafting queue.
 const empty = runForEachItem(PAYLOAD, [

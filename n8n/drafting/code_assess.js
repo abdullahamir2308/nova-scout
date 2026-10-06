@@ -193,8 +193,13 @@ function isRoleInbox(email) {
   return ROLE_LOCALPARTS.indexOf(lp) !== -1 || ROLE_LOCALPARTS.indexOf(bare) !== -1;
 }
 
+// An honorific is not a first name: "Dr. John S. Sampalis" is greeted "Hi John,",
+// not "Hi Dr.," (found 2026-10-06 on lead 55's LinkedIn draft). Never strips the
+// last remaining word, so a one-word name is returned as it was.
+const HONORIFICS = ['dr', 'prof', 'professor', 'mr', 'mrs', 'ms', 'miss', 'mx', 'sir', 'madam', 'eng', 'ing'];
 function firstName(name) {
   const parts = str(name).split(/\s+/).filter(Boolean);
+  while (parts.length > 1 && HONORIFICS.indexOf(parts[0].toLowerCase().replace(/\.+$/, '')) !== -1) parts.shift();
   return parts.length ? parts[0] : '';
 }
 

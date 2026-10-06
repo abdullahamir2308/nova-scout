@@ -25,7 +25,8 @@ re-activate it in the editor after importing.
 ## Why this is 3b and not part of Workflow 3
 
 Section 9 puts the Apollo lookup inside Workflow 3 ("**Then** Apollo lookup for
-leads scoring ≥ 60 only"). It ships as a separate workflow anyway, for one
+leads scoring ≥ 50 only" -- ≥ 60 until 2026-10-06, see Section 9's "Decision
+2026-10-06"). It ships as a separate workflow anyway, for one
 reason: build rule 4 requires every workflow to be queue-driven and idempotent,
 and an inline Apollo stage is neither.
 
@@ -36,8 +37,30 @@ scored before it existed. Reaching them would have meant re-queueing them to
 ClinicalTrials.gov lookup each) to get at a step that costs neither. Every future
 outage, plan change, or threshold change would have the same shape.
 
-As its own queue keyed on `status='scored' AND fit_score >= 60 AND no contacts
+As its own queue keyed on `status='scored' AND fit_score >= 50 AND no contacts
 row`, it drains whatever is waiting, whenever it runs.
+
+## Three ways a lead gets a contact (2026-10-06)
+
+`Resolve Contact` picks the first that applies; only the third spends anything.
+
+1. **A scraped address** in `data/ichgcp_leads.csv` (via `Index Scraped Emails`):
+   the email, verified, plus the founder's name, title and LinkedIn if the site
+   gave them. Apollo is not called.
+2. **No address, but a founder LinkedIn profile** that enrichment harvested from the
+   company's own site (`linkedin.com/in/...`; a company page does not count): a
+   **LinkedIn-only contact** -- `linkedin_url` plus the name and title the site gave,
+   `email` NULL, `verified` false, `apollo_id` NULL. Apollo is not called, the lead
+   advances to `contact_found`, and Workflow 4 drafts the DM (its email is tagged
+   `no-address` and held). **Such a lead is never queued for Apollo again** because
+   it now has a `contacts` row; if the plan ever allows the lookup, delete those rows
+   (`apollo_id IS NULL AND email IS NULL AND linkedin_url IS NOT NULL`) to re-queue
+   them.
+3. **Neither:** Apollo. On the Free plan it answers 403, nothing is written and the
+   lead stays `scored` and is retried every hour -- the manual look-up Section 7
+   prices. They take a slot in every batch (best score first), so once 10 or more
+   leads are stuck this way the leads behind them are never reached. Today there
+   are five (53, 92, 35, 94, 212).
 
 ## The pipeline
 
@@ -239,7 +262,7 @@ python n8n/contacts/test_drift_guards.py   # 16 cases
   operator needs.
 - **`test_drift_guards.py`** mutates a scratch copy of the Master Ref (or the JS,
   or the ingestion workflow) and proves each build-time guard refuses. Two cases
-  assert the opposite: that moving the ≥ 60 gate in the doc, or the CSV URL in
+  assert the opposite: that moving the score gate in the doc, or the CSV URL in
   ingestion, *changes the generated workflow* rather than failing — those are read
   from their source, not restated.
 
@@ -267,13 +290,15 @@ docker exec -e N8N_RUNNERS_BROKER_PORT=5690 -e N8N_RUNNERS_ENABLED=false `
   nova-scout-n8n-1 n8n execute --id contacts0001
 ```
 
-Repeat until this reaches zero:
+Repeat until this stops falling (it never reaches zero while a lead has neither a
+scraped address nor a founder LinkedIn -- those stay, see above):
 
 ```sql
 SELECT count(*) FROM leads l
   JOIN scores s ON s.lead_id = l.id
   LEFT JOIN contacts c ON c.lead_id = l.id
- WHERE l.status = 'scored' AND s.fit_score >= 60 AND c.lead_id IS NULL;
+ WHERE l.status = 'scored' AND s.disqualified = false
+   AND s.fit_score >= 50 AND c.lead_id IS NULL;
 ```
 
 The two `N8N_RUNNERS_*` overrides keep the one-off CLI process from colliding

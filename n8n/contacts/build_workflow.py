@@ -8,7 +8,8 @@ This generator holds the spec-drift guards for Workflow 3b. Four things this
 stage depends on are locked elsewhere and cannot be imported into an n8n Code
 node:
 
-    Section  9  the >= 60 Apollo gate    -> what keeps Apollo on the free tier
+    Section  9  the Apollo score gate    -> what keeps Apollo on the free tier
+                (>= 60 until 2026-10-06, >= 50 since; read the doc, not this line)
     Section  7  Apollo runs AFTER scoring -> the same, structurally
     Section  8  the `contacts` columns    -> what the write step inserts
     Section 12  the ICP buyer titles      -> who the ranker prefers
