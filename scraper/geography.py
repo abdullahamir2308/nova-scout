@@ -172,7 +172,8 @@ _REGION_MEMBERS = {
     "americas": """
         united_states usa us united_states_of_america canada mexico guatemala belize honduras el_salvador
         costa_rica panama colombia ecuador peru bolivia chile argentina uruguay paraguay brazil dominican_republic
-        jamaica trinidad_and_tobago puerto_rico haiti bahamas barbados guyana suriname bermuda cayman_islands
+        jamaica trinidad_and_tobago trinidad_tobago saint_lucia puerto_rico haiti bahamas barbados guyana suriname
+        bermuda cayman_islands
     """,
     "middle-east": """
         turkey turkiye israel jordan lebanon iraq saudi_arabia united_arab_emirates uae kuwait qatar bahrain oman
@@ -182,7 +183,7 @@ _REGION_MEMBERS = {
         south_africa nigeria kenya ghana ethiopia tanzania uganda zambia zimbabwe mozambique malawi rwanda senegal
         cameroon ivory_coast cote_d_ivoire botswana namibia angola mauritius madagascar sudan south_sudan somalia
         democratic_republic_of_the_congo dr_congo congo gabon benin togo burkina_faso mali niger guinea sierra_leone
-        liberia gambia
+        liberia gambia burundi djibouti equatorial_guinea mauritania
     """,
 }
 _REGION_BY_NAME = {}
@@ -218,11 +219,24 @@ def slug_to_name(slug: str) -> str:
     return " ".join(w if (i and w in small) else w.capitalize() for i, w in enumerate(words))
 
 
+# Slugs whose derived name reads wrongly. Found on the first real plan run
+# (2026-10-06, 138 index links); the rest derive cleanly. A name is written to
+# leads.country and never changes afterwards, so these are fixed before the
+# first shard, not after.
+DISPLAY_NAMES = {
+    "usa": "USA",
+    "dr_congo": "DR Congo",
+    "cote_d_ivoire": "Cote d'Ivoire",
+    "bosnia_herzegovina": "Bosnia and Herzegovina",
+    "trinidad_tobago": "Trinidad and Tobago",
+}
+
+
 def canonical_name(slug: str) -> str:
     """The name written to leads.country. Core countries keep their locked
     spelling; everything else is derived from the slug (never from link text,
     which can change), so a country's name is the same on every run."""
-    return _CORE_NAME_BY_SLUG.get(slug) or slug_to_name(slug)
+    return _CORE_NAME_BY_SLUG.get(slug) or DISPLAY_NAMES.get(slug) or slug_to_name(slug)
 
 
 def is_core(display_name: str) -> bool:
@@ -243,6 +257,10 @@ def excluded_as(value: str) -> str | None:
 
 def flagged_as(value: str) -> tuple[str, str] | None:
     tokens = _tokens(value)
+    # "guinea" is a whole word in Papua New Guinea and Equatorial Guinea, which
+    # have no programme of their own (the first real plan flagged both).
+    if "guinea" in tokens and tokens & {"papua", "equatorial"}:
+        return None
     for rules, label, note in FLAGGED:
         if _matches(tokens, rules):
             return label, note

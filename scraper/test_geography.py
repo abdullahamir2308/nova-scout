@@ -83,7 +83,20 @@ for name, slug in g.CORE_COUNTRIES.items():
     check("core %-15s not excluded" % name, g.excluded_as(slug) is None and g.excluded_as(name) is None)
     check("core %-15s slug -> locked display name" % name, g.canonical_name(slug) == name)
     check("core %-15s is in a region table" % name, g.shard_of(slug)[1] is True)
-check("a non-core slug gets a stable derived name", g.canonical_name("united_states") == "United States")
+check("a non-core slug gets a stable derived name", g.canonical_name("united_kingdom") == "United Kingdom")
+# From the first real plan run (138 index links): the slugs whose derived names read wrongly.
+for slug, name in [("usa", "USA"), ("dr_congo", "DR Congo"), ("cote_d_ivoire", "Cote d'Ivoire"),
+                   ("bosnia_herzegovina", "Bosnia and Herzegovina"), ("trinidad_tobago", "Trinidad and Tobago"),
+                   ("saint_lucia", "Saint Lucia"), ("south_korea", "South Korea"), ("new_zealand", "New Zealand")]:
+    check("display name: %s -> %s" % (slug, name), g.canonical_name(slug) == name)
+check("display overrides never rename a core country", not (set(g.DISPLAY_NAMES) & set(g._CORE_NAME_BY_SLUG)))
+# The six slugs the first real plan could not place.
+for slug, shard in [("burundi", "africa"), ("djibouti", "africa"), ("equatorial_guinea", "africa"),
+                    ("mauritania", "africa"), ("saint_lucia", "americas"), ("trinidad_tobago", "americas")]:
+    check("%s is mapped, to %s" % (slug, shard), g.shard_of(slug) == (shard, True))
+check("Papua New Guinea is not flagged as Guinea", g.flagged_as("papua_new_guinea") is None)
+check("Equatorial Guinea is not flagged as Guinea", g.flagged_as("equatorial_guinea") is None)
+check("Guinea itself is still flagged", g.flagged_as("guinea") is not None)
 check("'of'/'and' stay lower-case in derived names", g.canonical_name("bosnia_and_herzegovina") == "Bosnia and Herzegovina")
 check("the 13 core names are never produced for another country",
       all(g.canonical_name(s) == n for n, s in g.CORE_COUNTRIES.items()))
