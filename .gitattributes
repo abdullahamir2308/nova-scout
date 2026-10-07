@@ -1,0 +1,26 @@
+# Line endings.
+#
+# This clone has core.autocrlf=true, which is the right default for a Windows
+# checkout: text files are stored LF in the repo and converted to CRLF on the
+# way out. One file is not that shape, and it caused a merge conflict nobody
+# had earned (2026-10-07).
+#
+# data/ichgcp_leads.csv is written by scraper/scrape_ichgcp.py through Python's
+# csv.writer, whose default line terminator is CRLF (RFC 4180). So the blob in
+# the repo genuinely contains CRLF. With autocrlf on, git then cleans the
+# working-tree CRLF back to LF to compare it against a blob that has CRLF --
+# and reports the file modified when nobody has touched it. That is the source
+# of the endless "LF will be replaced by CRLF the next time Git touches it"
+# warnings, and when the GitHub Action commits a new version of the same file,
+# the phantom local change has a real remote change to conflict with.
+#
+# `-text` means: no end-of-line conversion either way. Store the bytes the
+# scraper wrote, hand back the bytes that are stored, and let the file compare
+# equal to itself.
+data/*.csv -text
+
+# The same reasoning, pre-emptively, for everything else whose bytes matter as
+# bytes rather than as text: a diff of these is not useful and a normalised
+# copy is not equivalent.
+*.docx binary
+*.pyc binary
