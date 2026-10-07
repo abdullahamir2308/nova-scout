@@ -21,7 +21,8 @@ parsed out of the Master Ref and asserted here rather than retyped:
     Section 3   drafting model and effort     -> the follow-up composition request
     Skill §8    follow-up lengths             -> code_followup.js + code_followup_assemble.js + the prompt
     Skill §3    claim rules                   -> Assemble Follow-Up embeds drafting's code_assemble.js rules
-    Section 12  geographies                   -> COUNTRY_CLOCKS keys (a country with no clock cannot ship)
+    Section 12  business-hours clocks         -> COUNTRY_CLOCKS (a country with no clock cannot ship)
+    Section 12  geographies + index snapshot  -> every country the scraper includes has a clock
     Section 6   LinkedIn is manual            -> every send query filters channel='email'
     Section 8   outreach_log / drafts columns -> what the INSERTs may touch
     Section 8   lead status values (LOCKED)   -> every status the SQL writes
@@ -285,6 +286,68 @@ def load_geographies(doc):
     return [g.strip().rstrip(".") for g in m.group(1).split(",") if g.strip()]
 
 
+# Section 12, "Business-hours clocks": one row per included country. The row is
+# the clock -- offset and weekend both -- so a wrong number in either place is a
+# build failure, not a send that quietly lands out of hours.
+_DAY_INDEX = {"Sun": 0, "Mon": 1, "Tue": 2, "Wed": 3, "Thu": 4, "Fri": 5, "Sat": 6}
+
+
+def load_country_clocks(doc):
+    anchor = re.search(r"\*\*Business-hours clocks[^\n]*\*\*", doc)
+    if not anchor:
+        raise AssertionError(
+            "Section 12 'Business-hours clocks' heading not found in %s" % MASTER_REF)
+    table = re.search(
+        r"\n\| Country \| Standard offset \| Weekend \| Tier \|\r?\n\|[-|]+\|\r?\n(.*?)(?:\r?\n\r?\n|\Z)",
+        doc[anchor.end():], re.S)
+    if not table:
+        raise AssertionError(
+            "no clock table follows the 'Business-hours clocks' heading in %s" % MASTER_REF)
+    clocks, core = {}, []
+    for line in table.group(1).splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) != 4:
+            raise AssertionError("clock row %r does not have 4 cells in %s" % (line, MASTER_REF))
+        name, offset, weekend, tier = cells
+        mo = re.match(r"^UTC([+-])(\d{1,2}):(\d{2})$", offset)
+        if not mo:
+            raise AssertionError("clock row %r has an unreadable offset %r" % (name, offset))
+        minutes = int(mo.group(2)) * 60 + int(mo.group(3))
+        if mo.group(1) == "-":
+            minutes = -minutes
+        days = []
+        for d in weekend.split("-"):
+            if d not in _DAY_INDEX:
+                raise AssertionError("clock row %r has an unreadable weekend day %r" % (name, d))
+            days.append(_DAY_INDEX[d])
+        if not days:
+            raise AssertionError("clock row %r has no weekend" % name)
+        if name in clocks:
+            raise AssertionError("clock row %r is listed twice in %s" % (name, MASTER_REF))
+        clocks[name] = {"utc_offset_min": minutes, "weekend": days}
+        if tier == "core":
+            core.append(name)
+    return clocks, core
+
+
+def load_index_countries():
+    """The /cro-list index as the scraper last read it (scraper/index_slugs.json),
+    classified by the scraper's own geography module, as the display names that
+    land in leads.country. Committed precisely so this question -- does every
+    country the pipeline can ingest have a clock? -- is answerable offline:
+    ichgcp.net 403s the dev machine, so nothing here may ask it."""
+    root = os.path.abspath(os.environ.get(
+        "NOVASCOUT_SCRAPER_ROOT", os.path.join(HERE, "..", "..")))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from scraper import geography as geo
+
+    with io.open(os.path.join(root, "scraper", "index_slugs.json"), encoding="utf-8") as fh:
+        snap = json.load(fh)
+    included = [s for s in snap["slugs"] if not geo.excluded_as(s)]
+    return sorted({geo.canonical_name(s) for s in included}), snap
+
+
 def load_lead_statuses(doc):
     m = re.search(r"\*\*Lead status values \(LOCKED\):\*\*\s*\n`([^`]+)`", doc)
     if not m:
@@ -352,6 +415,8 @@ MAX_URLS = load_url_cap(DOC)
 OPT_OUT_KEYWORDS = load_opt_out_keywords(DOC)
 FOLLOW_UP_DAYS, MAX_FOLLOW_UPS = load_follow_up(DOC)
 GEOGRAPHIES = load_geographies(DOC)
+COUNTRY_CLOCKS, CLOCK_CORE = load_country_clocks(DOC)
+INDEX_COUNTRIES, INDEX_SNAPSHOT = load_index_countries()
 LEAD_STATUSES = load_lead_statuses(DOC)
 OUTREACH_COLUMNS = load_columns(DOC, "outreach_log")
 DRAFTS_COLUMNS = load_columns(DOC, "drafts")
@@ -416,11 +481,50 @@ def _assert_decide_matches_spec():
         "the sender clock drifted: docker-compose says %s (%+d min), code_decide.js says %+d min. "
         "The warm-up ceiling counts the sender's day." % (SENDER_ZONE, SENDER_OFFSET, found))
 
-    countries = re.findall(r"^\s*'([^']+)':\s*\{\s*utc_offset_min", _js_block(src, "COUNTRY_CLOCKS", "code_decide.js"), re.M)
-    assert sorted(countries) == sorted(GEOGRAPHIES), (
-        "COUNTRY_CLOCKS is not Section 12's geography list. A lead in a country with no clock "
-        "can never be placed in business hours:\n  doc: %r\n  js:  %r" % (sorted(GEOGRAPHIES), sorted(countries)))
+    # --- Section 12's business-hours clocks, row for row ---------------------
+    #
+    # Not just the keys any more. Since 2026-10-07 the table holds every country
+    # the scraper includes, and the doc's table carries each one's offset and
+    # weekend, so both numbers are checked here: a country with no clock can
+    # never be placed in business hours, and a country with the WRONG clock
+    # sends out of hours without anything failing.
+    block = _js_block(src, "COUNTRY_CLOCKS", "code_decide.js")
+    js_clocks = {}
+    for mo in re.finditer(
+        r"""^\s*(?:'([^']+)'|"([^"]+)"):\s*\{\s*utc_offset_min:\s*(-?\d+),\s*weekend:\s*\[([0-9,\s]+)\]\s*\},?\s*$""",
+        block, re.M,
+    ):
+        name = mo.group(1) if mo.group(1) is not None else mo.group(2)
+        js_clocks[name] = {
+            "utc_offset_min": int(mo.group(3)),
+            "weekend": [int(d) for d in mo.group(4).replace(" ", "").split(",") if d != ""],
+        }
+    entries = len([ln for ln in block.splitlines() if "utc_offset_min" in ln])
+    assert len(js_clocks) == entries, (
+        "code_decide.js has %d COUNTRY_CLOCKS entries but only %d parsed -- a row is not in the "
+        "one shape the build reads (\"Name\": { utc_offset_min: N, weekend: [..] },)" % (entries, len(js_clocks)))
+    assert js_clocks == COUNTRY_CLOCKS, (
+        "COUNTRY_CLOCKS is not Section 12's 'Business-hours clocks' table. A country with no clock "
+        "can never be placed in business hours, and a wrong offset sends out of hours silently:\n"
+        "  only in the doc: %r\n  only in the js:  %r\n  differing rows:  %r"
+        % (sorted(set(COUNTRY_CLOCKS) - set(js_clocks)),
+           sorted(set(js_clocks) - set(COUNTRY_CLOCKS)),
+           sorted(n for n in set(js_clocks) & set(COUNTRY_CLOCKS) if js_clocks[n] != COUNTRY_CLOCKS[n])))
 
+    # The core 13 are the same list in both of Section 12's places.
+    assert sorted(CLOCK_CORE) == sorted(GEOGRAPHIES), (
+        "Section 12's clock table marks a different set of countries 'core' than its "
+        "\"Geographies:\" line:\n  Geographies: %r\n  tier=core:   %r"
+        % (sorted(GEOGRAPHIES), sorted(CLOCK_CORE)))
+
+    # And the whole point: every country this pipeline can ingest has a clock.
+    # INDEX_COUNTRIES is scraper/index_slugs.json run through the scraper's own
+    # geography module, so it is the same names the CSV and leads.country carry.
+    missing = [c for c in INDEX_COUNTRIES if c not in COUNTRY_CLOCKS]
+    assert not missing, (
+        "%d countries the scraper includes have no business-hours clock, so their leads can be "
+        "scored, drafted and approved and then never sent: %r. Add each to Section 12's clock "
+        "table and to code_decide.js." % (len(missing), missing))
 
 def _assert_classify_matches_spec():
     src = js("code_classify_reply.js")
@@ -1679,7 +1783,7 @@ DIGEST_JS = bake("code_digest.js", SENDER_ZONE=SENDER_ZONE, SENDER_OFFSET=SENDER
 # drafting's approval_chain.py, so both workflows carry the same nodes.
 sys.path.insert(0, DRAFTING_DIR)
 import approval_chain  # noqa: E402
-APPROVAL = approval_chain.load(DRAFTING_DIR)
+APPROVAL = approval_chain.load(DRAFTING_DIR, sorted(COUNTRY_CLOCKS))
 APPROVAL_JS = APPROVAL["gate"]
 APPROVAL_RULES = APPROVAL["rules"]
 _check_model = re.search(r"^const CHECK_MODEL = '([a-z0-9-]+)';", APPROVAL_RULES, re.M)
@@ -2211,6 +2315,17 @@ for _nodes in (send_nodes, mailwatch_nodes, followup_nodes, health_nodes, digest
         if _n["type"] == "n8n-nodes-base.scheduleTrigger":
             for _iv in _n["parameters"]["rule"]["interval"]:
                 _field = _iv.get("field")
+                # Added 2026-10-07: a FIXED SLOT is the other half of this. An
+                # interval of 1 passes the clock-value test above, but
+                # `days`/1 + triggerAtHour compiles to one cron a day at that
+                # hour and nothing else -- which is how Ingestion came to fire
+                # at 23:00 PKT on a laptop that is off at night, and mostly
+                # never fired at all (Section 7's idempotency rule).
+                for _pin in ("triggerAtHour", "triggerAtDay", "triggerAtDayOfMonth", "triggerAtMinute"):
+                    assert _pin not in _iv, (
+                        "%s: schedule %r pins %s, so it has one moment a day (or a week) to fire in. "
+                        "The host is off at night; Section 7: 'No workflow may assume its schedule "
+                        "fired.'" % (_n["name"], _iv, _pin))
                 _ok = not (_field in ("hours", "days", "weeks") and int(_iv.get(_field + "Interval", 1)) > 1)
                 assert _ok, (
                     "%s: schedule %r enters n8n's recurrenceCheck on a clock value (hour of day, day of year), "
@@ -2459,7 +2574,8 @@ for _file, _wf in VARIANTS:
 print("  warm-up (Section 5): %s" % ", ".join("week %d%s=%d/day" % (w, "+" if i == len(WARMUP) - 1 else "", n)
                                             for i, (w, n) in enumerate(WARMUP)))
 print("  sender clock: %s (%+d min) -- the day the ceiling counts" % (SENDER_ZONE, SENDER_OFFSET))
-print("  geographies with a business-hours clock: %d (Section 12)" % len(GEOGRAPHIES))
+print("  business-hours clocks (Section 12): %d countries -- %d core, %d extended; every one of the %d the index snapshot includes has one"
+      % (len(COUNTRY_CLOCKS), len(CLOCK_CORE), len(COUNTRY_CLOCKS) - len(CLOCK_CORE), len(INDEX_COUNTRIES)))
 print("  opt-out keywords (Sections 5+9): %r" % OPT_OUT_KEYWORDS)
 print("  follow-ups (Section 9): after %d days, maximum %d; composed by %s (effort %s) under drafting's rules, "
       "#1 %d-%d words, #2 at most %d (skill section 8)" % (FOLLOW_UP_DAYS, MAX_FOLLOW_UPS, DRAFT_MODEL, DRAFT_EFFORT,

@@ -135,12 +135,36 @@ const SYSTEM_PROMPT = __SYSTEM_PROMPT__;
 // testable, and keeps a `}}` in the schema from ending the expression early.
 const CLAUDE_REQUEST = __CLAUDE_REQUEST__;
 
+// Section 12's business-hours clocks, as a list of country names, substituted
+// at build time from the doc's own table -- the same table code_decide.js's
+// COUNTRY_CLOCKS is checked against, so this cannot drift from what Send can
+// actually place in business hours.
+//
+// Why drafting cares about a send-side table: a lead whose country has no clock
+// is refused by Send for ever (`unknown-country`). Before 2026-10-07 the table
+// held the core 13 only, so an extended-country lead was looked up, drafted,
+// claim-checked and auto-approved -- real API spend -- for an email that could
+// never go out. Two had already got that far (498 Austria, 492 Armenia). The
+// clock table now covers all 133 included countries, so this guard is the net
+// under it: a country the directory starts listing before anyone adds its
+// clock, or a lead imported by hand from an excluded jurisdiction, is stopped
+// here instead of being discovered months later in the pending queue.
+const SEND_CLOCK_COUNTRIES = __SEND_CLOCK_COUNTRIES__;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 function str(v) {
   return v === null || v === undefined ? '' : String(v).trim();
+}
+
+// Section 12's clock table, case-insensitively -- the same way code_decide.js
+// looks it up, so this guard and Send can never disagree about one lead.
+const SEND_CLOCK_KEYS = SEND_CLOCK_COUNTRIES.map(function (c) { return String(c).toLowerCase(); });
+
+function hasSendClock(country) {
+  return SEND_CLOCK_KEYS.indexOf(str(country).toLowerCase()) !== -1;
 }
 
 // Diacritic-insensitive lowercase. 'Janos Biro' -> 'janos biro', so a local-part
@@ -301,6 +325,33 @@ const base = {
   country: lead.country,
   fit_score: lead.fit_score,
 };
+
+// --- Can this lead ever be sent to? ---------------------------------------
+//
+// First, before the ClinicalTrials.gov answer is even read, because this is the
+// one skip that must not be retried: no model call, no claim check, and no
+// place in the next tick's batch either. A lead with no business-hours clock
+// cannot be sent to at all (Section 12), so it takes the no-API branch and
+// Build Low-Context Drafts records why -- which advances it to 'drafted' and
+// gets it out of the queue, exactly as a low-context note does, for exactly the
+// same reason: a lead that writes no row is re-picked by every tick and starves
+// the leads behind it.
+if (!hasSendClock(lead.country)) {
+  return {
+    json: Object.assign({}, base, {
+      ok: true,
+      groundable: false,
+      no_send_clock: true,
+      // The addressing modes are still recorded -- they tell a reviewer whether
+      // a hand-written email to this lead would have anywhere to go.
+      email_addressing: lead.email ? 'addressed' : 'unaddressed',
+      linkedin_addressing: lead.linkedin_url ? 'addressed' : 'unaddressed',
+      fact_count: 0,
+      fact_kinds: [],
+      missing_facts: [],
+    }),
+  };
+}
 
 // --- Did ClinicalTrials.gov answer? ----------------------------------------
 //

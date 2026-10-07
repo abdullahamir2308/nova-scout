@@ -42,32 +42,196 @@ const MAX_FOLLOW_UPS = 2;
 const SENDER_UTC_OFFSET_MIN = 300;
 
 // Section 5: "within the recipient's business hours". The recipient's, not the
-// sender's -- leads span every Section 12 geography, UTC-6 to UTC+5:30.
+// sender's -- leads span every country ichgcp.net lists, UTC-6 to UTC+12.
 //
 // Approximate on purpose: fixed standard-time offsets, no DST (the operator's
 // call, 2026-09-14 -- at 5-20 sends/day an hour of drift is not worth a tz
-// database). The countries that do shift (Poland, Czech Republic, Hungary,
-// Romania, Egypt) run one hour LATER than this table in summer, so a send the
-// table places at 16:30 lands at 17:30 local. Egypt's working week is
-// Sunday-Thursday; everyone else here works Monday-Friday.
+// database, and n8n's Code sandbox has no module that would give us one). A
+// country that observes summer time runs one hour LATER than this table for
+// part of the year, so a send the table places at 16:30 lands at 17:30 local:
+// Europe, North America, the southern-hemisphere countries in their own summer
+// (Chile, New Zealand, south-east Australia), and Israel, Lebanon and
+// Morocco. Paraguay and Jordan are NOT on that list: both abolished summer
+// time and sit permanently on one offset (Paraguay UTC-3 since October 2024,
+// Jordan UTC+3 since 2022, Mexico 2022, Brazil 2019, Turkey 2016), which is
+// what this table carries. Egypt IS on the list -- it brought summer time back
+// in 2023. Morocco drifts the other way: permanently UTC+1, stepping back to
+// UTC+0 for Ramadan, so the window lands an hour EARLY that month. It never sends before 09:00 local, and never on a
+// weekend.
 //
-// Keys must be exactly Section 12's geography list -- the build refuses
-// otherwise, so a new target country cannot ship without a clock.
+// `weekend` is each country's statutory weekend, 0=Sunday .. 6=Saturday:
+// Friday-Saturday across the Gulf and most of the Arab world plus Israel,
+// Bangladesh, Algeria, Djibouti and Mauritania; Saturday alone in Nepal;
+// Saturday-Sunday everywhere else -- the UAE included, since 2022.
+//
+// Keys are the 133 countries of Section 12's "Business-hours clocks" table,
+// which is every country the scraper includes: the core 13 at their locked
+// spelling plus canonical_name(slug) for the rest, so the clock is found by the
+// same string leads.country carries. The build refuses to generate if this
+// table and the doc's disagree, so a country cannot ship without a clock -- and
+// a lead whose country has none is stopped at Assess Grounding and the Approval
+// Gate before any model call, not only here (Section 12).
 const COUNTRY_CLOCKS = {
-  'Turkey':         { utc_offset_min: 180,  weekend: [6, 0] },
-  'Mexico':         { utc_offset_min: -360, weekend: [6, 0] },
-  'India':          { utc_offset_min: 330,  weekend: [6, 0] },
-  'Pakistan':       { utc_offset_min: 300,  weekend: [6, 0] },
-  'Egypt':          { utc_offset_min: 120,  weekend: [5, 6] },
-  'Poland':         { utc_offset_min: 60,   weekend: [6, 0] },
-  'Romania':        { utc_offset_min: 120,  weekend: [6, 0] },
-  'Hungary':        { utc_offset_min: 60,   weekend: [6, 0] },
-  'Czech Republic': { utc_offset_min: 60,   weekend: [6, 0] },
-  'UAE':            { utc_offset_min: 240,  weekend: [6, 0] },
-  'South Africa':   { utc_offset_min: 120,  weekend: [6, 0] },
-  'Brazil':         { utc_offset_min: -180, weekend: [6, 0] },
-  'Argentina':      { utc_offset_min: -180, weekend: [6, 0] },
+  // --- the core 13 (Section 12 "Geographies"); values unchanged since 2026-09-14
+  'Turkey':                  { utc_offset_min: 180,  weekend: [6, 0] },
+  'Mexico':                  { utc_offset_min: -360, weekend: [6, 0] },
+  'India':                   { utc_offset_min: 330,  weekend: [6, 0] },
+  'Pakistan':                { utc_offset_min: 300,  weekend: [6, 0] },
+  'Egypt':                   { utc_offset_min: 120,  weekend: [5, 6] },
+  'Poland':                  { utc_offset_min: 60,   weekend: [6, 0] },
+  'Romania':                 { utc_offset_min: 120,  weekend: [6, 0] },
+  'Hungary':                 { utc_offset_min: 60,   weekend: [6, 0] },
+  'Czech Republic':          { utc_offset_min: 60,   weekend: [6, 0] },
+  'UAE':                     { utc_offset_min: 240,  weekend: [6, 0] },
+  'South Africa':            { utc_offset_min: 120,  weekend: [6, 0] },
+  'Brazil':                  { utc_offset_min: -180, weekend: [6, 0] },
+  'Argentina':               { utc_offset_min: -180, weekend: [6, 0] },
+
+  // --- Europe
+  'Albania':                 { utc_offset_min: 60,   weekend: [6, 0] },
+  'Armenia':                 { utc_offset_min: 240,  weekend: [6, 0] },
+  'Austria':                 { utc_offset_min: 60,   weekend: [6, 0] },
+  'Azerbaijan':              { utc_offset_min: 240,  weekend: [6, 0] },
+  'Belgium':                 { utc_offset_min: 60,   weekend: [6, 0] },
+  'Bosnia and Herzegovina':  { utc_offset_min: 60,   weekend: [6, 0] },
+  'Bulgaria':                { utc_offset_min: 120,  weekend: [6, 0] },
+  'Croatia':                 { utc_offset_min: 60,   weekend: [6, 0] },
+  'Cyprus':                  { utc_offset_min: 120,  weekend: [6, 0] },
+  'Denmark':                 { utc_offset_min: 60,   weekend: [6, 0] },
+  'Estonia':                 { utc_offset_min: 120,  weekend: [6, 0] },
+  'Finland':                 { utc_offset_min: 120,  weekend: [6, 0] },
+  'France':                  { utc_offset_min: 60,   weekend: [6, 0] },
+  'Georgia':                 { utc_offset_min: 240,  weekend: [6, 0] },
+  'Germany':                 { utc_offset_min: 60,   weekend: [6, 0] },
+  'Greece':                  { utc_offset_min: 120,  weekend: [6, 0] },
+  'Ireland':                 { utc_offset_min: 0,    weekend: [6, 0] },
+  'Italy':                   { utc_offset_min: 60,   weekend: [6, 0] },
+  'Kosovo':                  { utc_offset_min: 60,   weekend: [6, 0] },
+  'Latvia':                  { utc_offset_min: 120,  weekend: [6, 0] },
+  'Lithuania':               { utc_offset_min: 120,  weekend: [6, 0] },
+  'Luxembourg':              { utc_offset_min: 60,   weekend: [6, 0] },
+  'Macedonia':               { utc_offset_min: 60,   weekend: [6, 0] },
+  'Malta':                   { utc_offset_min: 60,   weekend: [6, 0] },
+  'Moldova':                 { utc_offset_min: 120,  weekend: [6, 0] },
+  'Montenegro':              { utc_offset_min: 60,   weekend: [6, 0] },
+  'Netherlands':             { utc_offset_min: 60,   weekend: [6, 0] },
+  'Norway':                  { utc_offset_min: 60,   weekend: [6, 0] },
+  'Portugal':                { utc_offset_min: 0,    weekend: [6, 0] },
+  'Serbia':                  { utc_offset_min: 60,   weekend: [6, 0] },
+  'Slovakia':                { utc_offset_min: 60,   weekend: [6, 0] },
+  'Slovenia':                { utc_offset_min: 60,   weekend: [6, 0] },
+  'Spain':                   { utc_offset_min: 60,   weekend: [6, 0] },
+  'Sweden':                  { utc_offset_min: 60,   weekend: [6, 0] },
+  'Switzerland':             { utc_offset_min: 60,   weekend: [6, 0] },
+  'Ukraine':                 { utc_offset_min: 120,  weekend: [6, 0] },
+  'United Kingdom':          { utc_offset_min: 0,    weekend: [6, 0] },
+
+  // --- the Americas
+  'Bahamas':                 { utc_offset_min: -300, weekend: [6, 0] },
+  'Canada':                  { utc_offset_min: -300, weekend: [6, 0] },
+  'Chile':                   { utc_offset_min: -240, weekend: [6, 0] },
+  'Colombia':                { utc_offset_min: -300, weekend: [6, 0] },
+  'Costa Rica':              { utc_offset_min: -360, weekend: [6, 0] },
+  'Dominican Republic':      { utc_offset_min: -240, weekend: [6, 0] },
+  'Ecuador':                 { utc_offset_min: -300, weekend: [6, 0] },
+  'El Salvador':             { utc_offset_min: -360, weekend: [6, 0] },
+  'Guatemala':               { utc_offset_min: -360, weekend: [6, 0] },
+  'Jamaica':                 { utc_offset_min: -300, weekend: [6, 0] },
+  'Panama':                  { utc_offset_min: -300, weekend: [6, 0] },
+  'Paraguay':                { utc_offset_min: -180, weekend: [6, 0] },
+  'Peru':                    { utc_offset_min: -300, weekend: [6, 0] },
+  'Saint Lucia':             { utc_offset_min: -240, weekend: [6, 0] },
+  'Suriname':                { utc_offset_min: -180, weekend: [6, 0] },
+  'Trinidad and Tobago':     { utc_offset_min: -240, weekend: [6, 0] },
+  'USA':                     { utc_offset_min: -300, weekend: [6, 0] },
+  'Uruguay':                 { utc_offset_min: -180, weekend: [6, 0] },
+
+  // --- Asia-Pacific
+  'Australia':               { utc_offset_min: 600,  weekend: [6, 0] },
+  'Bangladesh':              { utc_offset_min: 360,  weekend: [5, 6] },
+  'Cambodia':                { utc_offset_min: 420,  weekend: [6, 0] },
+  'China':                   { utc_offset_min: 480,  weekend: [6, 0] },
+  'Hong Kong':               { utc_offset_min: 480,  weekend: [6, 0] },
+  'Indonesia':               { utc_offset_min: 420,  weekend: [6, 0] },
+  'Japan':                   { utc_offset_min: 540,  weekend: [6, 0] },
+  'Kazakhstan':              { utc_offset_min: 300,  weekend: [6, 0] },
+  'Kyrgyzstan':              { utc_offset_min: 360,  weekend: [6, 0] },
+  'Malaysia':                { utc_offset_min: 480,  weekend: [6, 0] },
+  'Mongolia':                { utc_offset_min: 480,  weekend: [6, 0] },
+  'Nepal':                   { utc_offset_min: 345,  weekend: [6] },
+  'New Zealand':             { utc_offset_min: 720,  weekend: [6, 0] },
+  'Papua New Guinea':        { utc_offset_min: 600,  weekend: [6, 0] },
+  'Philippines':             { utc_offset_min: 480,  weekend: [6, 0] },
+  'Singapore':               { utc_offset_min: 480,  weekend: [6, 0] },
+  'South Korea':             { utc_offset_min: 540,  weekend: [6, 0] },
+  'Sri Lanka':               { utc_offset_min: 330,  weekend: [6, 0] },
+  'Taiwan':                  { utc_offset_min: 480,  weekend: [6, 0] },
+  'Thailand':                { utc_offset_min: 420,  weekend: [6, 0] },
+  'Turkmenistan':            { utc_offset_min: 300,  weekend: [6, 0] },
+  'Uzbekistan':              { utc_offset_min: 300,  weekend: [6, 0] },
+  'Vietnam':                 { utc_offset_min: 420,  weekend: [6, 0] },
+
+  // --- the Middle East and North Africa
+  'Algeria':                 { utc_offset_min: 60,   weekend: [5, 6] },
+  'Bahrain':                 { utc_offset_min: 180,  weekend: [5, 6] },
+  'Israel':                  { utc_offset_min: 120,  weekend: [5, 6] },
+  'Jordan':                  { utc_offset_min: 180,  weekend: [5, 6] },
+  'Kuwait':                  { utc_offset_min: 180,  weekend: [5, 6] },
+  'Lebanon':                 { utc_offset_min: 120,  weekend: [6, 0] },
+  'Morocco':                 { utc_offset_min: 60,   weekend: [6, 0] },
+  'Oman':                    { utc_offset_min: 240,  weekend: [5, 6] },
+  'Qatar':                   { utc_offset_min: 180,  weekend: [5, 6] },
+  'Saudi Arabia':            { utc_offset_min: 180,  weekend: [5, 6] },
+  'Tunisia':                 { utc_offset_min: 60,   weekend: [6, 0] },
+
+  // --- sub-Saharan Africa
+  'Angola':                  { utc_offset_min: 60,   weekend: [6, 0] },
+  'Benin':                   { utc_offset_min: 60,   weekend: [6, 0] },
+  'Burkina Faso':            { utc_offset_min: 0,    weekend: [6, 0] },
+  'Burundi':                 { utc_offset_min: 120,  weekend: [6, 0] },
+  'Cameroon':                { utc_offset_min: 60,   weekend: [6, 0] },
+  'Congo':                   { utc_offset_min: 60,   weekend: [6, 0] },
+  "Cote d'Ivoire":           { utc_offset_min: 0,    weekend: [6, 0] },
+  'DR Congo':                { utc_offset_min: 60,   weekend: [6, 0] },
+  'Djibouti':                { utc_offset_min: 180,  weekend: [5, 6] },
+  'Equatorial Guinea':       { utc_offset_min: 60,   weekend: [6, 0] },
+  'Ethiopia':                { utc_offset_min: 180,  weekend: [6, 0] },
+  'Gabon':                   { utc_offset_min: 60,   weekend: [6, 0] },
+  'Gambia':                  { utc_offset_min: 0,    weekend: [6, 0] },
+  'Ghana':                   { utc_offset_min: 0,    weekend: [6, 0] },
+  'Guinea':                  { utc_offset_min: 0,    weekend: [6, 0] },
+  'Kenya':                   { utc_offset_min: 180,  weekend: [6, 0] },
+  'Liberia':                 { utc_offset_min: 0,    weekend: [6, 0] },
+  'Madagascar':              { utc_offset_min: 180,  weekend: [6, 0] },
+  'Malawi':                  { utc_offset_min: 120,  weekend: [6, 0] },
+  'Mali':                    { utc_offset_min: 0,    weekend: [6, 0] },
+  'Mauritania':              { utc_offset_min: 0,    weekend: [5, 6] },
+  'Mauritius':               { utc_offset_min: 240,  weekend: [6, 0] },
+  'Mozambique':              { utc_offset_min: 120,  weekend: [6, 0] },
+  'Nigeria':                 { utc_offset_min: 60,   weekend: [6, 0] },
+  'Rwanda':                  { utc_offset_min: 120,  weekend: [6, 0] },
+  'Senegal':                 { utc_offset_min: 0,    weekend: [6, 0] },
+  'Tanzania':                { utc_offset_min: 180,  weekend: [6, 0] },
+  'Togo':                    { utc_offset_min: 0,    weekend: [6, 0] },
+  'Uganda':                  { utc_offset_min: 180,  weekend: [6, 0] },
+  'Zambia':                  { utc_offset_min: 120,  weekend: [6, 0] },
+  'Zimbabwe':                { utc_offset_min: 120,  weekend: [6, 0] },
 };
+
+// Looked up case-insensitively. leads.country is written canonically by the
+// scraper, so case never varies in practice -- but a lead imported by hand and
+// typed "poland" would otherwise be refused as unknown-country with a clock
+// sitting right there, and the drafting guard (code_assess.js, code_approval.js)
+// and the claims library's proof matching both already ignore case. All three
+// agreeing matters more than strictness here.
+const CLOCK_BY_KEY = {};
+Object.keys(COUNTRY_CLOCKS).forEach(function (name) {
+  CLOCK_BY_KEY[name.toLowerCase()] = COUNTRY_CLOCKS[name];
+});
+
+function clockFor(country) {
+  return CLOCK_BY_KEY[str(country).toLowerCase()] || null;
+}
 
 // Local business hours, minutes after local midnight, half-open [start, end).
 const BUSINESS_START_MIN = 9 * 60;
@@ -178,7 +342,7 @@ function warmupState(state, clock) {
 
 // Local wall-clock for a country at instant t, and whether it is business time.
 function localClock(country, t) {
-  const zone = COUNTRY_CLOCKS[str(country)];
+  const zone = clockFor(country);
   if (!zone) return null;
   const local = new Date(t + zone.utc_offset_min * MS_MIN);
   const minutes = local.getUTCHours() * 60 + local.getUTCMinutes();
@@ -231,7 +395,7 @@ function ineligibility(c) {
   if (body.indexOf(OPT_OUT) === -1) return 'no-opt-out';
   if (body.indexOf(OPT_OUT + '\n\n' + SIGNATURE) === -1) return 'stale-signature';
   if (countUrls(body) > MAX_URLS) return 'too-many-urls';
-  if (!COUNTRY_CLOCKS[str(c.country)]) return 'unknown-country:' + str(c.country);
+  if (!clockFor(c.country)) return 'unknown-country:' + str(c.country);
   return null;
 }
 

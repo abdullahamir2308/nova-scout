@@ -86,6 +86,10 @@ return {
         'tier-' + pick.match_tier + ' title; email_status=' + (status || 'none') +
         '; ' + pick.candidates_in_role + ' of ' + pick.candidates_considered +
         ' indexed people were in an ICP role at this domain',
+      // No attempt to record: Apollo answered and found somebody. null makes
+      // Write Contact & Advance delete any earlier record, so a lead that was
+      // in needs_manual_contact and has since been reached leaves that queue.
+      attempt: null,
     },
   },
 };

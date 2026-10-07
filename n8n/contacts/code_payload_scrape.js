@@ -35,6 +35,10 @@ return {
       // At least one reachable channel, so Workflow 4 has something to draft to.
       advance: hasChannel,
       note: r.evidence || null,
+      // No attempt to record: this lead was reached for free. null makes Write
+      // Contact & Advance delete any earlier record, so a lead that was once in
+      // needs_manual_contact and has since been reached leaves that queue.
+      attempt: null,
     },
   },
 };

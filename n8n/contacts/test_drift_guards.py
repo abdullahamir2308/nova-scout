@@ -270,6 +270,117 @@ case(
     expect_in="expected exactly one .csv fetch",
 )
 
+# --- the starvation fix (migration 015) -------------------------------------
+#
+# The guards that matter most here are the ones that keep the queue moving. A
+# lead Apollo will never answer for has to LEAVE the queue; if it does not, it
+# occupies a slot in every batch of 10 for ever and new leads are never reached.
+# Nine leads were in exactly that state on 2026-10-07.
+case(
+    "the batch query stops excluding retired leads -> build refuses",
+    mutate_js=lambda s: s.replace("FROM contact_attempts a", "FROM contacts a", 1),
+    js_file="build_workflow.py",
+    expect_in="occupies a slot in every batch",
+)
+case(
+    "the queue keeps the flag but drops the attempt count -> build refuses",
+    mutate_js=lambda s: s.replace("OR a.attempts >= $3", "", 1),
+    js_file="build_workflow.py",
+    expect_in="cannot be defeated by an unfamiliar error shape",
+)
+case(
+    "a permanent refusal stops being told apart from a transient one -> build refuses",
+    mutate_js=lambda s: s.replace("isPlanGate", "planGateCheck"),
+    expect_in="isPlanGate",
+)
+case(
+    "the refusal branch stops recording the attempt -> build refuses",
+    mutate_js=lambda s: s.replace("attempt_row: {", "unused_row: {", 1),
+    expect_in="attempt_row",
+)
+case(
+    "a reached lead stops clearing its earlier record -> build refuses",
+    mutate_js=lambda s: s.replace("attempt: null,", "", 1),
+    js_file="code_payload_scrape.js",
+    expect_in="waiting for a human",
+)
+case(
+    "the write statement stops recording the tombstone's attempt -> build refuses",
+    mutate_js=lambda s: s.replace("p->'attempt'->>'outcome'", "p->>'outcome'", 1),
+    js_file="build_workflow.py",
+    expect_in="one statement",
+)
+case(
+    "'exhausted' stops being sticky, so a blip could re-queue a retired lead -> build refuses",
+    mutate_js=lambda s: s.replace("ELSE EXCLUDED.last_outcome END," + chr(10) + "  detail",
+                                  "ELSE 'refused' END," + chr(10) + "  detail", 1),
+    js_file="build_workflow.py",
+    expect_in="sticky",
+)
+
+# --- the site-published source ----------------------------------------------
+case(
+    "the same-domain rule disappears -> build refuses",
+    mutate_js=lambda s: s.replace("onOwnDomain", "anyDomain"),
+    js_file="code_site_emails.js",
+    expect_in="another company",
+)
+case(
+    "the never-a-contact list disappears -> build refuses",
+    mutate_js=lambda s: s.replace("NEVER", "ALLOWED"),
+    js_file="code_site_emails.js",
+    expect_in="careers@",
+)
+case(
+    "the mailto: half of 'literally on the page' disappears -> build refuses",
+    mutate_js=lambda s: s.replace("MAILTO_RE", "HREF_RE"),
+    js_file="code_site_emails.js",
+    expect_in="literally on the page",
+)
+case(
+    "Resolve Contact stops reading the harvest -> build refuses",
+    mutate_js=lambda s: s.replace("site_email", "unused_email"),
+    js_file="code_resolve.js",
+    expect_in="nothing uses the answer",
+)
+case(
+    "a published address stops being written verified -> build refuses",
+    mutate_js=lambda s: s.replace("""        apollo_id: null,
+        verified: true,
+      },
+      evidence:
+        'email published""", """        apollo_id: null,
+        verified: false,
+      },
+      evidence:
+        'email published""", 1),
+    js_file="code_resolve.js",
+    expect_in="IS confirmed",
+)
+
+# --- the schedule must survive a host that is off at night ------------------
+case(
+    "Contact Lookup moved to 'every 6 hours' -> build refuses (n8n's clock-hour check)",
+    mutate_js=lambda s: s.replace('{"field": "hours", "hoursInterval": 1}',
+                                  '{"field": "hours", "hoursInterval": 6}', 1),
+    js_file="build_workflow.py",
+    expect_in="misses it on a host",
+)
+case(
+    "Contact Lookup moved to a fixed daily slot -> build refuses",
+    mutate_js=lambda s: s.replace('{"field": "hours", "hoursInterval": 1}',
+                                  '{"field": "days", "daysInterval": 1, "triggerAtHour": 23}', 1),
+    js_file="build_workflow.py",
+    expect_in="misses it on a host",
+)
+case(
+    "Contact Lookup pinned to one minute of the hour -> build refuses",
+    mutate_js=lambda s: s.replace('{"field": "hours", "hoursInterval": 1}',
+                                  '{"field": "hours", "hoursInterval": 1, "triggerAtMinute": 30}', 1),
+    js_file="build_workflow.py",
+    expect_in="misses it on a host",
+)
+
 print("Workflow 3b spec-drift guards\n")
 for label in PASSED:
     print("  ok   " + label)

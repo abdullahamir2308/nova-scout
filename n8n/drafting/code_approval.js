@@ -11,7 +11,8 @@
 //
 //   1. settings.auto_approve_email is on          (read at runtime, migration 014)
 //   2. it carries no rule tag                     (nothing after '+' in variant)
-//   3. it is not a low-context note
+//   3. it is not a low-context note, nor a no-send-clock note
+//   3b. its lead's country has a Send business-hours clock (Section 12)
 //   4. every claim code it records is confirmed   (claims_library.confirmed)
 //   5. a second Sonnet 5.5 call compares each product claim with the confirmed
 //      claims and each prospect fact with the enrichment record, and every one
@@ -66,6 +67,19 @@
 const CHECK_MODEL = 'claude-sonnet-5-5';
 const CHECK_EFFORT = 'high';
 const CHECK_MAX_TOKENS = 16000;
+
+// Section 12's business-hours clocks, as a list of country names, substituted
+// at build time from the doc's own table by whichever generator embeds this
+// file -- the same table code_decide.js's COUNTRY_CLOCKS is checked against.
+//
+// Rule 3b. Send refuses an email to a country with no clock for ever
+// (`unknown-country`), so approving one would put a draft in the digest's
+// auto-approved list that can never go out, and pay for a claim check to get
+// there. Assess Grounding already stops such a lead before the drafting call;
+// this is the gate's own copy of that rule, because a follow-up, a redraft
+// under an older build, or a country removed from the table later would all
+// reach here without passing through that branch.
+const SEND_CLOCK_COUNTRIES = __SEND_CLOCK_COUNTRIES__;
 
 // One entry per statement, in the email's order. Every object closes with
 // additionalProperties:false, which structured outputs requires.
@@ -193,6 +207,21 @@ function isLowContext(variant) {
   return /^low-context(\/|$)/.test(apStr(variant));
 }
 
+// The other no-model branch (2026-10-07): a lead whose country has no Send
+// business-hours clock. Its own prefix, so a reviewer is not told "low context"
+// about a lead whose facts were fine.
+function isNoSendClock(variant) {
+  return /^no-send-clock(\/|$)/.test(apStr(variant));
+}
+
+// Section 12's clock table, case-insensitively -- the same way code_decide.js
+// looks it up, so the gate and Send can never disagree about one lead.
+const SEND_CLOCK_KEYS = SEND_CLOCK_COUNTRIES.map(function (c) { return String(c).toLowerCase(); });
+
+function hasSendClock(country) {
+  return SEND_CLOCK_KEYS.indexOf(apStr(country).toLowerCase()) !== -1;
+}
+
 // The drafts an item carries, whichever workflow built it.
 function draftsOf(payload) {
   if (!payload || typeof payload !== 'object') return [];
@@ -218,8 +247,20 @@ function gateReasons(draft, ctx) {
     reasons.push('low-context: a note to a person, not an email to send');
     return reasons;
   }
+  if (isNoSendClock(variant)) {
+    reasons.push('no-send-clock: a note to a person, not an email to send');
+    return reasons;
+  }
   if (!ctx || typeof ctx !== 'object') {
     reasons.push('no-context: the draft arrived without its approval context');
+    return reasons;
+  }
+  const country = apStr(ctx.country);
+  if (!hasSendClock(country)) {
+    // Held, not repaired and never checked: no rewrite can give a country a
+    // business-hours clock, and Send would refuse the email anyway.
+    reasons.push('no-send-clock: ' + (country || '(no country)') +
+      ' has no business-hours clock, so this email can never be sent (Section 12)');
     return reasons;
   }
   if (ctx.auto_approve !== true) reasons.push('auto-approve-off: settings.auto_approve_email is false');

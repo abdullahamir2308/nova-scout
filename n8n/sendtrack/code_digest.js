@@ -35,6 +35,9 @@ function kindOf(variant) {
   const fu = /^follow-up-(\d+)/.exec(v);
   if (fu) return 'follow-up ' + fu[1];
   if (/^low-context/.test(v)) return 'low-context note';
+  // Workflow 4's other no-model branch (2026-10-07): the lead's country has no
+  // Send business-hours clock, so nothing could ever go out to it.
+  if (/^no-send-clock/.test(v)) return 'no-send-clock note';
   return 'first touch';
 }
 

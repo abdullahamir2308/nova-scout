@@ -84,4 +84,40 @@ const node = runOnceForAll(DIGEST, [{ json: ROW }], { Config: [{ json: CFG }] },
 t.check('the node emits exactly one item: Build Digest\'s answer', [node.length, node[0].json.send, node[0].json.subject],
   [1, true, d.subject]);
 
+// --- the host is off at night: the catch-up cases (audited 2026-10-07) ------
+//
+// The digest is the one schedule in the system with a time of day in it, so it
+// is the one worth proving catches up. It does not fire at 08:00; it fires at
+// the first tick AT OR AFTER 08:00 operator time that has not already sent that
+// day, and it covers from where the last digest stopped. A host that comes up
+// at 10:40 still gets that day's digest, and a day it was never up at all folds
+// into the next one rather than vanishing.
+
+t.check(
+  'a host that comes up at 10:40 still sends that day -- the hour is a floor, not a slot',
+  buildDigest(Object.assign({}, ROW, { local_hour: 10 }), { digest_hour: 8 }).send, true);
+t.check(
+  '... and at 23:00, the last tick of the day',
+  buildDigest(Object.assign({}, ROW, { local_hour: 23 }), { digest_hour: 8 }).send, true);
+t.check(
+  'a tick before the hour holds, and says why',
+  [buildDigest(Object.assign({}, ROW, { local_hour: 7 }), { digest_hour: 8 }).send,
+   buildDigest(Object.assign({}, ROW, { local_hour: 7 }), { digest_hour: 8 }).reason],
+  [false, 'before-digest-hour']);
+t.check(
+  'the second tick of the day does not send again',
+  [buildDigest(Object.assign({}, ROW, { already_sent: true, local_hour: 9 }), { digest_hour: 8 }).send,
+   buildDigest(Object.assign({}, ROW, { already_sent: true, local_hour: 9 }), { digest_hour: 8 }).reason],
+  [false, 'already-sent-today']);
+t.check(
+  'a day the host was off folds into the next digest -- the window is three days wide and still one email',
+  (function () {
+    const d = buildDigest(Object.assign({}, ROW, {
+      digest_day: '2026-10-07', local_hour: 11,
+      covers_from: '2026-10-04T03:00:00.000Z', covers_to: '2026-10-07T06:00:00.000Z',
+    }), { digest_hour: 8 });
+    return [d.send, d.text.indexOf('Covers 2026-10-04 08:00 PKT to 2026-10-07 11:00 PKT') !== -1];
+  })(),
+  [true, true]);
+
 t.done();

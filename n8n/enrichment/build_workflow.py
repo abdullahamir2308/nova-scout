@@ -375,6 +375,41 @@ nodes = [
     },
 ]
 
+# --- Guard: the schedule cannot depend on the host being up at one moment ----
+#
+# Section 7's idempotency rule: "the host machine will be off some of the time.
+# No workflow may assume its schedule fired." Two ways to break it, both of
+# which this stage is one edit away from:
+#
+#   a fixed slot        `days`/1 + triggerAtHour compiles to one cron a day at
+#                       that hour and nothing else. Ingestion was set that way
+#                       (23:00 Asia/Karachi) and on a laptop that is off at
+#                       night it mostly never fired at all.
+#   a clock-value gate  n8n 2.35.7's recurrenceCheck gates an hours, days or
+#                       weeks interval above 1 on the CLOCK VALUE of the last
+#                       run -- (hour - lastHour + 24) % 24 >= N -- kept across
+#                       restarts in staticData. Follow-Ups' "Every 6 Hours"
+#                       stored hour 0 and skipped its only tick in nine days,
+#                       at 00:00 PKT on 2026-10-02, with leads due.
+#
+# Minutes are counted on absolute elapsed minutes in that function, so a
+# minutes interval is safe.
+for _n in nodes:
+    if _n["type"] != "n8n-nodes-base.scheduleTrigger":
+        continue
+    for _iv in _n["parameters"]["rule"]["interval"]:
+        for _pin in ("triggerAtHour", "triggerAtDay", "triggerAtDayOfMonth", "triggerAtMinute"):
+            assert _pin not in _iv, (
+                "%s: schedule %r pins %s, so it has one moment to fire in. Section 7: 'No "
+                "workflow may assume its schedule fired.'" % (_n["name"], _iv, _pin))
+        _field = _iv.get("field")
+        assert not (_field in ("hours", "days", "weeks") and int(_iv.get(_field + "Interval", 1)) > 1), (
+            "%s: schedule %r enters n8n's recurrenceCheck on a clock value (hour of day, day of "
+            "year), not elapsed time -- on a host that sleeps, a due tick is silently skipped "
+            "(Follow-Ups, 2026-10-02). Use a minutes interval, or an interval of 1."
+            % (_n["name"], _iv))
+
+
 connections = {
     "Every 30 Minutes": {"main": [[{"node": "Config", "type": "main", "index": 0}]]},
     "Manual Trigger": {"main": [[{"node": "Config", "type": "main", "index": 0}]]},

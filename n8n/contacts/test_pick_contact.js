@@ -63,19 +63,43 @@ const planGate = pick({
   error_code: 'API_INACCESSIBLE',
 });
 t.check('a plan refusal writes nothing', planGate.write, false);
-t.check('a plan refusal is retryable', planGate.retry, true);
 t.check('a plan refusal is not a no-match', planGate.matched, false);
 t.check('the refusal text is carried for the operator',
   planGate.skip_reason.indexOf('not included in your Free plan') > 0, true);
+// Changed 2026-10-07. A plan gate is a property of the account, not a blip: it
+// answers identically every hour, and retrying it hourly for ever is what was
+// starving the batch of 10. So it is NOT retried -- it is recorded as exhausted
+// and the lead moves to needs_manual_contact.
+t.check('a plan refusal is not retried -- it will answer the same next hour', planGate.retry, false);
+t.check('... and is recorded as exhausted, so the lead leaves the queue', planGate.attempt_row.outcome, 'exhausted');
+t.check('... with the refusal text in the record a human reads',
+  planGate.attempt_row.detail.indexOf('not included in your Free plan') > 0, true);
+t.check('... and what to do about it', planGate.attempt_row.detail.indexOf('contact_found') > 0, true);
+t.check('... and how to put it back in the queue',
+  planGate.attempt_row.detail.indexOf('delete its contact_attempts row') > 0, true);
 
 const rateLimited = pick({ error: 'rate limit exceeded', error_code: 'RATE_LIMITED' });
-t.check('a rate limit is retryable too', rateLimited.retry, true);
+t.check('a rate limit IS retried -- it could answer next time', rateLimited.retry, true);
+t.check('... and is recorded as refused, not exhausted', rateLimited.attempt_row.outcome, 'refused');
+t.check('... but it is still counted, so even this cannot starve the queue for ever',
+  rateLimited.attempt_row.detail.indexOf('Retried next run') > 0, true);
+t.check('a 429 is read as a rate limit even with no error_code',
+  pick({ error: 'Request failed with status code 429' }).attempt_row.outcome, 'refused');
+t.check('a timeout is retried', pick({ error: 'ETIMEDOUT connecting to api.apollo.io' }).attempt_row.outcome, 'refused');
+t.check('a 500 is retried', pick({ error: 'Request failed with status code 503' }).attempt_row.outcome, 'refused');
+t.check('a plan-gate word inside a rate-limit message does not make it permanent',
+  pick({ error: '429: API_INACCESSIBLE while rate limited' }).attempt_row.outcome, 'refused');
 
 // n8n wraps an HTTP-level failure as an object rather than a string. Observed
 // live on the first run of this stage, where it rendered as '[object Object]'
 // and threw away the only field the operator needed.
 const objectError = pick({ error: { message: 'Forbidden', httpCode: '403' } });
-t.check('an object-shaped error is retryable', objectError.retry, true);
+// A 403 is permanent for the same reason the plan gate is: whatever is refusing
+// -- the plan, a revoked key, a narrowed scope -- will refuse again next hour,
+// and only a person can change it. Recorded, visible, and reversible by
+// deleting the contact_attempts row.
+t.check('a 403 is not retried either', objectError.retry, false);
+t.check('... and is recorded as exhausted', objectError.attempt_row.outcome, 'exhausted');
 t.check('an object-shaped error is serialised, not stringified to [object Object]',
   objectError.skip_reason.indexOf('[object Object]') < 0, true);
 t.check('and the operator can still read why',
@@ -250,5 +274,21 @@ t.check('an empty enrichment result writes nothing', noPerson.write, false);
 const sparse = payload({ person: { id: 'a5', email: 'x@jssresearch.com', email_status: 'verified' } }, tiers);
 t.check('the search title fills a gap in the enrichment', sparse.payload.title, 'Co-Founder & CTO');
 t.check('the search name fills a gap in the enrichment', sparse.payload.name, 'Founder Person');
+
+// --- the attempt record, which is what keeps the queue moving (migration 015)
+
+const noPeople = pick({ people: [] });
+t.check('a tombstone also records an exhausted attempt', noPeople.payload.attempt.outcome, 'exhausted');
+t.check('... with the reason Apollo gave, and what to do',
+  [noPeople.payload.attempt.detail.indexOf('no people indexed') !== -1,
+   noPeople.payload.attempt.detail.indexOf('contact_found') !== -1],
+  [true, true]);
+t.check('... and it still does not advance the lead', noPeople.payload.advance, false);
+t.check('a refusal carries lead_id, because it writes its own row',
+  pick({ error: 'rate limit exceeded' }).attempt_row.lead_id, noPeople.lead_id);
+t.check('a refusal writes no contacts row at all', pick({ error: 'rate limit exceeded' }).write, false);
+const matched = pick({ people: [person({ title: 'Founder & CEO' })] });
+t.check('a match records no attempt here -- the payload builders clear it instead',
+  [matched.matched, 'attempt' in matched, 'attempt_row' in matched], [true, false, false]);
 
 t.done();

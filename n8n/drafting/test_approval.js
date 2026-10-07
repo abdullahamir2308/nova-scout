@@ -12,8 +12,16 @@ const { runForEachItem, runner } = require('./harness');
 
 const GATE = path.join(__dirname, 'code_approval.js');
 const APPLY = path.join(__dirname, 'code_approval_apply.js');
+// Section 12's business-hours clock table, as the builds bake it in. A stand-in
+// holding the countries these cases use; 'Greenland' is deliberately absent, so
+// rule 3b has something to refuse. The real list is checked against the doc by
+// both generators, and n8n/sendtrack/test_drift_guards.py proves that guard fires.
+const CLOCK_COUNTRIES = ['India', 'Poland', 'Turkey', 'Mexico', 'Germany'];
+const baked = function (src) {
+  return src.replace('__SEND_CLOCK_COUNTRIES__', JSON.stringify(CLOCK_COUNTRIES));
+};
 const RULES = (function () {
-  const src = fs.readFileSync(GATE, 'utf8');
+  const src = baked(fs.readFileSync(GATE, 'utf8'));
   return src.slice(0, src.indexOf('// Node body'));
 })();
 // As the build ships them: the rules section, then the body, with the node it
@@ -78,7 +86,7 @@ function firstTouch(emailVariant, approval, linkedinVariant) {
   };
 }
 function gate(item) {
-  return runForEachItem(GATE, [item])[0].json;
+  return runForEachItem(GATE, [item], {}, baked)[0].json;
 }
 
 // --- Approval Gate: rules 1-4 -----------------------------------------------------
@@ -465,5 +473,34 @@ r = runRepair(FU_PREV, repairResp([{ original: FU_W_SENT, replacement: 'One more
 comp = JSON.parse(r.content[0].text);
 t.check('... and the repair edits the follow-up\'s own fields (payload.draft shape)',
   [r.repaired, comp.body.indexOf('ever waits'), comp.ask, comp.added_claim], [true, -1, ASK, 'BEN-DECK']);
+
+// --- rule 3b: a country with no Send business-hours clock (2026-10-07) -------
+//
+// Assess Grounding already stops such a lead before the drafting call, so a
+// draft only reaches here from a follow-up, a redraft under an older build, or
+// a country later removed from Section 12's table. Held, never repaired: no
+// rewrite can give a country a clock, and Send would refuse the email anyway.
+
+g = gate(firstTouch(CLEAN, ctx({ country: 'Greenland' })));
+t.check('a country with no clock holds the email, and no check is paid for',
+  [g.needs_check, g.check_request, g.payload.drafts[0].status], [false, null, 'pending']);
+t.check('... and the reason names the country and why', g.payload.drafts[0].hold_reason,
+  'no-send-clock: Greenland has no business-hours clock, so this email can never be sent (Section 12)');
+t.check('... while its LinkedIn DM is held for being LinkedIn, as always (Section 6)',
+  g.payload.drafts[1].hold_reason, 'linkedin: always reviewed and sent by hand');
+g = gate(firstTouch(CLEAN, ctx({ country: null })));
+t.check('no country at all is the same hold, and says so', g.payload.drafts[0].hold_reason,
+  'no-send-clock: (no country) has no business-hours clock, so this email can never be sent (Section 12)');
+g = gate(firstTouch(CLEAN, ctx({ country: 'india' })));
+t.check('a clock country in the wrong case still passes -- matched as code_decide.js matches it',
+  [g.needs_check, g.payload.drafts[0].hold_reason], [true, null]);
+g = gate(firstTouch(CLEAN + '+long', ctx({ country: 'Greenland', auto_approve: false })));
+t.check('the clock rule is the ONLY reason given -- nothing else is worth saying about a draft that can never go out',
+  g.payload.drafts[0].hold_reason,
+  'no-send-clock: Greenland has no business-hours clock, so this email can never be sent (Section 12)');
+g = gate(firstTouch('no-send-clock/role-inbox', null, 'no-send-clock/no-profile'));
+t.check('a no-send-clock NOTE is held for what it is, and never called low context',
+  [g.needs_check, g.payload.drafts[0].hold_reason],
+  [false, 'no-send-clock: a note to a person, not an email to send']);
 
 t.done();

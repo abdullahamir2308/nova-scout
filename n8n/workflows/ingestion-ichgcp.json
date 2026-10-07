@@ -7,25 +7,30 @@
         "rule": {
           "interval": [
             {
-              "field": "days",
-              "daysInterval": 1,
-              "triggerAtHour": 23
+              "field": "minutes",
+              "minutesInterval": 30
             }
           ]
         }
       },
-      "name": "Daily Schedule",
+      "name": "Every 30 Minutes",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
-      "position": [-160, 100],
-      "notes": "Fires daily at 23:00 in the workflow timezone (Asia/Karachi, set via GENERIC_TIMEZONE) = 18:00 UTC. The GitHub Action scrapes one region per weekday at 06:00 UTC, but GitHub starts scheduled runs 5-7 hours late (13:18 UTC at the latest in the run history), so 18:00 UTC is after that day's shard has merged into the CSV. Daily, not weekly: five shards land on five different days, and the upsert is idempotent. (It was weekly Monday 12:00 = 07:00 UTC, which fetched the previous week's file.)"
+      "position": [
+        -760,
+        40
+      ],
+      "notes": "Was 'daily at 23:00 Asia/Karachi' until 2026-10-07 -- a single fixed slot, on a host that is off at night, so most nights it never fired.\n\nNow it ticks every 30 minutes and does its work only when the CSV has changed since the last ingest (ingest_log, migration 015). A quiet tick is one HTTP GET of a committed file plus one SELECT. Section 7: 'No workflow may assume its schedule fired.'\n\nMinutes, not hours or days: n8n 2.35.7 gates an hours rule on the clock hour of the last run and a days rule on the day of the year, so a tick at the same clock value reads as zero time elapsed -- the bug that cost three follow-ups on 2026-10-02."
     },
     {
       "parameters": {},
       "name": "Manual Trigger",
       "type": "n8n-nodes-base.manualTrigger",
       "typeVersion": 1,
-      "position": [-160, 260]
+      "position": [
+        -760,
+        220
+      ]
     },
     {
       "parameters": {
@@ -42,7 +47,11 @@
       "name": "Fetch ICH GCP CSV",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [80, 180]
+      "position": [
+        -540,
+        130
+      ],
+      "notes": "ichgcp.net returns 403 to this machine (Section 9, Workflow 1), so the scrape runs as a GitHub Action and commits data/ichgcp_leads.csv. This workflow only ever reads that committed file. n8n/contacts/build_workflow.py parses this URL out of the shipped JSON so the two stages cannot drift onto different artefacts."
     },
     {
       "parameters": {
@@ -52,41 +61,245 @@
       "name": "Parse CSV",
       "type": "n8n-nodes-base.extractFromFile",
       "typeVersion": 1.1,
-      "position": [300, 180]
+      "position": [
+        -320,
+        130
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Fingerprint CSV -- n8n Code node (Run Once for All Items).\n//\n// Answers one question: has data/ichgcp_leads.csv changed, in a way that\n// matters to `leads`, since the last ingest?\n//\n// WHY THIS NODE EXISTS. Ingestion used to be a Schedule Trigger set to\n// \"daily, triggerAtHour 23\". On n8n 2.35.7 that compiles to a cron of\n// `<s> <m> 23 * * *` with no recurrence gate, so it fires once a day at 23:xx\n// Asia/Karachi and at no other time. The host is a laptop that is on in the\n// PKT daytime and off at night, so most nights it simply never ran -- and\n// Section 7's idempotency rule is explicit that \"no workflow may assume its\n// schedule fired\". Every other stage obeys that by draining a queue. This one\n// has no queue: its input is a file. So the file's own identity becomes the\n// queue, and the workflow can tick as often as it likes.\n//\n// WHAT IS FINGERPRINTED, and why not the bytes. Only the three fields the\n// upsert writes -- domain, company_name, country -- canonicalised and sorted by\n// domain. A change to a description, a phone number or an address is a real\n// change to the file and no change at all to `leads`, and re-running the upsert\n// for it would be work with no outcome. The e-mail column is deliberately out\n// too: Workflow 3b re-fetches the CSV for itself and reads the address there,\n// so ingestion ignoring it changes nothing.\n//\n// THE HASH. FNV-1a, 64-bit, over that canonical text, in BigInt. The n8n Code\n// sandbox refuses `require('crypto')` (measured on this instance 2026-10-07:\n// \"Module 'crypto' is disallowed\") and has no `crypto.subtle`, so a real digest\n// is not available here; BigInt, Buffer and TextEncoder are. FNV-1a is not a\n// cryptographic hash and does not need to be: nobody is trying to forge a\n// collision, the only question is whether two versions of a file we published\n// ourselves differ. The row count goes in the fingerprint alongside the hash,\n// so a collision would also have to preserve the row count exactly.\n\nconst FNV_OFFSET = 14695981039346656037n;\nconst FNV_PRIME = 1099511628211n;\nconst MASK = (1n << 64n) - 1n;\n\nfunction str(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\n// Matches the upsert's own idea of a domain: that column is the dedupe key\n// (Section 9, \"Dedupe key is normalised domain\"), so two spellings of one\n// domain must not read as two different files.\nfunction normDomain(v) {\n  return str(v).toLowerCase().replace(/^https?:\\/\\//, '').replace(/^www\\./, '')\n    .replace(/[/].*$/, '').replace(/[.:]+$/, '');\n}\n\nfunction fnv1a64(text) {\n  const bytes = new TextEncoder().encode(text);\n  let h = FNV_OFFSET;\n  for (let i = 0; i < bytes.length; i++) {\n    h ^= BigInt(bytes[i]);\n    h = (h * FNV_PRIME) & MASK;\n  }\n  let hex = h.toString(16);\n  while (hex.length < 16) hex = '0' + hex;\n  return hex;\n}\n\nconst rows = [];\nconst items = $input.all();\nfor (let i = 0; i < items.length; i++) {\n  const r = items[i].json || {};\n  const domain = normDomain(r.domain);\n  // A row with no domain cannot be upserted (domain is the key) and must not\n  // change the fingerprint either, or an empty line would look like new data.\n  if (!domain) continue;\n  rows.push({\n    domain: domain,\n    company_name: str(r.company_name),\n    country: str(r.country),\n  });\n}\n\nrows.sort(function (a, b) {\n  if (a.domain !== b.domain) return a.domain < b.domain ? -1 : 1;\n  if (a.company_name !== b.company_name) return a.company_name < b.company_name ? -1 : 1;\n  return a.country < b.country ? -1 : (a.country > b.country ? 1 : 0);\n});\n\n// Tab-separated, newline-terminated: neither character can appear inside a\n// value here (the parser strips them), so no two different files can serialise\n// to the same text by rearranging field boundaries.\nconst canonical = rows.map(function (r) {\n  return r.domain + '\\t' + r.company_name + '\\t' + r.country;\n}).join('\\n');\n\nreturn [{\n  json: {\n    // The shape is readable on purpose: an operator looking at ingest_log can\n    // see the algorithm and the row count without consulting this file.\n    fingerprint: 'fnv1a64:' + fnv1a64(canonical) + ':' + rows.length,\n    rows_in_csv: rows.length,\n    // A file with no usable rows is not a new version of anything -- raw.github\n    // serving an error page, or a scrape that wrote nothing, must not record an\n    // ingest or wipe anything.\n    usable: rows.length > 0,\n    rows: rows,\n  },\n}];\n"
+      },
+      "name": "Fingerprint CSV",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -100,
+        130
+      ],
+      "notes": "Collapses the file into one item carrying a fingerprint of the three columns the upsert writes -- so the next two nodes each run once, not once per row.\n\nFNV-1a/64 in BigInt rather than a real digest: the Code sandbox refuses require('crypto') (measured 2026-10-07) and has no crypto.subtle. Nobody is forging a collision here; the only question is whether two versions of a file we published ourselves differ, and the row count rides along in the fingerprint too."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Has this version of the CSV already been ingested? (migration 015)\n--\n-- $1 Fingerprint CSV's `fingerprint`\n--\n-- One row, always, so New CSV? has something to read whatever the answer is --\n-- a Postgres node that returns no rows ends the branch silently, and \"nothing\n-- happened\" would be indistinguishable from \"already ingested\".\n--\n-- leads_before is counted HERE, before the upsert, so Record Ingest can say\n-- what this ingest actually added rather than what the table holds.\nSELECT $1::text                                                        AS fingerprint,\n       NOT EXISTS (SELECT 1 FROM ingest_log g WHERE g.csv_fingerprint = $1) AS is_new,\n       (SELECT count(*) FROM leads)::int                               AS leads_before,\n       (SELECT max(ingested_at) FROM ingest_log)                       AS last_ingest_at;",
+        "options": {
+          "queryReplacement": "={{ [$json.fingerprint] }}"
+        }
+      },
+      "name": "Check Ingest Log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        120,
+        130
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "alwaysOutputData": false,
+      "notes": "Returns exactly one row whatever the answer, so New CSV? always has something to read: a Postgres node that returns nothing ends the branch silently, and 'already ingested' would be indistinguishable from 'the query failed'.\n\nleads_before is counted here, before the upsert, so Record Ingest can report what this ingest actually added."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "isnew",
+              "leftValue": "={{ $json.is_new && $('Fingerprint CSV').first().json.usable }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "New CSV?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        340,
+        130
+      ],
+      "notes": "true: this version of the file has not been ingested, and it has at least one usable row. false: nothing happens -- the normal outcome of most ticks.\n\n`usable` is the second half on purpose: raw.githubusercontent serving an error page, or a scrape that wrote nothing, parses to zero rows, and recording an ingest for that would mark a non-file as ingested."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Rows to Items -- n8n Code node (Run Once for All Items).\n//\n// Fans the fingerprinted rows back out, one item each, for the upsert.\n//\n// Fingerprint CSV collapses the whole file into ONE item so that Check Ingest\n// Log and New CSV? each run once rather than once per row -- a Postgres node\n// executes its query per item, and asking \"have we seen this file?\" 273 times\n// would be 273 queries to answer one question. This node undoes that collapse.\n//\n// It reads the rows from Fingerprint CSV by name rather than from $json,\n// because the Postgres node between them replaced the items with its own\n// result. That is the silent-empty-field trap Workflow 4 found the hard way\n// (Section 9, Workflow 4): n8n resolves a field nobody emitted to an empty\n// string without erroring, so this would have upserted 273 blank rows and\n// reported success.\n\nconst fp = $('Fingerprint CSV').first().json;\nconst rows = (fp && fp.rows) || [];\n\nif (!rows.length) {\n  // Cannot happen downstream of New CSV? (which gates on `usable`), but an\n  // empty return is the only safe answer if it ever does: an upsert of nothing\n  // is a no-op, while a thrown error would leave ingest_log unwritten and the\n  // next tick would try the same file again for ever.\n  return [];\n}\n\nreturn rows.map(function (r) {\n  return {\n    json: {\n      domain: r.domain,\n      company_name: r.company_name,\n      country: r.country,\n    },\n  };\n});\n"
+      },
+      "name": "Rows to Items",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        40
+      ],
+      "notes": "Undoes Fingerprint CSV's collapse, one item per row, for the upsert.\n\nIt reads the rows from Fingerprint CSV BY NAME: the Postgres node above replaced the items with its own result, so $json here is the ingest-log check. That is Workflow 4's silent-empty-field bug -- n8n resolves a field nobody emitted to an empty string without erroring -- and it would have upserted 273 blank rows and reported success."
     },
     {
       "parameters": {
         "operation": "executeQuery",
         "query": "INSERT INTO leads (domain, company_name, country, source, status)\nVALUES ($1, $2, $3, 'ichgcp', 'ingested')\nON CONFLICT (domain) DO UPDATE SET\n  company_name = EXCLUDED.company_name,\n  country = EXCLUDED.country,\n  updated_at = now()",
         "options": {
-          "queryReplacement": "={{$json.domain}},{{$json.company_name}},{{$json.country}}"
+          "queryReplacement": "={{ [$json.domain, $json.company_name, $json.country] }}"
         }
       },
       "name": "Upsert into leads",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.4,
-      "position": [520, 180],
-      "notes": "Only sets status/source on first INSERT. A lead that has already progressed past 'ingested' (enriched/scored/etc.) is left alone on re-runs -- re-running the weekly scrape must not regress pipeline state for leads it has already seen.",
+      "position": [
+        780,
+        40
+      ],
       "credentials": {
         "postgres": {
           "id": "novascoutPg01",
           "name": "Postgres - novascout"
         }
-      }
+      },
+      "notes": "Only sets status/source on first INSERT. A lead that has already progressed past 'ingested' (enriched/scored/...) is left alone on re-runs -- re-ingesting must never regress pipeline state, and at a 30-minute tick it would do so twice an hour.\n\nON CONFLICT (domain) DO UPDATE, so a multi-country CRO keeps one row. The CSV already settles which country that is (Section 9, Workflow 1: core beats extended, otherwise the country the file already holds wins), so leads.country is stable across runs even though this statement overwrites it every time.\n\nParameters go in as an array, so a company name containing a comma is never split. typeVersion stays at 2.4 for that reason."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Record that this version of the CSV has been ingested (migration 015).\n--\n-- $1 the fingerprint   $2 rows in the file   $3 leads before the upsert\n--\n-- Written AFTER the upsert, never before: a crash in between then leaves the\n-- fingerprint unrecorded and the next tick does the whole thing again, which is\n-- free (the upsert is idempotent). Recorded first, a crash would mark a file\n-- ingested that never was.\n--\n-- ON CONFLICT DO NOTHING so a re-run of the same file is a no-op rather than an\n-- error -- and so the first run cannot be defeated by two ticks overlapping.\nINSERT INTO ingest_log (csv_fingerprint, rows_in_csv, leads_before, leads_after)\nSELECT $1::text, $2::int, $3::int, (SELECT count(*) FROM leads)::int\nON CONFLICT (csv_fingerprint) DO NOTHING\nRETURNING csv_fingerprint, rows_in_csv, leads_before, leads_after,\n          leads_after - leads_before AS leads_added;",
+        "options": {
+          "queryReplacement": "={{ [$('Fingerprint CSV').first().json.fingerprint, $('Fingerprint CSV').first().json.rows_in_csv, $('Check Ingest Log').first().json.leads_before] }}"
+        }
+      },
+      "name": "Record Ingest",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1000,
+        40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "executeOnce": true,
+      "notes": "executeOnce, because the node above it ran once per row and this is one fact about the file.\n\nAfter the upsert, never before: a crash in between leaves the fingerprint unrecorded and the next tick redoes the whole thing, which is free. Recorded first, a crash would mark a file ingested that never was.\n\nIt returns leads_added, which is the number worth reading in the execution log."
     }
   ],
   "connections": {
-    "Daily Schedule": {
-      "main": [[{ "node": "Fetch ICH GCP CSV", "type": "main", "index": 0 }]]
+    "Every 30 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Fetch ICH GCP CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Manual Trigger": {
-      "main": [[{ "node": "Fetch ICH GCP CSV", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Fetch ICH GCP CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Fetch ICH GCP CSV": {
-      "main": [[{ "node": "Parse CSV", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Parse CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Parse CSV": {
-      "main": [[{ "node": "Upsert into leads", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Fingerprint CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fingerprint CSV": {
+      "main": [
+        [
+          {
+            "node": "Check Ingest Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Ingest Log": {
+      "main": [
+        [
+          {
+            "node": "New CSV?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New CSV?": {
+      "main": [
+        [
+          {
+            "node": "Rows to Items",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Rows to Items": {
+      "main": [
+        [
+          {
+            "node": "Upsert into leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert into leads": {
+      "main": [
+        [
+          {
+            "node": "Record Ingest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "active": false,

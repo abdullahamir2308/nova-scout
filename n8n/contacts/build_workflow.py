@@ -290,11 +290,72 @@ SELECT l.id           AS lead_id,
    AND s.disqualified = false
    AND s.fit_score >= $1
    AND c.lead_id IS NULL
+   -- Added 2026-10-07 (migration 015). THE STARVATION FIX. Without this, a
+   -- lead with no scraped address, no address on its own site and no founder
+   -- LinkedIn goes to Apollo, is refused by the Free plan, writes nothing, and
+   -- comes back at the TOP of the next hour's batch -- `fit_score DESC` puts
+   -- the same stuck leads first every time. Nine were waiting on 2026-10-07;
+   -- at ten, the batch of 10 is full of them and no new lead is ever looked up
+   -- again. `contacts` could not record this: a tombstone there means "asked,
+   -- nobody there", which is a different thing from "asked, Apollo would not
+   -- answer", and Section 8 locks that table's columns.
+   --
+   -- Two ways out of the queue, and the second is the one that cannot be
+   -- defeated: 'exhausted' retires a lead whose every source has genuinely
+   -- answered, and the attempt count retires one whose refusal nobody
+   -- recognised. Delete the contact_attempts row to put a lead back.
+   AND NOT EXISTS (
+         SELECT 1 FROM contact_attempts a
+          WHERE a.lead_id = l.id
+            AND (a.last_outcome = 'exhausted' OR a.attempts >= $3))
  -- Best-first, not oldest-first. Every other workflow drains its queue in id
  -- order because the work is free; this one spends money, so a bounded batch
  -- should buy the highest-scoring contacts available rather than the oldest.
+ -- Safe to keep now that a lead nobody can reach leaves the queue instead of
+ -- sitting at the top of it.
  ORDER BY s.fit_score DESC, l.id
  LIMIT $2;"""
+
+# How many pages of a lead's own site Harvest Site Emails may read (the
+# homepage plus contact/imprint/about/team links discovered on it), and how many
+# lookups a lead gets before it leaves the queue for needs_manual_contact.
+#
+# 3, not 1: a lead whose every source has answered is retired at once by
+# `last_outcome = 'exhausted'`, so this number only bounds the case where a
+# refusal was NOT recognised as permanent -- a shape nobody has seen yet. Three
+# hourly tries is enough tolerance for a blip and short enough that ten stuck
+# leads cannot sit in the batch for half a day. A lead retired by the count
+# alone shows `last_outcome = 'refused'` in needs_manual_contact, which is the
+# signal that the recogniser needs a new case rather than the lead needing a
+# human.
+SITE_MAX_PAGES = 5
+MAX_ATTEMPTS = 3
+
+ATTEMPT_SQL = """-- Record a lookup that produced no contact (migration 015).
+--
+-- $1 code_pick_contact.js's `attempt_row`: {lead_id, outcome, detail}
+--
+-- This is the queue's memory. Without it the batch query cannot tell "not
+-- looked up yet" from "looked up, nobody would answer", and a lead Apollo
+-- refuses comes back at the top of every hour's batch for ever.
+--
+-- `attempts` counts up across runs; `first_at` keeps the first time anybody
+-- asked, so needs_manual_contact can show how long a lead has been waiting.
+-- The lead is deliberately NOT advanced: Section 8's status flow has no state
+-- for "asked and found nothing", and 'contact_found' would put a contactless
+-- lead in front of Workflow 4's grounding guard.
+INSERT INTO contact_attempts (lead_id, attempts, last_outcome, detail)
+SELECT (p->>'lead_id')::bigint, 1, p->>'outcome', p->>'detail'
+  FROM (SELECT $1::jsonb AS p) s
+ON CONFLICT (lead_id) DO UPDATE SET
+  attempts     = contact_attempts.attempts + 1,
+  -- Once exhausted, always exhausted: a later transient refusal must not
+  -- demote a lead back into the queue it has already left.
+  last_outcome = CASE WHEN contact_attempts.last_outcome = 'exhausted'
+                      THEN 'exhausted' ELSE EXCLUDED.last_outcome END,
+  detail       = EXCLUDED.detail,
+  last_at      = now()
+RETURNING lead_id, attempts, last_outcome;"""
 
 WRITE_SQL = """-- Write the contact and advance the lead in ONE statement, so a crash between
 -- the two cannot leave a contact stored against a lead still sitting in the
@@ -330,6 +391,34 @@ WITH payload AS (
     apollo_id    = EXCLUDED.apollo_id,
     verified     = EXCLUDED.verified
   RETURNING lead_id, email, verified
+), att AS (
+  -- The attempt record, in the same statement as the contact (migration 015).
+  --
+  -- A tombstone (Apollo answered, nobody there) records 'exhausted', so the
+  -- lead leaves the queue and turns up in needs_manual_contact with the reason.
+  -- A real contact deletes any record there is: the lead has a channel now, and
+  -- a stale row would show it as still waiting for a human.
+  --
+  -- Here rather than in a node of its own because a crash between the two would
+  -- leave a contact stored against a lead the queue still thinks is untried, or
+  -- a lead retired with a contact nobody can see -- the same reason the contact
+  -- and the status move together.
+  INSERT INTO contact_attempts (lead_id, attempts, last_outcome, detail)
+  SELECT (p->>'lead_id')::bigint, 1, p->'attempt'->>'outcome', p->'attempt'->>'detail'
+    FROM payload
+   WHERE p->'attempt' IS NOT NULL AND p->'attempt' <> 'null'::jsonb
+  ON CONFLICT (lead_id) DO UPDATE SET
+    attempts     = contact_attempts.attempts + 1,
+    last_outcome = CASE WHEN contact_attempts.last_outcome = 'exhausted'
+                        THEN 'exhausted' ELSE EXCLUDED.last_outcome END,
+    detail       = EXCLUDED.detail,
+    last_at      = now()
+  RETURNING lead_id
+), cleared AS (
+  DELETE FROM contact_attempts
+   WHERE lead_id = (SELECT lead_id FROM ins)
+     AND (SELECT p->'attempt' IS NULL OR p->'attempt' = 'null'::jsonb FROM payload)
+  RETURNING lead_id
 ), adv AS (
   -- Section 8's status flow: scored -> contact_found. The status guard makes a
   -- concurrent or repeated run a no-op rather than a double write.
@@ -344,7 +433,9 @@ WITH payload AS (
 SELECT i.lead_id,
        i.email,
        i.verified,
-       (SELECT count(*) FROM adv) > 0 AS advanced
+       (SELECT count(*) FROM adv) > 0     AS advanced,
+       (SELECT count(*) FROM att) > 0     AS attempt_recorded,
+       (SELECT count(*) FROM cleared) > 0 AS attempt_cleared
   FROM ins i;"""
 
 # --- Guard: the write step inserts exactly the columns Section 8 defines ------
@@ -369,6 +460,121 @@ if "s.fit_score >= $1" not in BATCH_SQL:
         "the batch query no longer gates on fit_score. Section 9 limits Apollo to "
         "leads scoring >= %d, which is what keeps it on the free tier." % APOLLO_THRESHOLD
     )
+
+
+# --- Guard: a lead that cannot be reached leaves the queue (migration 015) ----
+#
+# This is the starvation fix, and it is one WHERE clause: without it a lead
+# Apollo will never answer for comes back at the top of every batch of 10 for
+# ever, because the queue is ordered by fit_score and has no memory of a lookup
+# that found nothing. Nine leads were already in that state on 2026-10-07.
+if "FROM contact_attempts a" not in BATCH_SQL:
+    raise AssertionError(
+        "the batch query no longer excludes leads with a contact_attempts record. A lead "
+        "with no scraped address, no address on its own site and no founder LinkedIn is "
+        "refused by Apollo every run; without this clause it occupies a slot in every batch "
+        "for ever, and at batch_size such leads the queue never reaches a new lead again."
+    )
+for _needed in ("a.last_outcome = 'exhausted'", "a.attempts >= $3"):
+    if _needed not in BATCH_SQL:
+        raise AssertionError(
+            "the batch query lost %r. Both halves matter: 'exhausted' retires a lead whose "
+            "every source has answered, and the attempt count retires one whose refusal "
+            "nobody recognised -- the second is the half that cannot be defeated by an "
+            "unfamiliar error shape." % _needed
+        )
+if "$3" not in BATCH_SQL:
+    raise AssertionError("the batch query does not take max_attempts as a parameter")
+
+# --- Guard: every outcome of a lookup is recorded -----------------------------
+#
+# Three places write the queue's memory, and all three have to keep doing it:
+# the refusal branch through its own node, and the tombstone through the write
+# statement. A match clears the record instead, so a lead that has since been
+# reached leaves needs_manual_contact.
+_pick = js("code_pick_contact.js")
+for _needed, _why in (
+    ("attempt_row", "the refusal branch must emit attempt_row for Record Lookup Attempt"),
+    ("'exhausted'", "a permanent refusal must be recorded as exhausted, not retried for ever"),
+    ("'refused'", "a transient refusal must be recorded as refused, so even it is counted"),
+    ("isPlanGate", "nothing tells a permanent refusal from a transient one any more"),
+):
+    if _needed not in _pick:
+        raise AssertionError("code_pick_contact.js lost %r -- %s" % (_needed, _why))
+for _f in ("code_payload_apollo.js", "code_payload_scrape.js"):
+    if "attempt: null" not in js(_f):
+        raise AssertionError(
+            "%s no longer sets payload.attempt = null. A lead that has just been reached "
+            "would keep its earlier contact_attempts row and go on showing in "
+            "needs_manual_contact as waiting for a human." % _f
+        )
+for _needed in ("p->'attempt'->>'outcome'", "DELETE FROM contact_attempts"):
+    if _needed not in WRITE_SQL:
+        raise AssertionError(
+            "the write statement lost %r. The contact, the status move and the attempt record "
+            "belong in one statement: a crash between them would leave a contact stored "
+            "against a lead the queue still thinks is untried." % _needed
+        )
+if "last_outcome = 'exhausted'" not in ATTEMPT_SQL or "ELSE EXCLUDED.last_outcome" not in ATTEMPT_SQL:
+    raise AssertionError(
+        "ATTEMPT_SQL no longer keeps 'exhausted' sticky. A later transient refusal would "
+        "demote a retired lead back into the queue it has already left."
+    )
+
+# --- Guard: the new free source is wired, and nothing is guessed --------------
+#
+# The whole value of this source is that it is free and literal. A derived
+# address (first.last@, or info@<domain> because most companies have one) would
+# be written `verified = true` on the strength of a pattern, which is exactly
+# the line Section 9 draws between a published address and Apollo's `guessed`.
+_site = js("code_site_emails.js")
+if "helpers.httpRequest" not in _site:
+    raise AssertionError("code_site_emails.js no longer fetches anything")
+for _needed, _why in (
+    ("onOwnDomain", "the same-domain rule is the only thing keeping another company's address out"),
+    ("NEVER", "without the never-a-contact list a cold email can go to careers@ or ir@"),
+    ("MAILTO_RE", "a mailto: href is half of what 'literally on the page' means"),
+):
+    if _needed not in _site:
+        raise AssertionError("code_site_emails.js lost %r -- %s" % (_needed, _why))
+_resolve = js("code_resolve.js")
+if "site_email" not in _resolve:
+    raise AssertionError(
+        "code_resolve.js does not read site_email, so Harvest Site Emails fetches every "
+        "lead's website and nothing uses the answer"
+    )
+if "verified: true" not in _resolve.split("source: 'site_published'")[1].split("evidence:")[0]:
+    raise AssertionError(
+        "the site-published branch no longer writes verified = true. Section 9's definition: "
+        "a first-party address the company published about itself IS confirmed."
+    )
+
+# --- Guard: the schedule cannot depend on the host being up at one moment -----
+#
+# Section 7's idempotency rule. n8n 2.35.7 gates an "every N hours" rule
+# (N > 1) on the CLOCK HOUR of the last run and an "every N days" rule on the
+# day of the year, so a tick at the same clock value reads as no time elapsed --
+# the bug that cost three follow-ups on 2026-10-02 (Section 9, Workflow 6). A
+# `days` rule with triggerAtHour is worse still: it is a single fixed slot, and
+# the host is off at night.
+def _assert_schedule_catches_up(node):
+    rule = node["parameters"]["rule"]["interval"]
+    for iv in rule:
+        field = iv.get("field")
+        if field == "minutes":
+            size = int(iv.get("minutesInterval", 5))
+            assert 1 <= size <= 59, "a minutes interval must be 1-59, got %d" % size
+            continue
+        if field == "hours" and int(iv.get("hoursInterval", 1)) == 1 and "triggerAtMinute" not in iv:
+            # Verified against the installed n8n 2.35.7: intervalToRecurrence
+            # activates no recurrence check for hoursInterval == 1, so this
+            # fires every hour at a stable minute with no clock-value gate.
+            continue
+        raise AssertionError(
+            "the %s trigger is %r. A schedule that must catch one moment misses it on a host "
+            "that is off at night (Section 7's idempotency rule): use a minutes interval, or "
+            "hours with interval 1 and no fixed minute." % (node["name"], iv)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +636,10 @@ nodes = [
                         "value": APOLLO_THRESHOLD,
                         "type": "number",
                     },
+                    {"id": "sitepages", "name": "site_max_pages", "value": SITE_MAX_PAGES,
+                     "type": "number"},
+                    {"id": "maxattempts", "name": "max_attempts", "value": MAX_ATTEMPTS,
+                     "type": "number"},
                 ]
             },
             "options": {},
@@ -499,7 +709,7 @@ nodes = [
             "operation": "executeQuery",
             "query": BATCH_SQL,
             "options": {
-                "queryReplacement": "={{ [$('Config').first().json.min_fit_score, $('Config').first().json.batch_size] }}"
+                "queryReplacement": "={{ [$('Config').first().json.min_fit_score, $('Config').first().json.batch_size, $('Config').first().json.max_attempts] }}"
             },
         },
         "name": "Get Qualified Batch",
@@ -515,6 +725,24 @@ nodes = [
             "split."
         ),
         "alwaysOutputData": False,
+    },
+    {
+        "parameters": {"mode": "runOnceForAllItems", "jsCode": js("code_site_emails.js")},
+        "name": "Harvest Site Emails",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [220, 130],
+        "notes": (
+            "The third free source (2026-10-07): an address the company publishes on its own "
+            "website. Only for a lead the CSV has no address for -- it reads the index itself "
+            "and skips the rest, so no prospect's server is asked for data already on disk.\n\n"
+            "Literal addresses only (a mailto: link or text on the page), the lead's own domain "
+            "only, and never a careers@/ir@/privacy@-class mailbox. Nothing is pattern-derived: "
+            "that is the line contacts.verified draws.\n\n"
+            "Run Once for All Items because the fetches are concurrent. It passes each lead row "
+            "through unchanged with site_email and the evidence added, so Resolve Contact still "
+            "reads one item per lead and keeps every decision in one place."
+        ),
     },
     {
         "parameters": {"mode": "runOnceForEachItem", "jsCode": js("code_resolve.js")},
@@ -605,15 +833,38 @@ nodes = [
             "conditions": boolean_condition("searchok", "={{ $json.write }}", True),
             "options": {},
         },
-        "name": "Drop Failed Searches",
-        "type": "n8n-nodes-base.filter",
+        "name": "Apollo Answered?",
+        "type": "n8n-nodes-base.if",
         "typeVersion": 2.2,
         "position": [1100, 240],
         "notes": (
-            "If Apollo did not answer, the lead is dropped and stays 'scored' so the next run "
-            "retries it. Same self-healing shape as Workflow 3's 'Drop Failed Lookups' and "
-            "Workflow 2's 'Drop Failed Calls'. Writing a no-contact row here instead would "
-            "record an outage as a fact about the company, permanently."
+            "Was 'Drop Failed Searches', a filter that discarded a refusal. It no longer "
+            "discards: the lead still gets no `contacts` row -- writing one would record an "
+            "outage as a fact about the company, permanently -- but the attempt is recorded "
+            "(migration 015), which is what stops a lead Apollo will never answer for from "
+            "filling every batch of 10 for ever.\n\n"
+            "true: Apollo answered, go on to the ranking. false: it did not, record the "
+            "attempt. code_pick_contact.js decides whether that attempt is 'refused' (retried) "
+            "or 'exhausted' (the plan gate, which answers the same way every hour)."
+        ),
+    },
+    {
+        "parameters": {
+            "operation": "executeQuery",
+            "query": ATTEMPT_SQL,
+            "options": {"queryReplacement": "={{ JSON.stringify($json.attempt_row) }}"},
+        },
+        "name": "Record Lookup Attempt",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.7,
+        "position": [1320, 360],
+        "credentials": PG_CRED,
+        "notes": (
+            "The lead keeps no `contacts` row -- Apollo never answered about it -- but the "
+            "queue now remembers that it was asked. `attempts` is what bounds a refusal "
+            "nobody recognised; `last_outcome = 'exhausted'` retires one that has genuinely "
+            "run out of sources. Either way the lead stays 'scored' and surfaces in "
+            "needs_manual_contact with the detail as its `why`."
         ),
     },
     {
@@ -717,6 +968,11 @@ nodes = [
     },
 ]
 
+# Every schedule in this workflow has to survive a host that is off at night.
+for _n in nodes:
+    if _n["type"] == "n8n-nodes-base.scheduleTrigger":
+        _assert_schedule_catches_up(_n)
+
 connections = {
     "Every Hour": {"main": [[{"node": "Config", "type": "main", "index": 0}]]},
     "Manual Trigger": {"main": [[{"node": "Config", "type": "main", "index": 0}]]},
@@ -724,7 +980,8 @@ connections = {
     "Fetch ICH GCP CSV": {"main": [[{"node": "Parse CSV", "type": "main", "index": 0}]]},
     "Parse CSV": {"main": [[{"node": "Index Scraped Emails", "type": "main", "index": 0}]]},
     "Index Scraped Emails": {"main": [[{"node": "Get Qualified Batch", "type": "main", "index": 0}]]},
-    "Get Qualified Batch": {"main": [[{"node": "Resolve Contact", "type": "main", "index": 0}]]},
+    "Get Qualified Batch": {"main": [[{"node": "Harvest Site Emails", "type": "main", "index": 0}]]},
+    "Harvest Site Emails": {"main": [[{"node": "Resolve Contact", "type": "main", "index": 0}]]},
     "Resolve Contact": {"main": [[{"node": "Needs Apollo?", "type": "main", "index": 0}]]},
     "Needs Apollo?": {
         "main": [
@@ -736,8 +993,13 @@ connections = {
         "main": [[{"node": "Write Contact & Advance", "type": "main", "index": 0}]]
     },
     "Apollo People Search": {"main": [[{"node": "Pick Best Contact", "type": "main", "index": 0}]]},
-    "Pick Best Contact": {"main": [[{"node": "Drop Failed Searches", "type": "main", "index": 0}]]},
-    "Drop Failed Searches": {"main": [[{"node": "Matched?", "type": "main", "index": 0}]]},
+    "Pick Best Contact": {"main": [[{"node": "Apollo Answered?", "type": "main", "index": 0}]]},
+    "Apollo Answered?": {
+        "main": [
+            [{"node": "Matched?", "type": "main", "index": 0}],
+            [{"node": "Record Lookup Attempt", "type": "main", "index": 0}],
+        ]
+    },
     "Matched?": {
         "main": [
             [{"node": "Apollo People Match", "type": "main", "index": 0}],
@@ -774,3 +1036,5 @@ print("  apollo threshold: >= %d" % APOLLO_THRESHOLD)
 print("  contacts columns: %r" % (CONTACTS_COLUMNS,))
 print("  title tiers:      %r" % (TITLE_TIERS,))
 print("  csv url:          %s" % CSV_URL)
+print("  free sources:     ichgcp CSV, then up to %d pages of the lead's own site, then a founder LinkedIn profile" % SITE_MAX_PAGES)
+print("  queue retirement: %d attempts, or one 'exhausted' answer (migration 015; delete the contact_attempts row to re-queue)" % MAX_ATTEMPTS)

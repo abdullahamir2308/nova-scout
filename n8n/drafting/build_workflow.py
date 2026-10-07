@@ -376,6 +376,44 @@ def load_geographies(doc=None):
     return [g.strip() for g in m.group(1).split(",") if g.strip()]
 
 
+def load_clock_countries(doc=None):
+    """Section 12's "Business-hours clocks" table, as country names only.
+
+    Duplicated from n8n/sendtrack/build_workflow.py on purpose, like the
+    taxonomy loader above: the stages must be able to fail independently. The
+    sendtrack build is the one that checks the table's numbers against
+    code_decide.js; drafting only needs to know which countries are IN it,
+    because a lead in a country that is not can never be sent to (Section 12),
+    and both Assess Grounding and the Approval Gate stop one before any model
+    call."""
+    doc = doc if doc is not None else _doc()
+    anchor = re.search(r"\*\*Business-hours clocks[^\n]*\*\*", doc)
+    if not anchor:
+        raise AssertionError(
+            "Section 12 'Business-hours clocks' heading not found in %s" % MASTER_REF)
+    table = re.search(
+        r"\n\| Country \| Standard offset \| Weekend \| Tier \|\r?\n\|[-|]+\|\r?\n(.*?)(?:\r?\n\r?\n|\Z)",
+        doc[anchor.end():], re.S)
+    if not table:
+        raise AssertionError(
+            "no clock table follows the 'Business-hours clocks' heading in %s" % MASTER_REF)
+    names, core = [], []
+    for line in table.group(1).splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) != 4:
+            raise AssertionError("clock row %r does not have 4 cells in %s" % (line, MASTER_REF))
+        if not re.match(r"^UTC[+-]\d{1,2}:\d{2}$", cells[1]):
+            raise AssertionError("clock row %r has an unreadable offset %r" % (cells[0], cells[1]))
+        if cells[0] in names:
+            raise AssertionError("clock row %r is listed twice in %s" % (cells[0], MASTER_REF))
+        names.append(cells[0])
+        if cells[3] == "core":
+            core.append(cells[0])
+    if not names:
+        raise AssertionError("Section 12's clock table is empty in %s" % MASTER_REF)
+    return names, core
+
+
 def load_link_free_weeks(doc=None):
     """Section 9, Workflow 4: "**Links:** none in warm-up weeks 1-N". The
     existing link policy, kept by v3; the v3 skill itself only says the ask
@@ -477,6 +515,7 @@ DRAFT_MODEL, DRAFT_EFFORT = load_drafting_model(DOC)
 DRAFTS_COLUMNS = load_drafts_columns(DOC)
 SMALL_TEAM = load_small_team(DOC)
 GEOGRAPHIES = load_geographies(DOC)
+CLOCK_COUNTRIES, CLOCK_CORE = load_clock_countries(DOC)
 LINK_FREE_WEEKS = load_link_free_weeks(DOC)
 COMPOSES = load_composes(SKILL_DOC)
 SUBJECT_RULES = load_subject_rules(SKILL_DOC)
@@ -1054,12 +1093,20 @@ assert "__SIGNATURE__" not in _assemble_js, "signature placeholder was not subst
 # produced four drafts that mentioned neither Nova nor NoblePath, because the
 # model was receiving an empty system prompt and simply summarising the fact
 # sheet back. Nothing errored; the workflow reported success.
-_assess_js = js("code_assess.js").replace(
+_assess_raw = js("code_assess.js")
+for _tok in ("__SYSTEM_PROMPT__", "__CLAUDE_REQUEST__", "__SEND_CLOCK_COUNTRIES__"):
+    assert _assess_raw.count(_tok) == 1, (
+        "code_assess.js must carry %s exactly once, found %d -- a substituted constant that is not "
+        "there is silently never substituted" % (_tok, _assess_raw.count(_tok)))
+_assess_js = _assess_raw.replace(
     "__SYSTEM_PROMPT__", json.dumps(SYSTEM_PROMPT, ensure_ascii=False)
 ).replace(
     "__CLAUDE_REQUEST__", json.dumps(CLAUDE_REQUEST, ensure_ascii=False, indent=2).replace("\n", "\n  ")
+).replace(
+    "__SEND_CLOCK_COUNTRIES__", json.dumps(sorted(CLOCK_COUNTRIES), ensure_ascii=False)
 )
 assert "__SYSTEM_PROMPT__" not in _assess_js, "system prompt placeholder was not substituted"
+assert "__SEND_CLOCK_COUNTRIES__" not in _assess_js, "the clock-country list was not substituted"
 assert "__CLAUDE_REQUEST__" not in _assess_js, "Claude request placeholder was not substituted"
 assert '"model": "%s"' % DRAFT_MODEL in _assess_js, "the shipped request does not name %s" % DRAFT_MODEL
 
@@ -1077,7 +1124,7 @@ _assert_emitted_upstream(_assess_js, _claude_reads, "code_assess.js")
 
 import approval_chain  # noqa: E402  (this directory; shared with n8n/sendtrack/build_workflow.py)
 
-APPROVAL = approval_chain.load(HERE)
+APPROVAL = approval_chain.load(HERE, CLOCK_COUNTRIES)
 APPROVAL_JS = APPROVAL["gate"]
 APPROVAL_RULES = APPROVAL["rules"]
 
@@ -1435,6 +1482,41 @@ nodes = [
         ),
     },
 ]
+
+# --- Guard: the schedule cannot depend on the host being up at one moment ----
+#
+# Section 7's idempotency rule: "the host machine will be off some of the time.
+# No workflow may assume its schedule fired." Two ways to break it, both of
+# which this stage is one edit away from:
+#
+#   a fixed slot        `days`/1 + triggerAtHour compiles to one cron a day at
+#                       that hour and nothing else. Ingestion was set that way
+#                       (23:00 Asia/Karachi) and on a laptop that is off at
+#                       night it mostly never fired at all.
+#   a clock-value gate  n8n 2.35.7's recurrenceCheck gates an hours, days or
+#                       weeks interval above 1 on the CLOCK VALUE of the last
+#                       run -- (hour - lastHour + 24) % 24 >= N -- kept across
+#                       restarts in staticData. Follow-Ups' "Every 6 Hours"
+#                       stored hour 0 and skipped its only tick in nine days,
+#                       at 00:00 PKT on 2026-10-02, with leads due.
+#
+# Minutes are counted on absolute elapsed minutes in that function, so a
+# minutes interval is safe.
+for _n in nodes:
+    if _n["type"] != "n8n-nodes-base.scheduleTrigger":
+        continue
+    for _iv in _n["parameters"]["rule"]["interval"]:
+        for _pin in ("triggerAtHour", "triggerAtDay", "triggerAtDayOfMonth", "triggerAtMinute"):
+            assert _pin not in _iv, (
+                "%s: schedule %r pins %s, so it has one moment to fire in. Section 7: 'No "
+                "workflow may assume its schedule fired.'" % (_n["name"], _iv, _pin))
+        _field = _iv.get("field")
+        assert not (_field in ("hours", "days", "weeks") and int(_iv.get(_field + "Interval", 1)) > 1), (
+            "%s: schedule %r enters n8n's recurrenceCheck on a clock value (hour of day, day of "
+            "year), not elapsed time -- on a host that sleeps, a due tick is silently skipped "
+            "(Follow-Ups, 2026-10-02). Use a minutes interval, or an interval of 1."
+            % (_n["name"], _iv))
+
 
 connections = {
     "Every 30 Minutes": {"main": [[{"node": "Config", "type": "main", "index": 0}]]},

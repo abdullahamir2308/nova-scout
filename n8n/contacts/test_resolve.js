@@ -133,4 +133,100 @@ const empty = runForEachItem(PAYLOAD, [
 ]).map(function (r) { return r.json; });
 t.check('a contact with no reachable channel does not advance', empty[0].payload.advance, false);
 
+// ---------------------------------------------------------------------------
+// The site-published address (2026-10-07) -- the third free source
+//
+// Harvest Site Emails runs immediately upstream and passes the lead row through
+// with site_email and its evidence added. It only fetches a site the CSV has no
+// address for, so site_email and a scraped address never both exist -- except
+// by a bug, and the first case below pins which one wins if they ever do.
+// ---------------------------------------------------------------------------
+
+function siteLead(over) {
+  return {
+    json: Object.assign({
+      lead_id: 733, domain: 'hvivo.com', company_name: 'hVIVO', country: 'United Kingdom',
+      fit_score: 53, founder_name: null, founder_linkedin: null, founder_title: null,
+      site_email: 'bd@hvivo.com', site_email_how: 'mailto', site_email_role_inbox: false,
+      site_email_is_founder: false, site_email_candidates: ['bd@hvivo.com', 'careers@hvivo.com'],
+      site_email_rejected: ['careers@hvivo.com'], site_pages_fetched: 4,
+      site_lookup: 'found',
+    }, over || {}),
+  };
+}
+
+function one(leadItem) {
+  return runForEachItem(RESOLVE, [leadItem], up)[0].json;
+}
+
+let r = one(siteLead());
+t.check('a site-published address skips Apollo', r.needs_apollo, false);
+t.check('... and is recorded as its own source', r.source, 'site_published');
+t.check('... and is written verified -- published by the company about itself', r.contact.verified, true);
+t.check('... with apollo_id null', r.contact.apollo_id, null);
+t.check('... and the evidence says where it came from and how',
+  [r.evidence.indexOf('published on the company') !== -1,
+   r.evidence.indexOf('as mailto') !== -1,
+   r.evidence.indexOf('4 pages') !== -1],
+  [true, true, true]);
+t.check('... and it counts as a credit saved', r.credits_saved, 1);
+t.check('the rejected candidates travel too, so a reviewer can see what was passed over',
+  r.site_email_candidates, ['bd@hvivo.com', 'careers@hvivo.com']);
+
+// The CSV wins if both somehow exist: it is a committed file, so it is the same
+// address on every run for ever, while a site is whatever it serves today.
+r = one(siteLead({ domain: 'atlantclinical.com', site_email: 'other@atlantclinical.com' }));
+t.check('a scraped address still beats a site one', [r.source, r.contact.email],
+  ['ichgcp_scrape', 'contact@atlantclinical.com']);
+
+r = one(siteLead({ site_email: 'info@hvivo.com', site_email_role_inbox: true }));
+t.check('a site role inbox is flagged as one', r.role_inbox, true);
+r = one(siteLead({ site_email: 'support@hvivo.com', site_email_role_inbox: false }));
+t.check('the role list is applied here too, even if upstream did not flag it', r.role_inbox, true);
+
+r = one(siteLead({
+  domain: 'ee-cro.com', site_email: 'ilse.eder@ee-cro.com', site_email_is_founder: true,
+  founder_name: 'Ilse Eder', founder_title: 'Managing Director',
+}));
+t.check('a mailbox carrying the founder name says so -- two sources agree on the person',
+  r.evidence.indexOf('two sources agree on the person') !== -1, true);
+t.check('... and the name and title are written', [r.contact.name, r.contact.title],
+  ['Ilse Eder', 'Managing Director']);
+
+r = one(siteLead({ site_email: 'info@hvivo.com', founder_name: 'Jane Roe', founder_title: 'MD' }));
+t.check('a role inbox never claims the founder owns it',
+  r.evidence.indexOf('not asserted to own this inbox') !== -1, true);
+t.check('... though the name is still on the row, because the site did say it', r.contact.name, 'Jane Roe');
+
+// No address anywhere: the LinkedIn-only and Apollo branches, with the site
+// lookup now part of what the evidence reports.
+r = one(siteLead({
+  site_email: null, site_lookup: 'no-address-found', site_pages_fetched: 5,
+  site_email_candidates: [], site_email_rejected: [],
+  founder_name: 'Jane Roe', founder_linkedin: 'https://www.linkedin.com/in/janeroe',
+}));
+t.check('no site address falls through to the LinkedIn-only branch', r.source, 'enrichment_linkedin');
+t.check('... and the evidence says the site was read and had nothing',
+  [r.evidence.indexOf('none published on the site') !== -1, r.evidence.indexOf('5 pages read') !== -1],
+  [true, true]);
+
+r = one(siteLead({
+  site_email: null, site_lookup: 'no-address-found', site_pages_fetched: 5,
+  site_email_candidates: ['careers@hvivo.com'], site_email_rejected: ['careers@hvivo.com'],
+}));
+t.check('nothing at all reaches Apollo', [r.needs_apollo, r.source], [true, 'apollo']);
+t.check('... carrying what each free source actually did, for the attempt record',
+  [r.free_sources.site_lookup, r.free_sources.site_pages_fetched,
+   r.free_sources.site_rejected, r.free_sources.founder_linkedin],
+  ['no-address-found', 5, ['careers@hvivo.com'], 'none found']);
+r = one(siteLead({ site_email: null, site_lookup: 'unreachable', site_pages_fetched: 0 }));
+t.check('a site that would not load is reported as unreachable, not as "no address"',
+  r.free_sources.site_lookup, 'unreachable');
+r = one(siteLead({ site_email: null, site_lookup: 'no-address-found',
+  founder_name: 'John Doe', founder_linkedin: 'https://www.linkedin.com/company/x' }));
+t.check('a company page is still not a person, so Apollo',
+  [r.needs_apollo, r.free_sources.founder_linkedin], [true, 'not a personal profile']);
+r = one(siteLead({ site_email: '   ' }));
+t.check('a blank site_email is no address at all', r.needs_apollo, true);
+
 t.done();

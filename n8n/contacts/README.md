@@ -40,27 +40,122 @@ outage, plan change, or threshold change would have the same shape.
 As its own queue keyed on `status='scored' AND fit_score >= 50 AND no contacts
 row`, it drains whatever is waiting, whenever it runs.
 
-## Three ways a lead gets a contact (2026-10-06)
+## Four ways a lead gets a contact (2026-10-07)
 
-`Resolve Contact` picks the first that applies; only the third spends anything.
+`Harvest Site Emails` and `Resolve Contact` take the first that applies; only the
+fourth spends anything.
 
 1. **A scraped address** in `data/ichgcp_leads.csv` (via `Index Scraped Emails`):
    the email, verified, plus the founder's name, title and LinkedIn if the site
-   gave them. Apollo is not called.
-2. **No address, but a founder LinkedIn profile** that enrichment harvested from the
-   company's own site (`linkedin.com/in/...`; a company page does not count): a
-   **LinkedIn-only contact** -- `linkedin_url` plus the name and title the site gave,
-   `email` NULL, `verified` false, `apollo_id` NULL. Apollo is not called, the lead
-   advances to `contact_found`, and Workflow 4 drafts the DM (its email is tagged
-   `no-address` and held). **Such a lead is never queued for Apollo again** because
-   it now has a `contacts` row; if the plan ever allows the lookup, delete those rows
-   (`apollo_id IS NULL AND email IS NULL AND linkedin_url IS NOT NULL`) to re-queue
-   them.
-3. **Neither:** Apollo. On the Free plan it answers 403, nothing is written and the
-   lead stays `scored` and is retried every hour -- the manual look-up Section 7
-   prices. They take a slot in every batch (best score first), so once 10 or more
-   leads are stuck this way the leads behind them are never reached. Today there
-   are five (53, 92, 35, 94, 212).
+   gave them. Nothing is fetched and Apollo is not called.
+2. **An address the company publishes on its own website** (added 2026-10-07,
+   `Harvest Site Emails`): literally on the page, same domain only, never a
+   careers@/ir@/privacy@-class mailbox. Written `verified = true` for the same
+   reason the ichgcp address is — it is first-party. Rules and evidence below.
+3. **No address, but a founder LinkedIn profile** that enrichment harvested from
+   the company's own site (`linkedin.com/in/...`; a company page does not count):
+   a **LinkedIn-only contact** — `linkedin_url` plus the name and title the site
+   gave, `email` NULL, `verified` false, `apollo_id` NULL. Apollo is not called,
+   the lead advances to `contact_found`, and Workflow 4 drafts the DM (its email
+   is tagged `no-address` and held).
+4. **None of those:** Apollo. On the Free plan it answers 403, which is a
+   property of the account and not a blip — so the attempt is recorded as
+   `exhausted`, the lead **leaves the queue**, and it surfaces in
+   `needs_manual_contact` with what each source actually tried. That is the
+   two-minute manual look-up Section 7 prices.
+
+**Such a lead is never queued again** because it now has a `contacts` row (2, 3)
+or a `contact_attempts` row (4). After an Apollo plan upgrade, put them all back
+with two deletes:
+
+```sql
+DELETE FROM contacts WHERE apollo_id IS NULL AND email IS NULL AND linkedin_url IS NOT NULL;
+DELETE FROM contact_attempts;
+```
+
+## The queue used to starve, and why it does not now (migration 015)
+
+**The bug.** The queue is `status='scored' AND fit_score >= 50 AND no contacts
+row`, ordered `fit_score DESC` and capped at `Config.batch_size` (10). A lead
+with no scraped address, no first-party address on its own site and no founder
+LinkedIn went to Apollo, was refused, wrote nothing, stayed `scored` — and came
+back at the **top** of the next hour's batch, because it scores well. Nine leads
+were in exactly that state on 2026-10-07 (35, 53, 92, 94, 212, 498, 500, 658,
+733). At ten, the batch of 10 would have held nothing but stuck leads and no new
+lead would ever have been looked up again.
+
+The queue had no memory of a lookup that found nothing, and `contacts` had
+nowhere to keep one: a tombstone row there means *"asked, nobody there"*, which
+is a different thing from *"asked, Apollo would not answer"*, and Master Ref
+Section 8 locks that table's columns.
+
+**The fix** is `contact_attempts` (migration 015) and one more clause in the
+batch query. Two ways out of the queue, and the second is the one that cannot be
+defeated:
+
+| `last_outcome` | Means | Retried? |
+|---|---|---|
+| `exhausted` | every source answered and there is no contact — including a plan-gated 403, which will answer identically every hour until somebody upgrades | no, ever |
+| `refused` | a 429, a 5xx, a timeout, a response that was not the expected shape | yes, up to `Config.max_attempts` (3) |
+
+`attempts` is what bounds the second row: a refusal whose shape nobody
+recognised still stops after three tries instead of starving the queue. A lead
+retired by the count alone shows `last_outcome = 'refused'` in
+`needs_manual_contact`, which is the signal that `isPlanGate` in
+`code_pick_contact.js` needs a new case rather than the lead needing a human.
+
+The lead stays `scored` throughout: Section 8's status flow has no state for
+"asked and found nothing", and `contact_found` would put a contactless lead in
+front of Workflow 4's grounding guard. A lookup that *does* find a contact
+deletes the record in the same statement that writes the contact, so a lead
+since reached leaves the manual queue.
+
+**Measured, the run that shipped this** (2026-10-07, one execution): of the nine
+stuck leads, **five were unblocked by source 2 alone** — 53 `info@ivrs.org.in`,
+94 `contact_us@rotrial.com`, 498 `ilse.eder@ee-cro.com`, 658
+`info@delphiniumcro.com`, 733 `bd@hvivo.com` — all five `verified`, all five now
+`contact_found`. The remaining four (35, 92, 212, 500) were recorded `exhausted`
+and left the queue, which went from 9 waiting to 0. No Apollo credit was spent;
+none could be.
+
+## Source 2: an address published on the lead's own website
+
+`code_site_emails.js`. It runs for a lead the CSV has no address for, reads the
+homepage and up to `Config.site_max_pages - 1` contact/imprint/about/team pages
+discovered on it (plus `/contact`, `/contact-us`, `/kontakt`, `/impressum`,
+`/about` as fallbacks), and harvests addresses from `mailto:` hrefs and from the
+page text.
+
+**Why the fetch is here and not in enrichment.** Workflow 2 already fetches these
+very pages, but keeps none of their text: it harvests LinkedIn URLs from the blob
+by regex and the rest goes to the model and is discarded. Adding the harvest
+there would only help leads enriched from then on — the 274 already in the table
+would each need a re-enrichment (a GPU call) and a re-score (a rationale call and
+a ClinicalTrials.gov lookup) to reach something that costs neither. So the stage
+that needs an address goes and looks for one, which also means it reads the site
+as it is today rather than as it was when the lead was enriched.
+
+**Three rules, each one earning its place against real pages:**
+
+| Rule | What it stops, measured |
+|---|---|
+| literally on the page — a `mailto:` or text, never pattern-derived | `first.last@`, or `info@<domain>` because most companies have one. A guessed address is not a published one, and `verified` draws exactly that line |
+| the lead's own domain, or a subdomain of it | `mtz-clinical.pl` publishes only `@pratia.com` (it was acquired), `cebisinternational.com` only `@cebis-int.com`, `archerresearch.eu` only Wix's `@sentry.wixpress.com` telemetry — the wrong company or no company, all three rejected by this one rule |
+| never a non-contact mailbox (`NEVER`) | `hvivo.com` publishes `bd@`, `careers@` and `ir@`. A cold email to careers@ is worse than none: wrong desk, and it reads as a mass send |
+
+**Which address, when there are several.** A deny list decides what is usable; a
+short preference ladder decides between what is left, and a mailbox carrying the
+founder's own name wins outright because two independent sources then agree on
+the person (the same corroboration `code_pick_contact.js` ranks an Apollo
+candidate by). Measured on the real pages: `ee-cro.com` → `ilse.eder@` over
+`office@` and `michael.freigassner@`; `hvivo.com` → `bd@` over `careers@`/`ir@`;
+`delphiniumcro.com` → `info@` over `client@`. Ties break by length then
+alphabetically, so two runs of one batch write the same address.
+
+**Politeness.** At most `site_max_pages` requests per lead, only for leads with
+no address on disk, only on the lead's own host, three leads at a time, and a
+404 on a path nobody linked is not recorded as an error. A batch of 10 is at
+most ~50 requests spread over as many hosts.
 
 ## The pipeline
 
@@ -69,6 +164,8 @@ Cron / Manual → Config → Fetch ICH GCP CSV → Parse CSV → Index Scraped E
                                                                 │
                                             Get Qualified Batch ┘
                                                     ↓
+                                           Harvest Site Emails
+                                                    ↓
                                             Resolve Contact → Needs Apollo?
                                                                    │
                           ┌────────────────────────────────── no ──┤
@@ -76,11 +173,11 @@ Cron / Manual → Config → Fetch ICH GCP CSV → Parse CSV → Index Scraped E
                           │                                        ↓
                           │              Apollo People Search → Pick Best Contact
                           │                                        ↓
-                          │                                 Drop Failed Searches
-                          │                                        ↓
-                          │                                    Matched? ── no ──┐
-                          │                                        │ yes        │
-                          │                     Apollo People Match ↓           │
+                          │                               Apollo Answered? ── no ──┐
+                          │                                        │ yes           ↓
+                          │                                    Matched? ── no ──┐  Record
+                          │                                        │ yes        │  Lookup
+                          │                     Apollo People Match ↓           │  Attempt
                           │                Build Contact Payload (Apollo)       │
                           │                                        ↓            │
                           │                            Drop Failed Matches      │
@@ -88,17 +185,21 @@ Cron / Manual → Config → Fetch ICH GCP CSV → Parse CSV → Index Scraped E
                           └──────────────→ Write Contact & Advance ←────────────┘
 ```
 
-Four branch points, each with a reason:
+Five branch points, each with a reason:
 
 - **Needs Apollo?** — Section 7's ordering rule, one level finer. Of the leads
   that scored high enough to be worth paying for, only the ones with no address
-  already on disk reach a paid endpoint.
-- **Drop Failed Searches / Drop Failed Matches** — a call that did not answer is
-  not evidence. The lead is dropped, stays `scored`, and is retried next run.
-  Same self-healing shape as Workflow 3's `Drop Failed Lookups` and Workflow 2's
-  `Drop Failed Calls`.
+  on disk and none published on their own site reach a paid endpoint.
+- **Apollo Answered?** — was `Drop Failed Searches`, a filter that discarded a
+  refusal. It no longer discards. The lead still gets no `contacts` row — writing
+  one would record an outage as a permanent fact about the company — but the
+  attempt is recorded, which is what stops a lead Apollo will never answer for
+  from filling every batch of 10 for ever.
 - **Matched?** — only a candidate that cleared both the title gate and the domain
   gate is worth an enrichment credit.
+- **Drop Failed Matches** — a call that did not answer is not evidence. Same
+  self-healing shape as Workflow 3's `Drop Failed Lookups` and Workflow 2's
+  `Drop Failed Calls`.
 
 ## The credit-conservation finding
 
@@ -130,6 +231,7 @@ One flag, two sources, one definition: **the address is confirmed, not inferred.
 | Source | `verified` | Why |
 |---|---|---|
 | ichgcp profile page | `true` | A first-party address the company published about itself |
+| the company's own website | `true` | The same ground: published by them, about them, literally on the page |
 | Apollo, `email_status: verified` | `true` | Apollo confirmed deliverability |
 | Apollo, `email_status: guessed` | `false` | Pattern-derived. Real enough to keep, not to send to unchallenged |
 | Apollo, masked or absent | `false` | No address at all |
@@ -151,11 +253,16 @@ title and LinkedIn URL from the Workflow 2 site extraction.
 
 ## The three-way split, and why it is three and not two
 
+*(Still true of what reaches `contacts`. Since migration 015 every one of these
+outcomes also writes or clears a `contact_attempts` row — see "The queue used to
+starve" above — which is what decides whether the lead stays in the queue.)*
+
 The distinction this stage turns on:
 
 | Outcome | Row written | Lead advances | Retried |
 |---|---|---|---|
-| Apollo refused or failed the call | no | no | **yes** |
+| Apollo refused transiently (429, 5xx, timeout) | no | no | **yes**, up to `max_attempts` |
+| Apollo refused permanently (the plan gate) | no (an `exhausted` attempt instead) | no | no |
 | Apollo answered, nobody usable | tombstone | no | no |
 | Apollo answered, contact found | yes | yes | no |
 
@@ -163,6 +270,15 @@ The distinction this stage turns on:
 opposite things. Collapsing them either burns a credit per cron tick forever on
 domains Apollo has already answered for, or writes a permanent "no contact"
 against a company that has one, on the strength of a five-minute outage.
+
+**And a third pair, found 2026-10-07: "refused" is itself two things.** A 429 or a
+timeout could answer differently next hour. A plan-gated 403 cannot — it is a
+property of the account, measured on every endpoint, and will say the same thing
+every hour until somebody upgrades. Treating the second like the first is what
+was filling the batch of 10 with the same nine leads. `isPlanGate` in
+`code_pick_contact.js` recognises only the plan gate, positively; anything it
+does not recognise stays a retry, so the old rule holds for every refusal that
+could still pass.
 
 The **tombstone** is a `contacts` row with every field null and `verified=false`.
 It exists because the batch query has no other way to tell "not looked up yet"
@@ -235,7 +351,8 @@ it — the four leads currently waiting will be picked up by the next execution.
 | File | Role |
 |---|---|
 | `code_index_csv.js` | **Index Scraped Emails** — domain → email map from the committed CSV |
-| `code_resolve.js` | **Resolve Contact** — the credit gate; scraped address short-circuits Apollo |
+| `code_site_emails.js` | **Harvest Site Emails** — an address published on the lead's own site |
+| `code_resolve.js` | **Resolve Contact** — the credit gate; a published address short-circuits Apollo |
 | `code_pick_contact.js` | **Pick Best Contact** — ranks the search, splits refusal / no-match / match |
 | `code_payload_apollo.js` | **Build Contact Payload (Apollo)** — email_status → `verified`, drops masked addresses |
 | `code_payload_scrape.js` | **Build Contact Payload (Scraped)** — the zero-credit branch |
@@ -247,9 +364,10 @@ it — the four leads currently waiting will be picked up by the next execution.
 Offline, no network and no Apollo. All exit non-zero on failure:
 
 ```powershell
-node   n8n/contacts/test_resolve.js        # 30 cases
-node   n8n/contacts/test_pick_contact.js   # 51 cases
-python n8n/contacts/test_drift_guards.py   # 16 cases
+node   n8n/contacts/test_resolve.js        # 67 cases
+node   n8n/contacts/test_site_emails.js    # 32 cases
+node   n8n/contacts/test_pick_contact.js   # 68 cases
+python n8n/contacts/test_drift_guards.py   # 31 cases
 ```
 
 - **`test_resolve.js`** covers the half that spends nothing, where the failure
@@ -260,6 +378,11 @@ python n8n/contacts/test_drift_guards.py   # 16 cases
   object-shaped-error case is a regression test: the first live run rendered n8n's
   wrapped HTTP failure as `[object Object]`, throwing away the only field an
   operator needs.
+- **`test_site_emails.js`** mocks the HTTP layer and replays the real pages of
+  the nine leads that were stuck on 2026-10-07. Its job is the silent failure
+  mode of this source: a rule a shade too loose writes another company's address,
+  `verified = true`, and the pipeline emails it with nobody the wiser. So there is
+  a case for each of the three rules against the page that actually breaks it.
 - **`test_drift_guards.py`** mutates a scratch copy of the Master Ref (or the JS,
   or the ingestion workflow) and proves each build-time guard refuses. Two cases
   assert the opposite: that moving the score gate in the doc, or the CSV URL in
@@ -290,16 +413,21 @@ docker exec -e N8N_RUNNERS_BROKER_PORT=5690 -e N8N_RUNNERS_ENABLED=false `
   nova-scout-n8n-1 n8n execute --id contacts0001
 ```
 
-Repeat until this stops falling (it never reaches zero while a lead has neither a
-scraped address nor a founder LinkedIn -- those stay, see above):
+Repeat until this reaches zero:
 
 ```sql
 SELECT count(*) FROM leads l
   JOIN scores s ON s.lead_id = l.id
   LEFT JOIN contacts c ON c.lead_id = l.id
  WHERE l.status = 'scored' AND s.disqualified = false
-   AND s.fit_score >= 50 AND c.lead_id IS NULL;
+   AND s.fit_score >= 50 AND c.lead_id IS NULL
+   AND NOT EXISTS (SELECT 1 FROM contact_attempts a
+                    WHERE a.lead_id = l.id
+                      AND (a.last_outcome = 'exhausted' OR a.attempts >= 3));
 ```
+
+Since migration 015 this **does** reach zero: a lead nobody can reach is
+retired rather than retried, and `needs_manual_contact` is where it goes.
 
 The two `N8N_RUNNERS_*` overrides keep the one-off CLI process from colliding
 with the task-runner broker the long-running container already has bound.

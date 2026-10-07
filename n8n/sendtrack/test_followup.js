@@ -309,7 +309,12 @@ t.check('... with the record, the claims and the first email from Build Follow-U
 
 // The real shared gate (n8n/drafting/code_approval.js), on what Assemble Follow-Up wrote.
 const GATE = path.join(__dirname, '..', 'drafting', 'code_approval.js');
-const gateOf = (item) => runForEachItem(GATE, [{ json: item }], {})[0].json;
+// Section 12's business-hours clock table, as build_workflow.py bakes it into
+// the gate (rule 3b). A stand-in with these fixtures' country; the build checks
+// the real list against the doc and test_drift_guards.py proves that fires.
+const CLOCK_COUNTRIES = ['Poland', 'Hungary', 'India', 'Turkey'];
+const bakedGate = (s) => s.replace('__SEND_CLOCK_COUNTRIES__', JSON.stringify(CLOCK_COUNTRIES));
+const gateOf = (item) => runForEachItem(GATE, [{ json: item }], {}, bakedGate)[0].json;
 let G = gateOf(AP);
 t.check('a clean follow-up with the flag on goes on to the claim check',
   [G.needs_check, G.payload.draft.status, G.check_request.model], [true, 'pending', 'claude-sonnet-5-5']);

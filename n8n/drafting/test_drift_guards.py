@@ -18,10 +18,13 @@ Exits non-zero on the first guard that failed to fire.
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+
+BS = chr(92)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -638,6 +641,88 @@ case(
                                    "  approved_by (auto|human), approved_at, claim_check jsonb\n", 1),
     expect_in="which Section 8",
 )
+
+# --- Section 12's business-hours clocks (2026-10-07) ------------------------
+#
+# Drafting only needs to know WHICH countries have a clock: a lead in one that
+# does not can never be sent to, so Assess Grounding and the Approval Gate both
+# stop it before any model call. The sendtrack build is what checks the table's
+# numbers; these cases check that drafting reads the same table and refuses when
+# it cannot.
+case(
+    "Section 12's clock table disappears -> build refuses",
+    mutate_doc=lambda d: d.replace("| Country | Standard offset | Weekend | Tier |", "| Country | Offset |", 1),
+    expect_in="no clock table follows",
+)
+case(
+    "the clock heading disappears -> build refuses",
+    mutate_doc=lambda d: d.replace("**Business-hours clocks", "**Business hours, roughly", 1),
+    expect_in="'Business-hours clocks' heading not found",
+)
+case(
+    "a clock row loses a cell -> build refuses rather than guess",
+    mutate_doc=lambda d: d.replace("| India | UTC+5:30 | Sat-Sun | core |", "| India | UTC+5:30 | Sat-Sun |", 1),
+    expect_in="does not have 4 cells",
+)
+case(
+    "a clock row's offset is unreadable -> build refuses",
+    mutate_doc=lambda d: d.replace("| India | UTC+5:30 | Sat-Sun | core |", "| India | +5:30 | Sat-Sun | core |", 1),
+    expect_in="unreadable offset",
+)
+case(
+    "a country is listed twice -> build refuses",
+    mutate_doc=lambda d: d.replace("| India | UTC+5:30 | Sat-Sun | core |",
+                                   "| India | UTC+5:30 | Sat-Sun | core |" + chr(10)
+                                   + "| India | UTC+6:30 | Sat-Sun | core |", 1),
+    expect_in="listed twice",
+)
+case(
+    "Assess Grounding loses the clock placeholder -> build refuses",
+    mutate_js=lambda s: s.replace("const SEND_CLOCK_COUNTRIES = __SEND_CLOCK_COUNTRIES__;",
+                                  "const SEND_CLOCK_COUNTRIES = [];", 1),
+    expect_in="__SEND_CLOCK_COUNTRIES__",
+)
+case(
+    "the Approval Gate loses the clock placeholder -> build refuses",
+    mutate_js=lambda s: s.replace("const SEND_CLOCK_COUNTRIES = __SEND_CLOCK_COUNTRIES__;",
+                                  "const SEND_CLOCK_COUNTRIES = [];", 1),
+    js_file="code_approval.js",
+    expect_in="__SEND_CLOCK_COUNTRIES__",
+)
+
+
+def clock_list_flows():
+    tmp = tempfile.mkdtemp(prefix="novascout-drift-")
+    try:
+        shutil.copytree(HERE, os.path.join(tmp, "drafting"))
+        stage_companions(tmp)
+        doc_path = os.path.join(tmp, "MasterRef.md")
+        write(doc_path, read(MASTER_REF).replace(
+            "| Germany | UTC+1:00 | Sat-Sun | |" + chr(10), "", 1))
+        rc, err = run_build(tmp, doc_path)
+        if rc != 0:
+            FAILED.append(("dropping a country from the clock table changes what ships", "build refused:" + chr(10)
+                           + err[-400:]))
+            return
+        wf = json.loads(read(os.path.join(tmp, "out", "drafting.json")))
+        for name in ("Assess Grounding", "Approval Gate"):
+            code = [n for n in wf["nodes"] if n["name"] == name][0]["parameters"]["jsCode"]
+            m = re.search("const SEND_CLOCK_COUNTRIES = (" + BS + "[[^" + BS + "]]*" + BS + "]);", code)
+            if not m:
+                FAILED.append(("dropping a country from the clock table changes what ships",
+                               "%s carries no clock list" % name))
+                return
+            names = json.loads(m.group(1))
+            if "Germany" in names or "India" not in names:
+                FAILED.append(("dropping a country from the clock table changes what ships",
+                               "%s still lists Germany, or lost India: %r" % (name, names[:5])))
+                return
+        PASSED.append("dropping a country from the clock table changes what ships -- it is read, not restated")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+clock_list_flows()
 
 print("drift guards for Workflow 4\n")
 for label in PASSED:

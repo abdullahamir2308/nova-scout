@@ -20,6 +20,7 @@ round is the workflow's own Assemble node code, verbatim -- a repaired email
 runs every rule again because it runs the same code again.
 """
 import io
+import json
 import os
 import re
 
@@ -31,8 +32,17 @@ def _read(path):
         return fh.read()
 
 
-def load(drafting_dir):
+def load(drafting_dir, send_clock_countries):
+    """send_clock_countries: Section 12's business-hours clock table, as country
+    names. Baked into the gate (rule 3b) rather than read at runtime, so the
+    build can check it against the doc -- and so Drafting and Follow-Ups cannot
+    end up judging the same draft against two different lists."""
     gate = _read(os.path.join(drafting_dir, "code_approval.js"))
+    token = "__SEND_CLOCK_COUNTRIES__"
+    assert gate.count(token) == 1, "code_approval.js must carry %s exactly once" % token
+    assert sorted(send_clock_countries) == sorted(set(send_clock_countries)), (
+        "the business-hours clock list has a duplicate country")
+    gate = gate.replace(token, json.dumps(sorted(send_clock_countries), ensure_ascii=False))
     at = gate.find(MARKER)
     assert at != -1, "code_approval.js has no '%s' marker" % MARKER
     rules = gate[:at]

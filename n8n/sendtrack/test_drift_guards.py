@@ -16,6 +16,7 @@ Exits non-zero on the first guard that failed to fire.
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -37,6 +38,22 @@ APPROVAL_APPLY = os.path.join(REPO, "n8n", "drafting", "code_approval_apply.js")
 # The repair loop (2026-10-03): Apply Repair's body and the chain generator.
 APPROVAL_REPAIR = os.path.join(REPO, "n8n", "drafting", "code_approval_repair.js")
 APPROVAL_CHAIN = os.path.join(REPO, "n8n", "drafting", "approval_chain.py")
+# Section 12's clock table must cover every country the scraper includes, so each
+# case gets its own copy of the scraper tree -- geography.py classifies the slugs
+# and index_slugs.json is the /cro-list index as it was last read.
+SCRAPER = os.path.join(REPO, "scraper")
+
+def index_countries():
+    """The included countries of scraper/index_slugs.json, as the display names
+    that land in leads.country -- the same question the build asks, asked here
+    against the shipped workflow rather than the source."""
+    if REPO not in sys.path:
+        sys.path.insert(0, REPO)
+    from scraper import geography as geo
+
+    snap = json.loads(read(os.path.join(SCRAPER, "index_slugs.json")))
+    return sorted({geo.canonical_name(s) for s in snap["slugs"] if not geo.excluded_as(s)})
+
 
 PASSED = []
 FAILED = []
@@ -62,6 +79,7 @@ def run_build(tmp, env_overrides=None):
     env["NOVASCOUT_DRAFTING_SKILL"] = os.path.join(tmp, "DraftingSkill.md")
     env["NOVASCOUT_DRAFTING_DIR"] = os.path.join(tmp, "drafting")
     env["SENDTRACK_OUT"] = os.path.join(tmp, "out")
+    env["NOVASCOUT_SCRAPER_ROOT"] = tmp
     # The real .env is out of every case unless a case brings its own file.
     env["NOVASCOUT_ENV_FILE"] = os.path.join(tmp, "no-such.env")
     env["NOVASCOUT_SENDER_NAME"] = FIXTURE_SENDER
@@ -81,7 +99,7 @@ def run_build(tmp, env_overrides=None):
 
 
 def setup(mutate_doc=None, mutate_compose=None, mutate_file=None, mutate_skill=None, mutate_rules=None,
-          mutate_approval=None):
+          mutate_approval=None, mutate_index=None):
     tmp = tempfile.mkdtemp(prefix="novascout-sendtrack-drift-")
     for src, dst, fn, label in ((SKILL, "DraftingSkill.md", mutate_skill, "the skill"),
                                 (RULES, os.path.join("drafting", "code_assemble.js"), mutate_rules, "code_assemble.js"),
@@ -102,6 +120,14 @@ def setup(mutate_doc=None, mutate_compose=None, mutate_file=None, mutate_skill=N
         write(os.path.join(tmp, dst), text)
     shutil.copytree(HERE, os.path.join(tmp, "sendtrack"),
                     ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(SCRAPER, os.path.join(tmp, "scraper"),
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    if mutate_index:
+        q = os.path.join(tmp, "scraper", "index_slugs.json")
+        snap = json.loads(read(q))
+        new = mutate_index(snap)
+        assert new != snap, "index mutation did not change index_slugs.json"
+        write(q, json.dumps(new, indent=2) + chr(10))
     doc = read(MASTER_REF)
     if mutate_doc:
         new = mutate_doc(doc)
@@ -125,8 +151,9 @@ def setup(mutate_doc=None, mutate_compose=None, mutate_file=None, mutate_skill=N
 
 
 def case(label, expect_in, mutate_doc=None, mutate_compose=None, mutate_file=None, env_overrides=None,
-         mutate_skill=None, mutate_rules=None, mutate_approval=None):
-    tmp = setup(mutate_doc, mutate_compose, mutate_file, mutate_skill, mutate_rules, mutate_approval)
+         mutate_skill=None, mutate_rules=None, mutate_approval=None, mutate_index=None):
+    tmp = setup(mutate_doc, mutate_compose, mutate_file, mutate_skill, mutate_rules, mutate_approval,
+                mutate_index)
     try:
         rc, err = run_build(tmp, env_overrides)
         if rc == 0:
@@ -139,8 +166,10 @@ def case(label, expect_in, mutate_doc=None, mutate_compose=None, mutate_file=Non
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def positive(label, check, mutate_doc=None, env_overrides=None, files=None, mutate_skill=None, mutate_approval=None):
-    tmp = setup(mutate_doc, mutate_skill=mutate_skill, mutate_approval=mutate_approval)
+def positive(label, check, mutate_doc=None, env_overrides=None, files=None, mutate_skill=None, mutate_approval=None,
+             mutate_index=None):
+    tmp = setup(mutate_doc, mutate_skill=mutate_skill, mutate_approval=mutate_approval,
+                mutate_index=mutate_index)
     try:
         for name, content in (files or {}).items():
             write(os.path.join(tmp, name), content)
@@ -271,6 +300,18 @@ case("Follow-Ups goes back to 'Every 6 Hours' -> refuses (n8n's clock-hour recur
 case("Follow-Ups on 'every 2 days' -> refuses (same clock-value check, day of year)", "recurrenceCheck",
      mutate_file=("build_workflow.py", lambda s: s.replace(
          '{"field": "minutes", "minutesInterval": 30}', '{"field": "days", "daysInterval": 2}', 1)))
+# A fixed slot is the other half of the idempotency rule, added 2026-10-07 after
+# Ingestion was found firing once a day at 23:00 PKT on a host that is off at
+# night -- an interval of 1 passes the clock-value test but a pinned hour or
+# minute still leaves one moment a day to fire in.
+case("Send pinned to one minute of the hour -> refuses", "one moment a day (or a week) to fire in",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         '{"field": "minutes", "minutesInterval": 10}',
+         '{"field": "minutes", "minutesInterval": 10, "triggerAtMinute": 7}', 1)))
+case("the Daily Digest moved to a real daily slot -> refuses", "one moment a day (or a week) to fire in",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         '{"field": "minutes", "minutesInterval": 30}',
+         '{"field": "days", "daysInterval": 1, "triggerAtHour": 8}', 1)))
 case("the follow-up schema loses a field Assemble Follow-Up requires -> refuses", "do not match the follow-up schema",
      mutate_file=("build_workflow.py", lambda s: s.replace(
          '"required": ["body", "ask", "added_claim", "claims", "first_email_covers"],',
@@ -310,14 +351,29 @@ case("Write Follow-Up reads a draft field nothing upstream produces -> refuses",
 case("the shared gate reads an approval field Assemble Follow-Up never builds -> refuses",
      "Assemble Follow-Up's `approval` has no",
      mutate_approval=lambda s: s.replace("if (ctx.auto_approve !== true)", "if (ctx.auto_approve !== true || ctx.reviewer)", 1))
+def _approval_src():
+    """code_approval.js as the build ships it: with Section 12's clock table
+    substituted for __SEND_CLOCK_COUNTRIES__ (rule 3b, 2026-10-07). Comparing
+    against the raw file would report the shipped code as not verbatim when the
+    only difference is the one constant both generators bake in."""
+    doc = read(MASTER_REF)
+    at = doc.index("**Business-hours clocks")
+    head = "| Country | Standard offset | Weekend | Tier |"
+    body = doc[doc.index(head, at):].split(chr(10) + chr(10))[0].splitlines()[2:]
+    names = sorted(ln.strip().strip("|").split("|")[0].strip() for ln in body)
+    return read(APPROVAL).replace("__SEND_CLOCK_COUNTRIES__", json.dumps(names, ensure_ascii=False))
+
+
 def _rules():
-    return read(APPROVAL)[:read(APPROVAL).index("// Node body")]
+    src = _approval_src()
+    return src[:src.index("// Node body")]
 
 
 positive(
     "Follow-Ups ships drafting's Approval Gate verbatim in every round, and Apply Claim Check / Apply Repair as its "
     "rules + their bodies, each reading its own round's node",
-    lambda tmp: None if all(_fu_code(tmp, g) == read(APPROVAL) for g in ("Approval Gate", "Approval Gate R1", "Approval Gate R2"))
+    lambda tmp: None if all(_fu_code(tmp, g) == _approval_src()
+                            for g in ("Approval Gate", "Approval Gate R1", "Approval Gate R2"))
     and _fu_code(tmp, "Apply Claim Check") == _rules() + "\n" + read(APPROVAL_APPLY).replace("$('__GATE__')", "$('Approval Gate')")
     and _fu_code(tmp, "Apply Claim Check R2") == _rules() + "\n" + read(APPROVAL_APPLY).replace("$('__GATE__')", "$('Approval Gate R2')")
     and _fu_code(tmp, "Apply Repair 1") == _rules() + "\n" + read(APPROVAL_REPAIR).replace("$('__CHECKED__')", "$('Apply Claim Check')")
@@ -338,12 +394,12 @@ case("Apply Claim Check stops reading its own round's gate -> refuses", "must re
      mutate_file=("build_workflow.py", lambda s: s.replace("import approval_chain  # noqa: E402",
                                                            "import approval_chain  # noqa: E402\n"
                                                            "approval_chain_load = approval_chain.load\n"
-                                                           "def _load(d):\n"
+                                                           "def _load(d, *a, **k):\n"
                                                            "    import io as _io\n"
                                                            "    p = os.path.join(d, 'code_approval_apply.js')\n"
                                                            "    src = _io.open(p, encoding='utf-8').read()\n"
                                                            "    _io.open(p, 'w', encoding='utf-8').write(src.replace(\"$('__GATE__')\", \"$('Approval Gate')\"))\n"
-                                                           "    return approval_chain_load(d)\n"
+                                                           "    return approval_chain_load(d, *a, **k)\n"
                                                            "approval_chain.load = _load", 1)))
 case("Assemble Follow-Up stops handing the composition to the repair loop -> refuses",
      "the repair loop (composition / repair / repair_fields)",
@@ -386,12 +442,74 @@ positive(
     else "the shipped Assemble Follow-Up is not drafting's rules + the follow-up body",
 )
 
-# --- Section 12 and the sender clock ----------------------------------------
-case("Section 12 adds a country with no business-hours clock -> refuses", "geography list",
-     mutate_doc=lambda d: d.replace("Brazil, Argentina.", "Brazil, Argentina, Chile.", 1))
-case("the clock table drops a Section 12 country -> refuses", "geography list",
+# --- Section 12's business-hours clocks -------------------------------------
+#
+# Since 2026-10-07 the clock table covers every country the scraper includes,
+# not only the core 13, and the doc carries each country's offset and weekend.
+# Four ways that can go wrong, and all must refuse: a country with no clock (its
+# leads get drafted and then never sent), a clock whose numbers disagree with
+# the doc (sends out of hours, silently), a row the build cannot parse (which
+# would otherwise just be skipped), and a country the directory lists that
+# nobody added at all.
+case("Section 12's clock table loses a country the JS still has -> refuses",
+     "not Section 12's 'Business-hours clocks' table",
+     mutate_doc=lambda d: d.replace("| Nepal | UTC+5:45 | Sat | |\n", "", 1))
+case("the JS loses a clock the doc's table has -> refuses",
+     "not Section 12's 'Business-hours clocks' table",
      mutate_file=("code_decide.js", lambda s: s.replace(
-         "  'Egypt':          { utc_offset_min: 120,  weekend: [5, 6] },\n", "", 1)))
+         "  'Egypt':                   { utc_offset_min: 120,  weekend: [5, 6] },\n", "", 1)))
+case("a clock's offset drifts between the doc and the JS -> refuses",
+     "differing rows",
+     mutate_doc=lambda d: d.replace("| India | UTC+5:30 | Sat-Sun | core |",
+                                    "| India | UTC+6:30 | Sat-Sun | core |", 1))
+case("a clock's weekend drifts between the doc and the JS -> refuses",
+     "differing rows",
+     mutate_doc=lambda d: d.replace("| Saudi Arabia | UTC+3:00 | Fri-Sat | |",
+                                    "| Saudi Arabia | UTC+3:00 | Sat-Sun | |", 1))
+case("a clock row is written in a shape the build cannot read -> refuses rather than skip it",
+     "is not in the one shape the build reads",
+     mutate_file=("code_decide.js", lambda s: s.replace(
+         "  'Kenya':                   { utc_offset_min: 180,  weekend: [6, 0] },",
+         "  'Kenya': { weekend: [6, 0], utc_offset_min: 180 },", 1)))
+case("the clock table marks a non-core country 'core' -> refuses",
+     "marks a different set of countries 'core'",
+     mutate_doc=lambda d: d.replace("| Germany | UTC+1:00 | Sat-Sun | |",
+                                    "| Germany | UTC+1:00 | Sat-Sun | core |", 1))
+case("the clock table disappears -> refuses loudly",
+     "no clock table follows",
+     mutate_doc=lambda d: d.replace("| Country | Standard offset | Weekend | Tier |\n|---|---|---|---|\n", "", 1))
+case("the directory lists a country nobody gave a clock -> refuses",
+     "have no business-hours clock",
+     mutate_index=lambda s: dict(s, slugs=sorted(s["slugs"] + ["greenland"])))
+positive(
+    "an excluded jurisdiction in the index needs no clock -- it is never scraped",
+    lambda tmp: None,
+    mutate_index=lambda s: dict(s, slugs=sorted(s["slugs"] + ["north_korea"])),
+)
+
+
+def _shipped_clock_keys(tmp):
+    code = node(load(tmp, "send.json"), "Decide Send")["parameters"]["jsCode"]
+    block = re.search(r"const COUNTRY_CLOCKS = \{(.*?)\n\};", code, re.S).group(1)
+    return set(re.findall(r"""^\s*(?:'([^']+)'|"([^"]+)"):\s*\{\s*utc_offset_min""", block, re.M)) and {
+        (a or b) for a, b in re.findall(
+            r"""^\s*(?:'([^']+)'|"([^"]+)"):\s*\{\s*utc_offset_min""", block, re.M)}
+
+
+def _every_index_country_ships(tmp):
+    missing = sorted(c for c in index_countries() if c not in _shipped_clock_keys(tmp))
+    return None if not missing else "no clock reached the shipped Decide Send for: %r" % missing
+
+
+positive(
+    "every country in the committed index snapshot reaches the shipped Decide Send",
+    _every_index_country_ships,
+)
+
+# --- the sender clock -------------------------------------------------------
+case("Section 12 promotes a country to core without the clock table agreeing -> refuses",
+     "marks a different set of countries 'core'",
+     mutate_doc=lambda d: d.replace("Brazil, Argentina.", "Brazil, Argentina, Chile.", 1))
 case("docker-compose moves the operator to a DST zone -> refuses", "no fixed offset",
      mutate_compose=lambda c: c.replace("GENERIC_TIMEZONE: Asia/Karachi", "GENERIC_TIMEZONE: Europe/Istanbul", 1))
 case("the JS sender clock disagrees with docker-compose -> refuses", "sender clock drifted",

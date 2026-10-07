@@ -22,9 +22,16 @@ const SYSTEM_PROMPT = 'SYSTEM PROMPT SENTINEL';
 // The request base build_workflow.py substitutes (skill v3): model, max_tokens,
 // effort, schema. A stand-in with the same keys; the build checks the real one.
 const CLAUDE_REQUEST = { model: 'claude-sonnet-5-5', max_tokens: 16000, output_config: { effort: 'high' } };
+// Section 12's business-hours clock table, as build_workflow.py bakes it in. A
+// stand-in holding the countries these cases use plus one that is NOT in it, so
+// the no-send-clock branch can be exercised; the build checks the real list
+// against the doc, and test_drift_guards.py proves that guard fires.
+const CLOCK_COUNTRIES = ['Poland', 'Mexico', 'India', 'Turkey', 'Brazil', 'Argentina',
+  'Germany', 'Austria'];
 const withSystemPrompt = function (src) {
   return src.replace('__SYSTEM_PROMPT__', JSON.stringify(SYSTEM_PROMPT))
-    .replace('__CLAUDE_REQUEST__', JSON.stringify(CLAUDE_REQUEST));
+    .replace('__CLAUDE_REQUEST__', JSON.stringify(CLAUDE_REQUEST))
+    .replace('__SEND_CLOCK_COUNTRIES__', JSON.stringify(CLOCK_COUNTRIES));
 };
 
 // A lead row shaped like the Get Draft Batch query returns it.
@@ -818,5 +825,80 @@ const AB = assess(withLib({ therapeutic_areas: ['oncology', 'dermatology'] }), c
 t.check('absent areas exclude the lead\'s own', AB.indexOf('Oncology') === -1 && AB.indexOf('Dermatology') === -1, true);
 t.check('and never include Other, which is an ordinary word', AB.indexOf('Other'), -1);
 t.check('and include every other taxonomy area', AB.length, 15);
+
+// ---------------------------------------------------------------------------
+// A country with no Send business-hours clock (Section 12, 2026-10-07)
+//
+// This is checked FIRST, before the ClinicalTrials.gov answer is even read,
+// because it is the one skip that must never be retried: the lead takes the
+// no-model branch and Build Low-Context Drafts records why, which advances it
+// to 'drafted' and gets it out of a queue it would otherwise sit in for ever.
+// ---------------------------------------------------------------------------
+
+const NOCLOCK = assess(lead({ country: 'Greenland', therapeutic_areas: ['Oncology'], city: 'Nuuk' }), ctgov(0, []));
+t.check('a country with no clock is not groundable, whatever its facts', NOCLOCK.groundable, false);
+t.check('and it is flagged as the clock problem, not a fact problem', NOCLOCK.no_send_clock, true);
+t.check('ok is true, so it is NOT dropped and retried next tick', NOCLOCK.ok, true);
+t.check('no prompt is built, so no model call can be made', NOCLOCK.prompt === undefined, true);
+t.check('no request is built either', NOCLOCK.request === undefined, true);
+t.check('the country travels with it, for the note', NOCLOCK.country, 'Greenland');
+t.check(
+  'a lead with no country at all takes the same branch',
+  [assess(lead({ country: null }), ctgov(0, [])).no_send_clock,
+   assess(lead({ country: '' }), ctgov(0, [])).no_send_clock],
+  [true, true]
+);
+t.check(
+  'the clock is matched case-insensitively, exactly as code_decide.js matches it',
+  assess(lead({ country: 'poland', therapeutic_areas: ['Oncology'], city: 'Warsaw' }), ctgov(0, [])).no_send_clock,
+  undefined
+);
+t.check(
+  'a clock country is unaffected -- it still runs the whole guard',
+  assess(lead({ country: 'Germany', therapeutic_areas: ['Oncology'], city: 'Berlin' }), ctgov(0, [])).groundable,
+  true
+);
+t.check(
+  'a failed ClinicalTrials.gov lookup cannot turn a no-clock lead into a retry',
+  assess(lead({ country: 'Greenland' }), { error: 'ETIMEDOUT' }).no_send_clock,
+  true
+);
+t.check(
+  'the addressing modes are still recorded, so a reviewer knows what is reachable',
+  [assess(lead({ country: 'Greenland', email: 'a@b.com' }), ctgov(0, [])).email_addressing,
+   assess(lead({ country: 'Greenland' }), ctgov(0, [])).email_addressing,
+   assess(lead({ country: 'Greenland', linkedin_url: 'https://linkedin.com/in/x' }), ctgov(0, [])).linkedin_addressing],
+  ['addressed', 'unaddressed', 'addressed']
+);
+
+// --- and what Build Low-Context Drafts does with it -------------------------
+
+const LOWCTX = path.join(__dirname, 'code_lowcontext.js');
+
+function note(assessed) {
+  return runForEachItem(LOWCTX, [{ json: assessed }], {})[0].json;
+}
+
+const NOTE_CLOCK = note(NOCLOCK);
+t.check('the no-clock note is tagged no-send-clock, never low-context',
+  NOTE_CLOCK.payload.drafts.map(function (d) { return d.variant.split('/')[0]; }),
+  ['no-send-clock', 'no-send-clock']);
+t.check('it names the country, so the reviewer knows what to add',
+  NOTE_CLOCK.payload.drafts[0].body.indexOf('Greenland') !== -1, true);
+t.check('it says plainly that nothing was generated and nothing was paid for',
+  NOTE_CLOCK.payload.drafts[0].body.indexOf('no model') !== -1, true);
+t.check('it still starts "NOT DRAFTED", which is what the send path refuses on',
+  NOTE_CLOCK.payload.drafts[0].body.indexOf('NOT DRAFTED'), 0);
+t.check('it advances the lead, so the queue behind it is not starved',
+  NOTE_CLOCK.payload.advance, true);
+
+const NOTE_LC = note(assess(lead({ country: 'Poland' }), ctgov(0, [])));
+t.check('a genuine low-context note is unchanged -- still the low-context prefix',
+  NOTE_LC.payload.drafts.map(function (d) { return d.variant.split('/')[0]; }),
+  ['low-context', 'low-context']);
+t.check('and still explains the grounding guard, not a clock',
+  [NOTE_LC.payload.drafts[0].body.indexOf('low context') !== -1,
+   NOTE_LC.payload.drafts[0].body.indexOf('clock') !== -1],
+  [true, false]);
 
 t.done();
