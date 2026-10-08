@@ -369,6 +369,13 @@ function ineligibility(c) {
       ' draft reached the send path (draft ' + c.draft_id + ')');
   }
   if (str(c.status) !== 'approved') return 'not-approved';
+  // A reply to a prospect who wrote to us is the reply lane's (Workflow 7): it
+  // skips the warm-up ceiling and the recipient's business hours, and it answers
+  // the address that wrote rather than contacts.email. The query does not
+  // select one, so reaching this line means the SQL changed -- and two of the
+  // checks below (a replied lead's status, and lead-replied) would stop it
+  // anyway. Named explicitly so the reason in the execution is the true one.
+  if (/^reply\//.test(str(c.variant))) return 'reply-lane';
   const followUp = /^follow-up-/.test(str(c.variant));
   const body = normaliseBody(c.body);
 

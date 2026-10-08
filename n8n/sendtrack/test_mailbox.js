@@ -17,6 +17,21 @@ const OWN = 'amitrixlabs.com';
 const OPT = "If this isn't relevant, reply 'no' and I won't follow up.";
 const ownDomain = (s) => s.replace('__OWN_DOMAIN__', JSON.stringify(OWN));
 
+// Since 2026-10-09 the shipped Classify Inbound node is two files: the
+// operator-command library (code_operator_command.js above its own 'Node body'
+// marker) and then this one, because the command has to be read before the
+// classification (Section 9, Workflow 7). The node-body test below therefore
+// gets the same two-part source build_workflow.py ships, or `operatorCommand`
+// would be undefined -- which is exactly the kind of wiring a unit test on one
+// file alone cannot see.
+const fs = require('fs');
+const SIGNATURE = 'Abdullah Amir\nFounder, Amitrix Labs\n+923178485713';
+const operatorLib = fs.readFileSync(path.join(__dirname, 'code_operator_command.js'), 'utf8')
+  .split('// Node body')[0]
+  .replace('__SIGNATURE__', JSON.stringify(SIGNATURE))
+  .replace('__MAX_URLS__', '1');
+const classifyNode = (s) => operatorLib + '\n' + ownDomain(s);
+
 const t = runner('Workflow 6 -- Mailbox Watch');
 
 // --- Sent mirror --------------------------------------------------------------
@@ -153,8 +168,33 @@ t.check('reply metadata', [c.message_id, c.received_at, c.from_addr, c.from_doma
 t.check('a gmail sender is flagged freemail (never matched or blocklisted by domain)',
   classify(inbound('hi', { from: 'X <someone@gmail.com>' })).freemail, true);
 t.check('optOutKeyword on an empty body is null', optOutKeyword(''), null);
-const node = runForEachItem(CLASSIFY, [{ json: inbound('Stop.') }], {}, ownDomain);
+const node = runForEachItem(CLASSIFY, [{ json: inbound('Stop.') }], {}, classifyNode);
 t.check('the shipped node body wraps the classification as payload', node[0].json.payload.classification, 'opt-out');
+// The operator fork: one message, read twice, in the shipped node. A prospect's
+// message is not a command; the thread headers now ride along on the payload
+// (migration 017), because a reply draft has to thread to them.
+t.check('... and reads the same message for an operator command -- a prospect reply is not one',
+  node[0].json.command, { is_command: false, command: null, code: null, replacement: null,
+    spf_pass: false, dkim_pass: false, refused_reason: null });
+const threaded = runForEachItem(CLASSIFY, [{ json: inbound('Tell me more.', {},
+  { 'in-reply-to': '<seed@amitrixlabs.com>', references: '<seed@amitrixlabs.com>' }) }], {}, classifyNode);
+t.check('the payload carries the thread headers as received (migration 017)',
+  [threaded[0].json.payload.in_reply_to, threaded[0].json.payload.references_raw,
+    threaded[0].json.payload.thread_ids],
+  ['<seed@amitrixlabs.com>', '<seed@amitrixlabs.com>', ['<seed@amitrixlabs.com>']]);
+t.check('... and NULL, not an empty string, when the message carried none',
+  [classify(inbound('hi', {}, { 'in-reply-to': '', references: '' })).in_reply_to,
+    classify(inbound('hi', {}, { 'in-reply-to': '', references: '' })).references_raw], [null, null]);
+// The hazard this fork exists for: the operator's own "APPROVE NS-..." is read
+// as a command from the same text the classifier reads, so it can never reach
+// the opt-out path. The decision about WHO sent it is SQL's (the operator
+// address is runtime data), which is why is_command is all this file reports.
+const opcmd = runForEachItem(CLASSIFY, [{ json: inbound('APPROVE NS-2345678ABC' + GMAIL_QUOTE, {},
+  { 'authentication-results': 'mx; dkim=pass; spf=pass' }) }], {}, classifyNode);
+t.check('an operator APPROVE in the same mailbox is recognised as a command, with its code',
+  [opcmd[0].json.command.is_command, opcmd[0].json.command.command, opcmd[0].json.command.code,
+    opcmd[0].json.command.spf_pass, opcmd[0].json.command.dkim_pass, opcmd[0].json.command.refused_reason],
+  [true, 'APPROVE', 'NS-2345678ABC', true, true, null]);
 
 // --- positive-signal detection -----------------------------------------------
 // Deterministic (build rule 3, no model), and does NOT touch classification --

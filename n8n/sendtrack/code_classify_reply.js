@@ -181,6 +181,13 @@ function classify(j) {
     subject: subject.slice(0, 300),
     classification: classification,
     opt_out_keyword: kw,
+    // Stored as received (migration 017): a reply draft has to thread to the
+    // conversation it answers, and these were parsed and thrown away until
+    // 2026-10-08. `thread_ids` is the parsed array Record Inbound matches a
+    // lead on; the other two are the headers themselves, because a client that
+    // drops its References chain leaves a gap nothing can reconstruct.
+    in_reply_to: str(meta['in-reply-to']) || null,
+    references_raw: str(meta['references']) || null,
     thread_ids: isBounce ? threadIds.concat(messageIds(raw)).filter(function (x, i, a) { return a.indexOf(x) === i; }) : threadIds,
     mentioned_addrs: isBounce ? addresses(raw).filter(function (a) { return domainOf(a) !== OWN_DOMAIN; }) : [],
     reply_text: fresh.slice(0, 4000),
@@ -191,5 +198,21 @@ function classify(j) {
 // ---------------------------------------------------------------------------
 // Node body
 // ---------------------------------------------------------------------------
-
-return { json: { payload: classify($input.item.json) } };
+//
+// Two readings of one message, and the ORDER matters (Section 9, Workflow 7).
+// build_workflow.py ships code_operator_command.js above this file -- every
+// line above its own "Node body" marker, verbatim -- so `operatorCommand` is
+// defined here. The operator answers the reply-review email from this same
+// mailbox, and that answer is a reply INSIDE the prospect's thread: the review
+// email quotes it, so References carries our own Message-ID and Record
+// Inbound's strongest matcher would tie the operator's message to the
+// prospect's lead. A one-word "no" from the operator would then blocklist a
+// real prospect, permanently, with no error anywhere.
+//
+// So the command is read first, from exactly the text the classifier reads --
+// what they wrote above the quoted thread -- and the fork itself is made
+// downstream, where the operator's address is known: it lives in the `settings`
+// table at runtime and may never be baked into this JSON (migration 008).
+const j = $input.item.json;
+const payload = classify(j);
+return { json: { payload: payload, command: operatorCommand(j, payload.reply_text) } };

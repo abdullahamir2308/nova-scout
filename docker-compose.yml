@@ -73,6 +73,41 @@ services:
       - ./NovaScout_MasterRef.md:/opt/novascout/NovaScout_MasterRef.md:ro
     command: ["python", "-u", "/opt/novascout/sendtrack/imap_health_server.py"]
 
+  smtp-send:
+    # The reply assistant's sender (Master Ref Section 9, Workflow 7). Runs
+    # n8n/sendtrack/smtp_send_server.py, which the "Send & Track - Send Reply"
+    # workflow calls at http://smtp-send:8766/send.
+    #
+    # It exists for one measured reason: a reply has to carry In-Reply-To and
+    # References, and n8n's Send Email node cannot set them -- read from the
+    # installed node on 2026-10-09, it builds nodemailer's mailOptions from a
+    # fixed field set with no headers option. nodemailer supports them; n8n does
+    # not pass them. That file has the detail. The COLD send path is untouched
+    # and still goes through the Send Email node.
+    #
+    # Same containment as imap-health, and for a stronger reason -- this one can
+    # send mail: only the mailbox's own SMTP settings (not the whole .env), code
+    # mounted read-only, a read-only filesystem, no root, and NO published port.
+    # It has no authentication of its own, so it stays on the compose network,
+    # and it refuses to send as any From but the configured mailbox.
+    # build_workflow.py refuses a `ports:` here.
+    image: python:3.12-alpine
+    restart: unless-stopped
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      NOVASCOUT_MAILBOX_ADDRESS: ${NOVASCOUT_MAILBOX_ADDRESS}
+      NOVASCOUT_MAILBOX_PASSWORD: ${NOVASCOUT_MAILBOX_PASSWORD}
+      NOVASCOUT_SMTP_HOST: ${NOVASCOUT_SMTP_HOST}
+      NOVASCOUT_SMTP_PORT: ${NOVASCOUT_SMTP_PORT:-465}
+      NOVASCOUT_SENDER_NAME: ${NOVASCOUT_SENDER_NAME}
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./n8n/sendtrack:/opt/novascout/sendtrack:ro
+    command: ["python", "-u", "/opt/novascout/sendtrack/smtp_send_server.py"]
+
   nocodb:
     image: nocodb/nocodb:latest
     restart: unless-stopped

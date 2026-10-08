@@ -629,6 +629,11 @@ def iso(expr):
     return "to_char((%s) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')" % expr
 
 
+def with_iso(sql):
+    """ISO(x) in a statement here -> iso(x), so every clock value leaves in one format."""
+    return re.sub(r"ISO\(([\w.]+)\)", lambda m: iso(m.group(1)), sql)
+
+
 BLOCKED_DOMAIN = ("EXISTS (SELECT 1 FROM blocklist b WHERE {d} = b.domain OR {d} LIKE '%.' || b.domain)")
 
 # The candidate row Decide Send sees for every approved email draft. Kept as a
@@ -687,6 +692,13 @@ cand AS (
     LEFT JOIN contacts c ON c.lead_id = d.lead_id
    WHERE d.channel = 'email'     -- Section 6: LinkedIn is sent by a human. Always.
      AND d.status = 'approved'   -- Workflow 5: nothing goes out that a human did not approve.
+     -- A reply belongs to the reply lane (Workflow 7), which skips the ceiling
+     -- and business hours and answers the address that wrote rather than
+     -- contacts.email. Excluded here rather than filtered later, so the cold
+     -- path never reads one: two independent guards would already have stopped
+     -- it (a replied lead's status, and outreach_log.replied), but "the cold
+     -- path cannot see a reply" is the statement worth being able to make.
+     AND coalesce(d.variant, '') NOT LIKE 'reply/%'
    ORDER BY d.id
    LIMIT 200
 )
@@ -763,6 +775,7 @@ d AS (
    WHERE d.id = (p.p->>'draft_id')::bigint
      AND d.channel = 'email'
      AND d.status = 'approved'
+     AND coalesce(d.variant, '') NOT LIKE 'reply/%'   -- the reply lane's, not this one's (Workflow 7)
      AND coalesce(d.edited_body, d.body) = p.p->>'raw_body'
      AND l.id = d.lead_id
      AND c.lead_id = d.lead_id
@@ -937,8 +950,29 @@ RECORD_INBOUND_SQL = """-- Record Inbound: match one INBOX message to a lead, re
 --
 -- The row also carries the operator's notification address, read from the
 -- settings table at runtime, so Build Notification has nothing baked in.
+--
+-- A MESSAGE FROM THE OPERATOR IS NEVER MATCHED TO A LEAD -- added 2026-10-09
+-- with the reply assistant (Section 9, Workflow 7), and this is the guard that
+-- makes a one-word "no" from the operator harmless. The operator answers the
+-- reply-review email from this same mailbox, and that answer is a reply INSIDE
+-- the prospect's thread: the review email quotes it, so References carries our
+-- own Message-ID and the `thread` matcher below -- the strongest one -- would
+-- tie the operator's message to the prospect's lead. "No" is Section 5's
+-- opt-out word, so the lead's domain would be blocklisted permanently, with no
+-- error anywhere. A command-shaped message never reaches this statement at all
+-- (Apply Operator Command handles it first); this catches everything else the
+-- operator sends here. Such a message is still RECORDED -- `lead_id` NULL,
+-- classification 'unmatched' -- so it is visible and idempotent, but nothing
+-- is blocklisted, no lead advances and nobody is notified.
 WITH p AS (
   SELECT $1::jsonb AS p
+),
+op AS (
+  SELECT (SELECT value FROM settings WHERE key = 'operator_email') AS addr
+),
+from_operator AS (
+  SELECT op.addr IS NOT NULL AND lower(op.addr) = lower(p.p->>'from_addr') AS yes
+    FROM p, op
 ),
 hit AS (
   SELECT h.lead_id, h.how
@@ -964,17 +998,24 @@ hit AS (
          AND NOT (p.p->>'own_domain')::boolean
          AND lower(l.domain) = p.p->>'from_domain'
          AND EXISTS (SELECT 1 FROM outreach_log o WHERE o.lead_id = l.id AND o.channel = 'email')
-    ) h
+    ) h, from_operator f
+   WHERE NOT f.yes
    ORDER BY h.rank, h.lead_id
    LIMIT 1
 ),
 ins AS (
   INSERT INTO inbound_messages (message_id, received_at, from_addr, subject, lead_id, matched_by,
-                                classification, opt_out_keyword, body_excerpt)
+                                classification, opt_out_keyword, body_excerpt,
+                                in_reply_to, references_raw, thread_ids)
   SELECT p.p->>'message_id', (p.p->>'received_at')::timestamptz, p.p->>'from_addr', p.p->>'subject',
          (SELECT lead_id FROM hit), (SELECT how FROM hit),
          CASE WHEN (SELECT lead_id FROM hit) IS NULL THEN 'unmatched' ELSE p.p->>'classification' END,
-         p.p->>'opt_out_keyword', p.p->>'body_excerpt'
+         p.p->>'opt_out_keyword', p.p->>'body_excerpt',
+         -- Migration 017: stored as received, because a reply draft has to
+         -- thread to the conversation it answers and these were parsed and
+         -- thrown away until 2026-10-08.
+         p.p->>'in_reply_to', p.p->>'references_raw',
+         coalesce(ARRAY(SELECT jsonb_array_elements_text(p.p->'thread_ids')), '{}')
     FROM p
   ON CONFLICT (message_id) DO NOTHING
   RETURNING lead_id, classification, received_at
@@ -1057,6 +1098,558 @@ SELECT ((SELECT count(*) FROM ins) = 1
   LEFT JOIN leads l    ON l.id = (SELECT lead_id FROM hit)
   LEFT JOIN scores s   ON s.lead_id = l.id
   LEFT JOIN contacts c ON c.lead_id = l.id;"""
+
+COMMAND_CONTEXT_SQL = with_iso("""-- Load Command Context: the three things Decide Command cannot read off the
+-- message itself (Section 9, Workflow 7). READ-ONLY -- it changes nothing, so a
+-- message that turns out not to be an operator command has cost one SELECT.
+--
+-- $1 { msg: Classify Inbound's payload, cmd: its operator-command parse }
+--
+--   * the operator's address, from `settings` at runtime (migration 008). It is
+--     never baked into workflow JSON, which is exactly why the sender check
+--     cannot live in code_operator_command.js.
+--   * the one-time code, if the message quoted one: does it exist, has it been
+--     used, has it expired, and which draft is it for (migration 017).
+--   * that draft's state and its current text, which an EDIT reframes.
+--
+-- Nothing here decides anything. Decide Command judges, and Apply Operator
+-- Command re-derives all three before it writes -- a bug in between can refuse
+-- a real approval, never accept a forged one.
+WITH p AS (
+  SELECT $1::jsonb AS p
+)
+SELECT p.p->'msg'                                              AS payload,
+       p.p->'cmd'                                              AS command,
+       (SELECT value FROM settings WHERE key = 'operator_email') AS operator_email,
+       ISO(now())                                              AS now,
+       a.code IS NOT NULL                                      AS code_found,
+       ISO(a.used_at)                                          AS code_used_at,
+       ISO(a.expires_at)                                       AS code_expires_at,
+       a.kind                                                  AS code_kind,
+       a.outcome                                               AS code_outcome,
+       a.draft_id                                              AS draft_id,
+       a.lead_id                                               AS code_lead_id,
+       d.status                                                AS draft_status,
+       d.channel                                               AS draft_channel,
+       d.variant                                               AS draft_variant,
+       coalesce(d.edited_body, d.body)                         AS draft_body
+  FROM p
+  LEFT JOIN reply_approvals a ON a.code = upper(p.p->'cmd'->>'code')
+  LEFT JOIN drafts d          ON d.id = a.draft_id;""")
+
+COMMAND_APPLY_SQL = """-- Apply Operator Command: record what arrived, and do what it is allowed to do.
+--
+-- $1 Decide Command's verdict (with the message payload and the parse on it)
+--
+-- THE RECORD COMES FIRST IN IMPORTANCE, not in the statement: every
+-- command-shaped message the mailbox receives gets a row in operator_commands,
+-- accepted or refused, keyed on Message-ID so a re-delivery acts once -- the
+-- role inbound_messages plays for a prospect message. The refused rows are the
+-- point (migration 017): a spoofed sender, a failed SPF or DKIM, an unknown,
+-- expired or reused code.
+--
+-- EVERYTHING THAT GRANTS AUTHORITY IS RE-DERIVED HERE and nothing is taken from
+-- the item, exactly as Claim Send re-checks what Decide Send decided:
+--   * the operator address comes from `settings`, again;
+--   * `sender_ok` is computed, not read;
+--   * the code must still be usable, through reply_approval_usable() --
+--     migration 017's single definition of "may be acted on now";
+--   * the draft must still be the pending draft that code belongs to.
+-- Migration 017's CHECK then refuses to store `accepted` at all unless SPF,
+-- DKIM and the sender all passed, so a bug in the workflow can refuse a real
+-- approval and cannot accept a forged one.
+--
+-- The code is marked used ONLY when the draft actually moved, so a refusal --
+-- including an EDIT that breaks Section 5's one-URL rule -- leaves the code
+-- good for another try.
+--
+-- `payload` is handed back unchanged: a command-shaped message that did NOT
+-- come from the operator falls through to Record Inbound, because it may well
+-- be a prospect writing (`handled` is false for it).
+WITH p AS (
+  SELECT $1::jsonb AS p
+),
+j AS (
+  SELECT p.p->'payload'                                        AS payload,
+         p.p->'payload'->>'message_id'                         AS message_id,
+         (p.p->'payload'->>'received_at')::timestamptz          AS received_at,
+         lower(p.p->'payload'->>'from_addr')                    AS from_addr,
+         left(coalesce(p.p->'payload'->>'subject', ''), 300)    AS subject,
+         nullif(p.p->>'command', '')                            AS command,
+         nullif(upper(coalesce(p.p->>'code', '')), '')          AS code,
+         coalesce((p.p->>'spf_pass')::boolean, false)           AS spf_pass,
+         coalesce((p.p->>'dkim_pass')::boolean, false)          AS dkim_pass,
+         (p.p->>'refused_reason')                               AS refused_reason,
+         (p.p->>'replacement')                                  AS replacement,
+         (p.p->>'edited_body')                                  AS edited_body,
+         (p.p->>'draft_id')::bigint                             AS draft_id,
+         (p.p->>'outcome')                                      AS outcome,
+         p.p->>'code_kind'                                      AS code_kind,
+         (SELECT value FROM settings WHERE key = 'operator_email') AS operator_email
+    FROM p
+),
+ok AS (
+  SELECT j.*,
+         (j.spf_pass AND j.dkim_pass AND j.operator_email IS NOT NULL
+          AND lower(j.operator_email) = j.from_addr)            AS sender_ok,
+         (j.refused_reason IS NULL AND j.command IS NOT NULL AND j.code IS NOT NULL
+          AND j.spf_pass AND j.dkim_pass AND j.operator_email IS NOT NULL
+          AND lower(j.operator_email) = j.from_addr
+          AND reply_approval_usable(j.code))                    AS may_act
+    FROM j
+),
+used AS (
+  UPDATE reply_approvals a
+     SET used_at            = now(),
+         used_by_message_id = ok.message_id,
+         outcome            = ok.outcome
+    FROM ok
+   WHERE a.code = ok.code
+     AND ok.may_act
+     AND a.used_at IS NULL
+     AND a.draft_id = ok.draft_id
+  RETURNING a.code, a.draft_id, a.outcome, a.kind
+),
+act AS (
+  UPDATE drafts d
+     SET status        = CASE WHEN u.outcome = 'rejected' THEN 'rejected' ELSE 'approved' END,
+         reject_reason = CASE WHEN u.outcome = 'rejected' THEN 'bad draft' ELSE d.reject_reason END,
+         edited_body   = CASE WHEN u.outcome = 'edited' THEN ok.edited_body ELSE d.edited_body END
+    FROM used u, ok
+   WHERE d.id = u.draft_id
+     AND d.status = 'pending'
+  RETURNING d.id, d.status, d.variant
+),
+rec AS (
+  INSERT INTO operator_commands (message_id, received_at, from_addr, subject, command, code,
+                                 spf_pass, dkim_pass, sender_ok, accepted, refused_reason,
+                                 replacement, draft_id)
+  SELECT ok.message_id, coalesce(ok.received_at, now()), ok.from_addr, nullif(ok.subject, ''),
+         ok.command, ok.code, ok.spf_pass, ok.dkim_pass, ok.sender_ok,
+         (SELECT count(*) FROM act) = 1,
+         CASE WHEN (SELECT count(*) FROM act) = 1 THEN NULL
+              ELSE coalesce(ok.refused_reason,
+                            'the code or the draft changed between the read and the write') END,
+         CASE WHEN ok.command = 'EDIT' THEN ok.replacement END,
+         ok.draft_id
+    FROM ok
+  ON CONFLICT (message_id) DO NOTHING
+  RETURNING message_id, accepted, refused_reason
+)
+SELECT (SELECT count(*) FROM rec) = 1                     AS recorded,
+       (SELECT count(*) FROM act) = 1                     AS accepted,
+       -- Re-derived, not carried over from the item: "this is the operator's
+       -- own mail" is the decision that stops a prospect's reply being
+       -- recorded, so it is made from `settings` here too.
+       (ok.sender_ok AND ok.spf_pass AND ok.dkim_pass)     AS handled,
+       -- An acknowledgement goes only to an authenticated operator, and only
+       -- the first time this Message-ID is seen: a re-delivery records nothing
+       -- new and must not answer twice.
+       (ok.sender_ok AND ok.spf_pass AND ok.dkim_pass
+        AND (SELECT count(*) FROM rec) = 1)               AS notify,
+       ok.operator_email                                  AS notify_to,
+       ok.message_id                                      AS message_id,
+       ok.subject                                         AS subject,
+       ok.command                                         AS command,
+       ok.code                                            AS code,
+       ok.code_kind                                       AS code_kind,
+       ok.spf_pass                                        AS spf_pass,
+       ok.dkim_pass                                       AS dkim_pass,
+       ok.sender_ok                                       AS sender_ok,
+       CASE WHEN (SELECT count(*) FROM act) = 1 THEN NULL
+            ELSE coalesce(ok.refused_reason,
+                          'the code or the draft changed between the read and the write') END
+                                                          AS refused_reason,
+       ok.draft_id                                        AS draft_id,
+       (SELECT status FROM act)                           AS draft_status,
+       (SELECT variant FROM act)                          AS draft_variant,
+       CASE WHEN (SELECT count(*) FROM act) = 1 THEN ok.edited_body END AS edited_body,
+       (SELECT outcome FROM used)                         AS outcome,
+       ok.payload                                         AS payload
+  FROM ok;"""
+
+REPLY_QUEUE_SQL = with_iso("""-- Find Replies To Answer -- the Reply Assistant's queue (Section 9, Workflow 7).
+-- READ-ONLY, one row per prospect message that still needs an answer.
+--
+-- $1 now_override ('' in the shipped workflow), $2 batch_size
+--
+-- THE QUEUE IS inbound_messages, NOT leads, and that is the whole of its
+-- idempotency: one drafted reply per prospect MESSAGE, for ever, because a
+-- reply_approvals row keyed to that Message-ID is proof one was drafted --
+-- whatever became of it. So a rejected reply is never redrafted (delete its
+-- reply_approvals row to ask for another), an expired code does not cause a
+-- second draft, and a prospect who writes again gets a new answer because that
+-- is a new Message-ID. Section 7's rule holds too: a missed run just means the
+-- next one finds the same message waiting.
+--
+-- Only `reply` is queued. An auto-reply, a bounce and an opt-out are not a
+-- person asking something (Classify Inbound's precedence), and an opt-out most
+-- certainly does not get answered.
+--
+-- The blocklist is checked HERE as well as in the send lane, so a prospect who
+-- replied and then opted out costs no model call at all.
+WITH clk AS (
+  SELECT coalesce(nullif($1, '')::timestamptz, now()) AS now
+),
+q AS (
+  SELECT i.message_id, i.received_at, i.from_addr, i.subject, i.in_reply_to, i.references_raw,
+         i.thread_ids, i.body_excerpt, i.lead_id
+    FROM inbound_messages i
+    JOIN leads l ON l.id = i.lead_id
+   WHERE i.classification = 'reply'
+     AND i.lead_id IS NOT NULL
+     AND NOT EXISTS (SELECT 1 FROM reply_approvals a WHERE a.inbound_message_id = i.message_id)
+     AND NOT __LEAD_BLOCKED__
+     AND NOT __FROM_BLOCKED__
+   ORDER BY i.received_at, i.message_id
+   LIMIT $2::int
+)
+SELECT q.message_id                                                     AS inbound_message_id,
+       ISO(q.received_at)                                               AS received_at,
+       q.from_addr                                                      AS from_addr,
+       q.subject                                                        AS subject,
+       q.in_reply_to                                                    AS in_reply_to,
+       q.references_raw                                                 AS references_raw,
+       q.thread_ids                                                     AS thread_ids,
+       -- What they wrote, above the quoted thread. outreach_log.reply_body has
+       -- it to 4,000 characters but holds the FIRST reply on that lead for
+       -- ever (Record Inbound coalesces), so it is used only when its
+       -- replied_at is this very message; otherwise the 600-character excerpt
+       -- in inbound_messages, which is per message and therefore always about
+       -- the right one.
+       coalesce((SELECT o.reply_body FROM outreach_log o
+                  WHERE o.lead_id = q.lead_id AND o.reply_body IS NOT NULL
+                    AND o.replied_at = q.received_at
+                  ORDER BY o.sent_at DESC LIMIT 1), q.body_excerpt)      AS reply_text,
+       l.id                                                             AS lead_id,
+       l.company_name                                                   AS company_name,
+       l.domain                                                         AS domain,
+       l.country                                                        AS country,
+       l.source                                                         AS source,
+       -- A name only when the person who wrote IS the contact on file; the
+       -- display name is not stored and a first name guessed out of a local
+       -- part would be an invented fact in the greeting.
+       (SELECT c.name FROM contacts c
+         WHERE c.lead_id = l.id AND lower(c.email) = lower(q.from_addr) AND coalesce(c.name, '') <> ''
+         LIMIT 1)                                                       AS their_name,
+       -- Our own side of the thread, oldest first, exactly as it was sent.
+       (SELECT coalesce(jsonb_agg(jsonb_build_object(
+                  'subject', d.subject, 'body', o.message_body,
+                  'sent_at', ISO2(o.sent_at), 'message_id', o.message_id,
+                  'variant', d.variant) ORDER BY o.sent_at), '[]'::jsonb)
+          FROM outreach_log o
+          LEFT JOIN drafts d ON d.id = o.draft_id
+         WHERE o.lead_id = l.id AND o.channel = 'email' AND o.message_id IS NOT NULL)
+                                                                        AS thread,
+       (SELECT coalesce(jsonb_agg(jsonb_build_object(
+                  'code', k.code, 'slot', k.slot, 'body', btrim(k.body),
+                  'countries', to_jsonb(k.countries), 'measured', k.measured,
+                  'confirmed', k.confirmed, 'active', k.active,
+                  'capabilities', to_jsonb(k.capabilities)) ORDER BY k.code), '[]'::jsonb)
+          FROM claims_library k
+         WHERE k.active AND k.confirmed)                                AS library,
+       e.therapeutic_areas                                              AS therapeutic_areas,
+       e.phases                                                         AS phases,
+       e.raw_extraction->>'city'                                        AS city,
+       e.founder_name                                                   AS founder_name,
+       e.employee_estimate                                              AS employee_estimate
+  FROM q
+  JOIN leads l ON l.id = q.lead_id
+  LEFT JOIN enrichments e ON e.lead_id = l.id
+ ORDER BY q.received_at, q.message_id;""").replace(
+    "__LEAD_BLOCKED__", BLOCKED_DOMAIN.format(d="lower(l.domain)")
+).replace(
+    "__FROM_BLOCKED__", BLOCKED_DOMAIN.format(d="lower(split_part(i.from_addr, '@', 2))")
+).replace("ISO2(o.sent_at)", iso("o.sent_at"))
+
+REPLY_WRITE_SQL = with_iso("""-- Write Reply Draft & Issue Code: the drafted reply into `drafts` as PENDING,
+-- and its one-time code into reply_approvals (Section 9, Workflow 7).
+--
+-- $1 Assemble Reply's payload, with the `review` block the email shows
+--
+-- A REPLY IS ALWAYS PENDING. Nothing here can approve it: no claim check runs
+-- on a reply, the operator reads every one, and migration 018 puts that on the
+-- table as well -- a `reply/` draft cannot become `approved` without a
+-- one-time code, and `approved_by = 'auto'` on one is refused by name.
+--
+-- The code comes from reply_approval_issue() (migration 018), which is the only
+-- definition of how a code is minted, reused and reaped. Writing one here by
+-- hand would have to know that 017's partial unique index allows exactly one
+-- unused code per draft, and that an expired unused one blocks its own
+-- replacement until it is reaped.
+--
+-- The NOT EXISTS is the same idempotency the queue uses, re-checked at the
+-- write: two runs overlapping on one prospect message write one draft.
+--
+-- `hold_reason` is set to the waiting command on purpose: the Daily Digest's
+-- HELD FOR A PERSON section reads that column, so a drafted reply nobody has
+-- answered shows up there with its code, next to everything else waiting.
+WITH p AS (
+  SELECT $1::jsonb AS p
+),
+ins AS (
+  INSERT INTO drafts (lead_id, channel, variant, subject, body, status)
+  SELECT (p.p->>'lead_id')::bigint, p.p->'draft'->>'channel', p.p->'draft'->>'variant',
+         p.p->'draft'->>'subject', p.p->'draft'->>'body', 'pending'
+    FROM p
+   WHERE NOT EXISTS (SELECT 1 FROM reply_approvals a
+                      WHERE a.inbound_message_id = p.p->>'inbound_message_id')
+  RETURNING id, lead_id, subject, body
+),
+code AS (
+  SELECT ins.id AS draft_id,
+         reply_approval_issue('reply', ins.id, ins.lead_id, p.p->>'inbound_message_id') AS code
+    FROM ins, p
+),
+held AS (
+  UPDATE drafts d
+     SET hold_reason = 'reply: waiting for your APPROVE / REJECT / EDIT ' || code.code
+    FROM code
+   WHERE d.id = code.draft_id
+  RETURNING d.id, d.hold_reason
+),
+a AS (
+  SELECT r.code, r.kind, r.draft_id, r.lead_id, r.issued_at, r.expires_at
+    FROM reply_approvals r
+   WHERE r.code = (SELECT code FROM code)
+)
+SELECT (SELECT count(*) FROM ins) = 1        AS written,
+       (SELECT id FROM ins)                  AS draft_id,
+       (p.p->>'lead_id')::bigint             AS lead_id,
+       (SELECT code FROM code)               AS code,
+       ISO(a.issued_at)                      AS issued_at,
+       ISO(a.expires_at)                     AS expires_at,
+       (SELECT subject FROM ins)             AS subject,
+       (SELECT body FROM ins)                AS body,
+       (SELECT hold_reason FROM held)        AS hold_reason,
+       p.p->'review'                         AS review,
+       p.p->>'inbound_message_id'            AS inbound_message_id,
+       (SELECT value FROM settings WHERE key = 'operator_email') AS operator_email
+  FROM p
+  LEFT JOIN a ON true;""")
+
+REMINDER_DUE_SQL = with_iso("""-- Find Due Reminders -- Section 9, Workflow 7: "Remind me after 4 hours."
+-- READ-ONLY. One row per open code the operator has not answered.
+--
+-- $1 now_override ('' in the shipped workflow), $2 remind_hours
+--
+-- `reminded_at` means "when the operator was last TOLD about this code, by any
+-- email" -- the reply-review email stamps it through the same statement a
+-- reminder does (Record Review Sent / Record Reminder), and so does the digest
+-- for the codes it carried. So NULL means nobody has been told at all, which is
+-- due at once: that is the self-heal for a review email or a digest SMTP
+-- refused, and it is why this is not simply `coalesce(reminded_at, issued_at)`.
+-- Otherwise each reminder lands remind_hours after the last -- the shape of the
+-- IMAP health check's 6-hourly reminder while a problem lasts.
+--
+-- Nothing is due once the code has expired: at that point there is nothing the
+-- operator could do with it, and the next digest or the next reply mints a
+-- fresh one.
+--
+-- BOTH KINDS, because both are the operator holding the same kind of decision:
+-- a `reply` drafted for a prospect who wrote to us, and an `email-hold` -- a
+-- first touch or follow-up the claim check held after its repairs, which the
+-- digest listed with a code of its own.
+--
+-- The draft must still be pending: one rejected or approved in the NocoDB grid
+-- needs no nudge, even if its code is technically still open.
+WITH clk AS (
+  SELECT coalesce(nullif($1, '')::timestamptz, now()) AS now
+)
+SELECT a.code                                 AS code,
+       a.kind                                 AS kind,
+       a.draft_id                             AS draft_id,
+       a.lead_id                              AS lead_id,
+       ISO(a.issued_at)                       AS issued_at,
+       ISO(a.expires_at)                      AS expires_at,
+       ISO(a.reminded_at)                     AS reminded_at,
+       ISO(clk.now)                           AS now,
+       d.channel                              AS channel,
+       d.variant                              AS variant,
+       d.subject                              AS subject,
+       coalesce(d.edited_body, d.body)        AS body,
+       d.hold_reason                          AS hold_reason,
+       l.company_name                         AS company_name,
+       l.domain                               AS domain,
+       l.country                              AS country,
+       i.body_excerpt                         AS their_text,
+       (SELECT value FROM settings WHERE key = 'operator_email') AS operator_email
+  FROM reply_approvals a
+  JOIN drafts d ON d.id = a.draft_id
+  JOIN leads l  ON l.id = a.lead_id
+  LEFT JOIN inbound_messages i ON i.message_id = a.inbound_message_id
+  CROSS JOIN clk
+ WHERE a.used_at IS NULL
+   AND a.expires_at > clk.now
+   AND d.status = 'pending'
+   AND (a.reminded_at IS NULL OR a.reminded_at <= clk.now - make_interval(hours => $2::int))
+ ORDER BY a.issued_at, a.code
+ LIMIT 20;""")
+
+REMINDER_STAMP_SQL = """-- Record Review Sent / Record Reminder -- one statement for both, so "the
+-- operator has been told about this code" can only mean one thing.
+--
+-- Stamps reminded_at, and only once SMTP accepted the message, so one that could
+-- not go out is sent again on the next tick -- the rule the Daily Digest and the
+-- IMAP health alert already follow. An unstamped code reads as "nobody has been
+-- told", which Find Due Reminders treats as due at once.
+--
+-- $1 the sender's `record` ({code}); $2 the email node's output (nodemailer's
+--    info, or {error} -- the node continues on error)
+WITH p AS (
+  SELECT $1::jsonb AS d, $2::jsonb AS r
+),
+upd AS (
+  UPDATE reply_approvals a
+     SET reminded_at = now()
+    FROM p
+   WHERE a.code = p.d->>'code'
+     AND a.used_at IS NULL
+     AND p.r->>'error' IS NULL
+     AND jsonb_typeof(p.r->'accepted') = 'array'
+     AND jsonb_array_length(p.r->'accepted') > 0
+  RETURNING a.code, a.reminded_at
+)
+SELECT p.d->>'code'                   AS code,
+       (SELECT count(*) FROM upd)::int AS recorded,
+       p.r->>'error'                  AS error
+  FROM p;"""
+
+# The candidate row Decide Reply Send sees. Kept as a list, like
+# CANDIDATE_COLUMNS, so the wiring guard knows exactly which fields exist.
+REPLY_CANDIDATE_COLUMNS = [
+    ("d.id", "draft_id"),
+    ("d.lead_id", "lead_id"),
+    ("d.channel", "channel"),
+    ("d.status", "status"),
+    ("d.variant", "variant"),
+    ("d.subject", "subject"),
+    ("coalesce(d.edited_body, d.body)", "body"),
+    ("l.domain", "domain"),
+    ("l.country", "country"),
+    ("l.status", "lead_status"),
+    ("a.code", "code"),
+    ("a.used_at IS NOT NULL", "approval_used"),
+    ("a.outcome", "approval_outcome"),
+    # The reply goes back to the address that WROTE, not to contacts.email --
+    # measured on lead 26, where the person who answered was not the address we
+    # wrote to (Section 9, Workflow 6).
+    ("i.from_addr", "to_addr"),
+    ("i.message_id", "their_message_id"),
+    ("i.references_raw", "references_raw"),
+    ("i.thread_ids", "thread_ids"),
+    ("i.message_id IS NOT NULL", "inbound_exists"),
+    ("(SELECT coalesce(array_agg(o.message_id ORDER BY o.sent_at), '{}') FROM outreach_log o "
+     "WHERE o.lead_id = d.lead_id AND o.channel = 'email' AND o.message_id IS NOT NULL)", "our_message_ids"),
+    (BLOCKED_DOMAIN.format(d="lower(l.domain)"), "lead_domain_blocked"),
+    (BLOCKED_DOMAIN.format(d="lower(split_part(i.from_addr, '@', 2))"), "recipient_domain_blocked"),
+]
+
+REPLY_SEND_STATE_SQL = """-- Load Reply Send State: every approved REPLY draft, with what each guard needs
+-- (Section 9, Workflow 7). One statement, one snapshot, one clock.
+--
+-- $1 now_override -- '' in the shipped workflow (checked at build time).
+--
+-- There is no warm-up history here and no business-hours input, because a reply
+-- is not cold outreach: it skips the ceiling, the recipient's business hours and
+-- the pacing floor (code_reply_decide.js says why for each). What it does not
+-- skip is in this query -- the blocklist on both domains, a used approval code
+-- with an approve-or-edit outcome, and the thread headers it must carry.
+--
+-- `d.variant LIKE 'reply/%' ` is the whole boundary between the two lanes: the
+-- cold Load Send State excludes exactly that, so no draft can be seen by both
+-- and the two lanes can never disagree about which rules apply to one.
+WITH clk AS (
+  SELECT coalesce(nullif($1, '')::timestamptz, now()) AS now
+),
+cand AS (
+  SELECT __REPLY_CANDIDATE_COLUMNS__
+    FROM drafts d
+    JOIN leads l ON l.id = d.lead_id
+    LEFT JOIN reply_approvals a   ON a.draft_id = d.id
+    LEFT JOIN inbound_messages i  ON i.message_id = a.inbound_message_id
+   WHERE d.channel = 'email'          -- Section 6: LinkedIn is sent by a human. Always.
+     AND d.status = 'approved'
+     AND coalesce(d.variant, '') LIKE 'reply/%'
+   ORDER BY d.id
+   LIMIT 50
+)
+SELECT __ISO_CLOCK__ AS clock,
+       (SELECT coalesce(json_agg(row_to_json(cand)), '[]'::json) FROM cand) AS candidates,
+       (SELECT coalesce(json_object_agg(k, n), '{}'::json)
+          FROM (SELECT coalesce(status, '?') AS k, count(*) AS n
+                  FROM drafts WHERE coalesce(variant, '') LIKE 'reply/%' GROUP BY 1) s) AS replies_by_status;"""
+
+REPLY_SEND_STATE_SQL = (
+    REPLY_SEND_STATE_SQL
+    .replace("__REPLY_CANDIDATE_COLUMNS__", ",\n         ".join("%s AS %s" % c for c in REPLY_CANDIDATE_COLUMNS))
+    .replace("__ISO_CLOCK__", iso("SELECT now FROM clk"))
+)
+
+REPLY_CLAIM_SQL = """-- Claim Reply Send: the reply lane's last line of defence, in one statement.
+--
+-- Decide Reply Send chose this draft moments ago. Everything that makes the send
+-- permissible is re-checked HERE, because this is where the draft actually
+-- flips -- a bug in Decide can make the lane send less, never more:
+--   Section 6   channel = 'email', and the variant really is a reply
+--   Workflow 7  the one-time code was used, with outcome approved or edited,
+--               and it belongs to THIS draft (migration 017/018)
+--   Workflow 5  status = 'approved', and the body unchanged since Decide read it
+--   Section 5   neither the lead's domain nor the address being answered is
+--               blocklisted -- the one guard a reply never skips
+--               and the lead really did reply
+--
+-- No advisory lock and no ceiling recount, and that is the difference from Claim
+-- Send: the cold path's lock exists so two overlapping ticks cannot both read
+-- "4 of 5" and both send. A reply has no quota to race over. What it does share
+-- is at-most-once: the draft flips to 'sent' and the outreach_log claim row is
+-- written BEFORE the SMTP call, so a crash between sending and logging leaves a
+-- claim rather than an approved draft that goes out again next tick.
+WITH p AS (
+  SELECT $1::jsonb AS p
+),
+d AS (
+  UPDATE drafts d
+     SET status = 'sent'
+    FROM p, leads l, reply_approvals a, inbound_messages i
+   WHERE d.id = (p.p->>'draft_id')::bigint
+     AND d.channel = 'email'
+     AND coalesce(d.variant, '') LIKE 'reply/%'
+     AND d.status = 'approved'
+     AND coalesce(d.edited_body, d.body) = p.p->>'raw_body'
+     AND l.id = d.lead_id
+     AND l.status = 'replied'
+     AND a.draft_id = d.id
+     AND a.code = p.p->>'code'
+     AND a.used_at IS NOT NULL
+     AND a.outcome IN ('approved', 'edited')
+     AND i.message_id = a.inbound_message_id
+     AND lower(i.from_addr) = lower(p.p->>'to_addr')
+     AND NOT __LEAD_BLOCKED__
+     AND NOT __RCPT_BLOCKED__
+  RETURNING d.id, d.lead_id
+),
+o AS (
+  INSERT INTO outreach_log (lead_id, draft_id, channel, sent_at, message_body)
+  SELECT d.lead_id, d.id, 'email', (p.p->>'clock')::timestamptz, p.p->>'body'
+    FROM d, p
+  RETURNING id
+)
+SELECT (SELECT count(*) FROM d) = 1       AS claimed,
+       (SELECT id FROM o)                  AS outreach_id,
+       (p.p->>'draft_id')::bigint          AS draft_id,
+       (p.p->>'lead_id')::bigint           AS lead_id,
+       p.p->>'to_addr'                     AS to_addr,
+       p.p->>'subject'                     AS subject,
+       p.p->>'body'                        AS body,
+       p.p->>'in_reply_to'                 AS in_reply_to,
+       p.p->'references'                   AS references,
+       p.p->>'clock'                       AS clock
+  FROM p;""".replace(
+    "__LEAD_BLOCKED__", BLOCKED_DOMAIN.format(d="lower(l.domain)")
+).replace(
+    "__RCPT_BLOCKED__", BLOCKED_DOMAIN.format(d="lower(split_part(i.from_addr, '@', 2))")
+)
 
 FOLLOWUP_DUE_SQL = """-- Find Due Follow-Ups -- Section 9: "if no reply after N days, generate
 -- follow-up draft back into the review queue. Maximum M follow-ups, then mark
@@ -1221,11 +1814,6 @@ SELECT (p.p->>'lead_id')::bigint   AS lead_id,
   FROM p;"""
 
 
-def with_iso(sql):
-    """ISO(x) in the IMAP Health SQL -> iso(x), so every clock value leaves in one format."""
-    return re.sub(r"\bISO\(([\w.]+)\)", lambda m: iso(m.group(1)), sql)
-
-
 HEALTH_LOAD_SQL = with_iso("""-- Load Health State: the IMAP checker's Message-IDs against what Mailbox Watch
 -- has recorded, plus this check's previous state -- one statement, one snapshot,
 -- one clock.
@@ -1355,7 +1943,24 @@ SELECT up.healthy                AS healthy,
 DIGEST_LOAD_SQL = with_iso("""-- Load Digest: everything the operator's daily digest says, in one snapshot
 -- (migration 014). Read-only.
 --
--- $1 now_override ('' in the shipped workflow)
+-- $1 now_override ('' in the shipped workflow), $2 digest_hour
+--
+-- NOT QUITE READ-ONLY SINCE 2026-10-09, and this is the one thing to know about
+-- it: when a digest is actually due, every pending EMAIL draft it is about to
+-- list gets a one-time approval code (`reply_approval_issue`, migration 018),
+-- so the operator can approve, reject or edit a held email by replying to the
+-- digest exactly as they do for a drafted reply (Section 9, Workflow 7). The
+-- codes are minted here because the email has to carry them, and $2 is read
+-- here so that happens ONLY on the tick that sends -- a code whose 48 hours
+-- start on a tick that sent nothing would be half spent before anyone saw it.
+-- Build Digest re-derives due-ness from the same two inputs, so the two cannot
+-- disagree. reply_approval_issue reuses an open code, so a second digest about
+-- the same held draft carries the same one, and a failed send re-issues
+-- nothing.
+--
+-- A low-context note and a no-send-clock note get no code: neither can ever be
+-- sent (Workflow 5), so approving one would mean nothing. A LinkedIn DM gets
+-- none either -- Section 6, a person sends those by hand.
 --
 -- The window starts where the last digest that went out stopped (digest_log),
 -- so a day the host was off is folded into the next digest instead of lost;
@@ -1401,7 +2006,13 @@ SELECT win.day::text                                                     AS dige
                                                                          AS sent,
        (SELECT coalesce(json_agg(x ORDER BY x.created_at, x.draft_id), '[]'::json) FROM (
           SELECT d.id AS draft_id, d.lead_id, l.company_name, l.domain, d.channel, d.variant, d.hold_reason,
-                 ISO(d.created_at) AS created_at, d.created_at >= win.from_ts AS new
+                 ISO(d.created_at) AS created_at, d.created_at >= win.from_ts AS new,
+                 CASE WHEN d.channel = 'email'
+                       AND NOT EXISTS (SELECT 1 FROM digest_log g WHERE g.digest_day = win.day)
+                       AND win.hour >= $2::int
+                       AND coalesce(d.variant, '') NOT LIKE 'low-context%'
+                       AND coalesce(d.variant, '') NOT LIKE 'no-send-clock%'
+                      THEN reply_approval_issue('email-hold', d.id, d.lead_id) END AS code
             FROM drafts d JOIN leads l ON l.id = d.lead_id
            WHERE d.status = 'pending') x)
                                                                          AS held
@@ -1425,9 +2036,25 @@ ins AS (
      AND jsonb_array_length(p.r->'accepted') > 0
   ON CONFLICT (digest_day) DO NOTHING
   RETURNING digest_day
+),
+-- The codes this digest carried: the digest IS how the operator was told about
+-- them, so they are stamped exactly as a reply-review email or a reminder
+-- stamps its own (Workflow 7). Without this the reminder lane would read them
+-- as never mentioned and nudge about every held draft half an hour later.
+told AS (
+  UPDATE reply_approvals a
+     SET reminded_at = now()
+    FROM p
+   WHERE a.code IN (SELECT jsonb_array_elements_text(p.d->'coded'))
+     AND a.used_at IS NULL
+     AND p.r->>'error' IS NULL
+     AND jsonb_typeof(p.r->'accepted') = 'array'
+     AND jsonb_array_length(p.r->'accepted') > 0
+  RETURNING a.code
 )
 SELECT p.d->>'digest_day'             AS digest_day,
        (SELECT count(*) FROM ins)::int AS recorded,
+       (SELECT count(*) FROM told)::int AS codes_told,
        p.r->>'error'                  AS error
   FROM p;"""
 
@@ -1495,7 +2122,8 @@ assert not _unknown, (
     "the follow-up INSERT writes drafts.%r, which Section 8 does not define." % _unknown)
 
 _ALL_SQL = [LOAD_STATE_SQL, CLAIM_SQL, CONFIRM_SQL, REVERT_SQL, MIRROR_SQL, RECORD_INBOUND_SQL,
-            FOLLOWUP_DUE_SQL, FOLLOWUP_WRITE_SQL]
+            FOLLOWUP_DUE_SQL, FOLLOWUP_WRITE_SQL, COMMAND_CONTEXT_SQL, COMMAND_APPLY_SQL, REPLY_QUEUE_SQL,
+            REPLY_WRITE_SQL, REMINDER_DUE_SQL, REMINDER_STAMP_SQL, REPLY_SEND_STATE_SQL, REPLY_CLAIM_SQL]
 for _sql in _ALL_SQL:
     for _status in re.findall(r"UPDATE leads l\s+SET status = '(\w+)'", _sql):
         assert _status in LEAD_STATUSES, (
@@ -1641,6 +2269,113 @@ _insert_cols = [c.strip() for c in re.search(r"INSERT INTO digest_log \(([^)]+)\
 _unknown = [c for c in _insert_cols if c not in load_columns(DOC, "digest_log", must="digest_day")]
 assert not _unknown, "Record Digest writes digest_log.%r, which Section 8 does not define." % _unknown
 
+# Workflow 7, the operator-command fork inside Mailbox Watch: Classify Inbound
+# -> Load Command Context -> Decide Command -> [Command Shaped?] -> Apply
+# Operator Command -> Build Command Ack -> [Tell Operator?] -> Send Command Ack,
+# with the not-the-operator branch falling through to Record Inbound.
+_command = js("code_operator_command.js")
+_command_ack = js("code_command_ack.js")
+_assert_js_emits("Load Command Context ($1.msg / $1.cmd)", {"payload", "command"}, _classify,
+                 "code_classify_reply.js's node body")
+assert "p.p->'msg'" in COMMAND_CONTEXT_SQL and "p.p->'cmd'" in COMMAND_CONTEXT_SQL, (
+    "Load Command Context no longer reads both halves of Classify Inbound's output")
+_assert_wired("Decide Command (ctx.*)", _reads(_command, "ctx"), final_select_aliases(COMMAND_CONTEXT_SQL),
+              "Load Command Context")
+_assert_js_emits("Apply Operator Command ($1)", _sql_payload_reads(COMMAND_APPLY_SQL), _command,
+                 "code_operator_command.js's decision")
+_assert_js_emits("Command Shaped? ($json.record) / Operator Mail? ($json.handled)", {"record", "handled"},
+                 _command, "code_operator_command.js")
+_assert_wired("Build Command Ack (r.*)", _reads(_command_ack, "r"), final_select_aliases(COMMAND_APPLY_SQL),
+              "Apply Operator Command")
+_assert_js_emits("Tell Operator? / Send Command Ack", NOTIFY_EMAIL_READS | {"notify"}, _command_ack,
+                 "code_command_ack.js")
+# Record Inbound is fed by TWO upstreams -- Decide Command's not-a-command
+# branch and Apply Operator Command's not-the-operator branch -- and reads
+# $json.payload from both, so both must carry it.
+assert "p.p->'payload'" in COMMAND_APPLY_SQL and "AS payload" in COMMAND_APPLY_SQL, (
+    "Apply Operator Command no longer hands the message payload back, so a command-shaped message "
+    "that did NOT come from the operator could not fall through to Record Inbound -- a prospect's "
+    "reply would be silently dropped")
+# The whole point of the fork: the operator's own address is runtime data, so
+# the sender comparison must happen in SQL and nowhere else.
+assert "settings WHERE key = 'operator_email'" in COMMAND_APPLY_SQL, (
+    "Apply Operator Command no longer re-derives the operator address from `settings` -- it would be "
+    "trusting the item it was handed for the one check that grants authority")
+assert "reply_approval_usable" in COMMAND_APPLY_SQL, (
+    "Apply Operator Command no longer re-checks the code through migration 017's "
+    "reply_approval_usable() -- a reused or expired code could act")
+assert "from_operator" in RECORD_INBOUND_SQL, (
+    "Record Inbound no longer refuses to match a message from the operator's own address to a lead. "
+    "The operator answers the review email inside the prospect's thread, so a one-word 'no' would "
+    "blocklist that prospect permanently (Section 9, Workflow 7)")
+
+# Workflow 7, the Reply Assistant: Find Replies To Answer -> Build Reply ->
+# Claude Reply -> Assemble Reply -> [Drop Failed Generations] -> Write Reply
+# Draft & Issue Code -> Build Review Email -> [Review Email?] -> Send Review
+# Email -> Record Review Sent; and the reminder lane beside it.
+_reply = js("code_reply.js")
+_reply_asm = js("code_reply_assemble.js")
+_reply_review = js("code_reply_review.js")
+_reply_remind = js("code_reply_remind.js")
+_assert_wired("Build Reply (r.*)", _reads(_reply, "r"), final_select_aliases(REPLY_QUEUE_SQL),
+              "Find Replies To Answer")
+_assert_js_emits("Claude Reply ($json.request)", {"request"}, _reply, "code_reply.js")
+_assert_js_emits("Assemble Reply (src.*)", _reads(_reply_asm, "src"), _reply, "code_reply.js")
+_assert_js_emits("Drop Failed Generations ($json.write)", {"write"}, _reply_asm, "code_reply_assemble.js")
+_reply_write_reads = (_sql_payload_reads(REPLY_WRITE_SQL)
+                      | set(re.findall(r"p\.p->'draft'->>?'(\w+)'", REPLY_WRITE_SQL)))
+_assert_js_emits("Write Reply Draft & Issue Code ($1)", _reply_write_reads | {"payload", "draft", "review"},
+                 _reply_asm, "code_reply_assemble.js")
+_assert_wired("Build Review Email (r.*)", _reads(_reply_review, "r"), final_select_aliases(REPLY_WRITE_SQL),
+              "Write Reply Draft & Issue Code")
+_assert_js_emits("Review Email? / Send Review Email / Record Review Sent",
+                 NOTIFY_EMAIL_READS | {"notify", "record"}, _reply_review, "code_reply_review.js")
+_assert_wired("Build Reminder (r.*)", _reads(_reply_remind, "r"), final_select_aliases(REMINDER_DUE_SQL),
+              "Find Due Reminders")
+_assert_js_emits("Remind? / Send Reminder", NOTIFY_EMAIL_READS | {"notify", "record"}, _reply_remind,
+                 "code_reply_remind.js")
+_assert_js_emits("Record Reminder ($1)", set(re.findall(r"p\.d->>?'(\w+)'", REMINDER_STAMP_SQL)),
+                 _reply_remind, "code_reply_remind.js's record")
+# A reply is drafted PENDING and gets its code from migration 018's one
+# definition; writing either by hand here is how the 48-hour window or the
+# one-open-code index would be got wrong.
+assert "'pending'" in REPLY_WRITE_SQL and "reply_approval_issue(" in REPLY_WRITE_SQL, (
+    "Write Reply Draft must insert the draft as 'pending' and take its code from "
+    "reply_approval_issue() (migration 018)")
+assert "INSERT INTO reply_approvals" not in REPLY_WRITE_SQL + DIGEST_LOAD_SQL, (
+    "a workflow is inserting into reply_approvals directly instead of through reply_approval_issue() "
+    "-- that function is the only thing that knows to reuse an open code and reap a dead one "
+    "(migration 018)")
+assert "reply_approval_issue('email-hold'" in DIGEST_LOAD_SQL, (
+    "the Daily Digest no longer issues a code for the email drafts it lists as held (Section 9, "
+    "Workflow 7) -- the operator could not approve one by replying to the digest")
+
+# Workflow 7, Send Reply: a separate lane, so the cold path is untouched. The
+# two must never be able to see each other's drafts.
+_reply_decide = js("code_reply_decide.js")
+_assert_wired("Decide Reply Send (state.*)", _reads(_reply_decide, "state"),
+              final_select_aliases(REPLY_SEND_STATE_SQL), "Load Reply Send State")
+_assert_wired("Decide Reply Send (candidate c.*)", _reads(_reply_decide, "c"),
+              [a for _, a in REPLY_CANDIDATE_COLUMNS], "the reply candidate query")
+_assert_js_emits("Claim Reply Send", _sql_payload_reads(REPLY_CLAIM_SQL), _reply_decide,
+                 "code_reply_decide.js's payload")
+REPLY_SEND_READS = {"to_addr", "subject", "body", "in_reply_to", "references"}
+_assert_wired("Send Reply", REPLY_SEND_READS, final_select_aliases(REPLY_CLAIM_SQL), "Claim Reply Send")
+_assert_wired("Check SMTP Result (claim.*)", _reads(_check, "claim"), final_select_aliases(REPLY_CLAIM_SQL),
+              "Claim Reply Send")
+assert "NOT LIKE 'reply/%'" in LOAD_STATE_SQL and "NOT LIKE 'reply/%'" in CLAIM_SQL, (
+    "the cold send path no longer excludes reply drafts. A reply answers the address that WROTE, not "
+    "contacts.email, and it skips the ceiling and business hours -- the two lanes must not be able to "
+    "see one draft (Section 9, Workflow 7)")
+assert "LIKE 'reply/%'" in REPLY_SEND_STATE_SQL and "LIKE 'reply/%'" in REPLY_CLAIM_SQL, (
+    "the reply lane no longer restricts itself to reply drafts")
+for _sql in (REPLY_SEND_STATE_SQL, REPLY_CLAIM_SQL):
+    assert "blocklist" in _sql, (
+        "a reply skips the warm-up ceiling and business hours; it never skips the blocklist "
+        "(Section 9, Workflow 7)")
+assert "warmup" not in _reply_decide and "WARMUP" not in _reply_decide, (
+    "code_reply_decide.js has grown a warm-up ceiling. Section 9, Workflow 7: a reply skips it.")
+
 _found = re.findall(r"^\s*'([a-z-]+)':", _js_block(_health, "PROBLEMS", "code_health.js"), re.M)
 assert _found == HEALTH_PROBLEMS, (
     "the IMAP health problem codes drifted between Section 8 (mailbox_health.problems) and code_health.js:\n"
@@ -1656,7 +2391,10 @@ assert not _unknown, "Record Health writes mailbox_health.%r, which Section 8 do
 # ---------------------------------------------------------------------------
 
 def bake(name, **subs):
-    src = js(name)
+    return bake_src(js(name), name, **subs)
+
+
+def bake_src(src, name, **subs):
     for key, val in subs.items():
         token = "__%s__" % key
         assert token in src, "%s has no %s placeholder" % (name, token)
@@ -1664,6 +2402,20 @@ def bake(name, **subs):
     left = re.findall(r"__[A-Z_]+__", src)
     assert not left, "%s still has unsubstituted placeholders %r" % (name, left)
     return src
+
+
+def above_node_body(name):
+    """A Code-node file's library half -- everything above its 'Node body'
+    marker -- for embedding in another node, the way the follow-ups embed
+    drafting's rules. The marker is what keeps the two halves honest: nothing
+    that reads n8n data can sit above it."""
+    src = js(name)
+    at = src.find("// Node body")
+    assert at != -1, "%s has no '// Node body' marker, so its library half cannot be embedded" % name
+    lib = src[:at]
+    assert "$(" not in lib and "$input" not in lib, (
+        "%s reads n8n data above its 'Node body' marker -- node-body code has moved above it" % name)
+    return lib
 
 
 # ---------------------------------------------------------------------------
@@ -1776,10 +2528,145 @@ assert "build the note around it" not in FOLLOWUP_SYSTEM_PROMPT + js("code_follo
     "follow-up was held for (skill section 8, 2026-10-03)")
 
 
+# ---------------------------------------------------------------------------
+# The reply composition call -- Section 9, Workflow 7
+#
+# Same model, parameters and caching as the follow-up call: Section 3's drafting
+# model through the Anthropic Messages API, no temperature/top_p/top_k (a
+# non-default value is a 400 on this model), effort from Section 3, JSON through
+# output_config.format with a strict schema. One difference, and it is the whole
+# shape of this workflow: a reply is NEVER auto-approved and never claim-checked
+# -- the operator reads every one and approves it with a one-time code -- so
+# there is no Approval Gate, no repair loop and no second model call anywhere in
+# the reply path. The deterministic rules still run (Assemble Reply embeds
+# drafting's own rule functions), and migration 018 refuses an auto-approved
+# reply on the table as well.
+# ---------------------------------------------------------------------------
+
+REPLY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "body": {"type": "string"},
+        "ask": {"type": "string"},
+        "claims": {"type": "array", "items": {"type": "string"}},
+        "deferred": {"type": "array", "items": {"type": "string"}},
+        "flag": {"type": "string"},
+    },
+    "required": ["body", "ask", "claims", "deferred", "flag"],
+    "additionalProperties": False,
+}
+_reply_assemble = js("code_reply_assemble.js")
+_reply_fields = (re.findall(r"'(\w+)'", re.search(r"const REPLY_FIELDS = \[(.*?)\];", _reply_assemble).group(1))
+                 + re.findall(r"'(\w+)'", re.search(r"const REPLY_LISTS = \[(.*?)\];", _reply_assemble).group(1)))
+assert sorted(_reply_fields) == sorted(REPLY_SCHEMA["required"]), (
+    "Assemble Reply's REPLY_FIELDS/REPLY_LISTS do not match the reply schema:\n  schema: %r\n  js:     %r"
+    % (REPLY_SCHEMA["required"], _reply_fields))
+
+REPLY_REQUEST = {
+    "model": DRAFT_MODEL,
+    "max_tokens": 16000,
+    "output_config": {"effort": DRAFT_EFFORT, "format": {"type": "json_schema", "schema": REPLY_SCHEMA}},
+}
+
+# The five topics a reply may not answer live in code_reply_topics.js, which is
+# prepended to both Build Reply and Assemble Reply. The prompt names them too,
+# so the model is told the same list the code checks.
+_reply_topics = js("code_reply_topics.js")
+REPLY_TOPICS = re.findall(r"^\s*topic: '([a-z]+)',", _reply_topics, re.M)
+assert len(REPLY_TOPICS) == 5, "code_reply_topics.js no longer holds the operator's five open topics: %r" % REPLY_TOPICS
+
+REPLY_SYSTEM_PROMPT = "\n".join([
+    "You write one short email replying to a small contract research organisation (CRO) that has",
+    "answered a cold email from " + SENDER_NAME + ". " + SENDER_NAME + " reads your draft and approves,",
+    "edits or rejects it before anything is sent. You are answering a real person who took the time",
+    "to write back.",
+    "",
+    "EVERY MESSAGE GIVES YOU FOUR SOURCES, and they are the only ones you have:",
+    "1. THEIR MESSAGE -- what they wrote above the quoted thread.",
+    "2. THE THREAD -- our own earlier messages, exactly as they were sent.",
+    "3. THEIR RECORD -- the facts we hold about their company, each with a sentence saying what it",
+    "   does not mean. Read those boundaries: two true facts joined into one sentence is the",
+    "   commonest way these drafts go wrong.",
+    "4. APPROVED CLAIMS -- the only things you may say about what we built, the problem it solves",
+    "   and who uses it. You may rephrase a line. You may never widen what it means.",
+    "",
+    "ANYTHING ELSE YOU DO NOT ANSWER. Not vaguely, not approximately, not \"typically\". The",
+    "message lists the questions they asked that none of the four sources settles -- about " +
+    ", ".join(REPLY_TOPICS[:-1]) + " or " + REPLY_TOPICS[-1] + " -- and for each one you say, in a",
+    "normal sentence, that you will confirm it and come back. Give no hint of the answer: not a",
+    "range, not \"it depends\", not \"usually\". Name every one of them in `deferred` and say in",
+    "`flag` what has to be confirmed. " + SENDER_NAME + " knows those answers and will put them in.",
+    "A guessed price, integration, language, hosting detail or date is the one failure that cannot",
+    "be taken back, because it reaches a prospect over a real person's name.",
+    "",
+    "ANSWER WHAT THEY ACTUALLY SAID, in their own order, and nothing they did not raise:",
+    "- If they declined, accept it in one line, leave one door open, and stop. Never argue, never",
+    "  re-pitch, never ask them to reconsider, never suggest they have misunderstood.",
+    "- If they asked something the record or the thread answers, answer it plainly and briefly.",
+    "- If they asked how we found them, the record says; say exactly that and no more.",
+    "- If they asked for something we have (the one approved link), offer it once.",
+    "Then exactly ONE next step, from the approved list, sized to what they wrote: a declining",
+    "reply gets the lightest one, an interested reply the direct one.",
+    "",
+    "THE PROSPECT: only the facts in their record and in the thread. Never describe them as",
+    "sponsoring anything -- in these emails \"sponsor\" means the biotech, pharma, device or",
+    "academic company that hires a CRO, their client. Never invent a trial, a person, a city or a",
+    "number. Do not name their company back at them.",
+    "",
+    "THE PRODUCT: the first email introduced it; refer back to it (\"the assistant\"). Never call it",
+    "a chatbot or a Q&A bot. The word \"AI\" at most once. Never \"AI-powered\". Name it only as",
+    "\"(we call it Nova)\", at most once, and only if naming it helps.",
+    "",
+    "NO REPEATS: the lines you use must not repeat the same capability -- each one says what it is",
+    "about -- and do not restate a capability the thread already covered.",
+    "",
+    "CLAIMS -- forbidden, all of them:",
+    "- guarantees (\"you'll never lose a sponsor\")",
+    "- any number, percentage or multiplier that is not in the approved claims, their record or",
+    "  the thread",
+    "- claiming to identify anonymous website visitors",
+    "- naming any CRM, tool or integration",
+    "- supported languages",
+    "- any count of clients beyond the deployments the proof line names, and never the phrase",
+    "  \"two CROs\"",
+    "- saying it books calls or fills a calendar -- it sends the sponsor your booking link, and the",
+    "  sponsor books",
+    "- saying it answers from SOPs or from documents -- it answers from their website",
+    "A stakes line is about the industry, not about us.",
+    "",
+    "THE NEXT STEP: one question, from the list, rephrased to fit what they said. No scheduling",
+    "link, no call length, no second question. The body before it asks for nothing.",
+    "",
+    "EVERYWHERE: plain text. No bullets, no headings, no placeholders, no merge tags. At most one",
+    "link, and only the one offered. No greeting, no sign-off and no opt-out line -- all three are",
+    "added afterwards. Never these words: " + ", ".join(SKILL_BANNED) + ". No invented urgency, no",
+    "flattery, no exclamation marks, and never thank them twice.",
+    "",
+    "Return JSON: body (everything before the next step, paragraphs separated by a blank line);",
+    "ask (the one next step); claims (the code of every approved line the reply used, the next step",
+    "included); deferred (the topic names you did not answer); flag (one line saying what " +
+    SENDER_NAME + " has to confirm, or \"\" if nothing).",
+])
+
 DECIDE_JS = bake("code_decide.js", SIGNATURE=SIGNATURE)
 CHECK_JS = bake("code_check_smtp.js", OWN_DOMAIN=OWN_DOMAIN)
 MIRROR_JS = bake("code_mirror_sent.js", OWN_DOMAIN=OWN_DOMAIN)
-CLASSIFY_JS = bake("code_classify_reply.js", OWN_DOMAIN=OWN_DOMAIN)
+
+# Workflow 7's operator-command library, verbatim above its own 'Node body'
+# marker, then Classify Inbound: so one message is read for a command and for a
+# classification by the same two files that the Decide Command node runs, and
+# the command is read FIRST (the node body says why).
+OPERATOR_RULES_JS = bake_src(above_node_body("code_operator_command.js"), "code_operator_command.js",
+                             SIGNATURE=SIGNATURE, MAX_URLS=MAX_URLS)
+CLASSIFY_JS = (
+    "// Classify Inbound -- generated by n8n/sendtrack/build_workflow.py.\n"
+    "// Part 1, verbatim: n8n/sendtrack/code_operator_command.js above its 'Node body' marker --\n"
+    "// the operator-command parser and its authentication gate (Section 9, Workflow 7).\n"
+    "// Part 2: n8n/sendtrack/code_classify_reply.js.\n\n"
+    + OPERATOR_RULES_JS + "\n" + bake("code_classify_reply.js", OWN_DOMAIN=OWN_DOMAIN)
+)
+COMMAND_JS = bake("code_operator_command.js", SIGNATURE=SIGNATURE, MAX_URLS=MAX_URLS)
+COMMAND_ACK_JS = bake("code_command_ack.js")
 DETECT_SIGNAL_JS = bake("code_detect_signal.js")
 NOTIFY_JS = bake("code_notify.js")
 FOLLOWUP_JS = bake("code_followup.js", SENDER_NAME=SENDER_NAME, FOLLOWUP_SYSTEM_PROMPT=FOLLOWUP_SYSTEM_PROMPT,
@@ -1794,6 +2681,31 @@ FOLLOWUP_ASSEMBLE_JS = (
 )
 HEALTH_JS = bake("code_health.js")
 DIGEST_JS = bake("code_digest.js", SENDER_ZONE=SENDER_ZONE, SENDER_OFFSET=SENDER_OFFSET)
+
+# Workflow 7's own Code nodes. The five open topics (code_reply_topics.js) are
+# prepended to both the node that detects them in the prospect's message and the
+# node that checks the draft against them, so the two cannot drift apart; and
+# Assemble Reply additionally carries drafting's rule functions verbatim, so a
+# reply is judged by the first touch's rules and not by a copy of them.
+REPLY_TOPICS_JS = js("code_reply_topics.js")
+REPLY_JS = (
+    "// Build Reply -- generated by n8n/sendtrack/build_workflow.py.\n"
+    "// Part 1, verbatim: n8n/sendtrack/code_reply_topics.js. Part 2: n8n/sendtrack/code_reply.js.\n\n"
+    + REPLY_TOPICS_JS + "\n"
+    + bake("code_reply.js", REPLY_SYSTEM_PROMPT=REPLY_SYSTEM_PROMPT, CLAUDE_REQUEST=REPLY_REQUEST,
+           SENDER_NAME=SENDER_NAME, THERAPEUTIC_AREAS=THERAPEUTIC_AREAS)
+)
+assert '"model": "%s"' % DRAFT_MODEL in REPLY_JS, "the shipped reply request does not name %s" % DRAFT_MODEL
+REPLY_ASSEMBLE_JS = (
+    "// Assemble Reply -- generated by n8n/sendtrack/build_workflow.py.\n"
+    "// Part 1, verbatim: n8n/drafting/code_assemble.js above its 'Node body' marker -- the\n"
+    "// first touch's claim rules. Part 2, verbatim: n8n/sendtrack/code_reply_topics.js.\n"
+    "// Part 3: n8n/sendtrack/code_reply_assemble.js.\n\n"
+    + RULES_JS + "\n" + REPLY_TOPICS_JS + "\n" + bake("code_reply_assemble.js", SIGNATURE=SIGNATURE)
+)
+REPLY_REVIEW_JS = bake("code_reply_review.js")
+REPLY_REMIND_JS = bake("code_reply_remind.js")
+REPLY_DECIDE_JS = bake("code_reply_decide.js", SIGNATURE=SIGNATURE, MAX_URLS=MAX_URLS)
 
 # Auto-approval (migration 014): Workflow 4's Approval Gate and Apply Claim
 # Check, verbatim -- drafting's code_approval.js, and its rules section followed
@@ -1889,6 +2801,27 @@ def http_get_node(name, url_expr, timeout_ms, pos, notes):
     return {
         "parameters": {"url": url_expr, "options": {
             "timeout": timeout_ms, "response": {"response": {"neverError": True, "responseFormat": "json"}}}},
+        "name": name, "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": pos,
+        "onError": "continueRegularOutput", "notes": notes,
+    }
+
+
+def http_post_node(name, url_expr, body_expr, timeout_ms, pos, notes):
+    """The reply lane's sender (Section 9, Workflow 7). Same error contract as
+    the Send Email node it stands in for: continue-on-error AND never-error, so
+    a refusal arrives at Check SMTP Result as an ordinary item instead of
+    stopping the execution with a claim already written -- and NO retry, because
+    a timeout after the server accepted the message would send twice."""
+    return {
+        "parameters": {
+            "method": "POST",
+            "url": url_expr,
+            "sendBody": True,
+            "specifyBody": "json",
+            "jsonBody": body_expr,
+            "options": {"timeout": timeout_ms,
+                        "response": {"response": {"neverError": True, "responseFormat": "json"}}},
+        },
         "name": name, "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": pos,
         "onError": "continueRegularOutput", "notes": notes,
     }
@@ -2009,12 +2942,49 @@ mailwatch_nodes = [
                  "Replies, opt-outs, bounces, out-of-offices. Only new messages after the first activation; "
                  "the last UID survives restarts, so anything that arrived while n8n was down is caught up."),
     code_node("Classify Inbound", CLASSIFY_JS, "runOnceForEachItem", [-660, 160],
-              "Reads only what they wrote above the quoted thread -- our own email says \"reply 'no'\" and "
+              "Two readings of one message. The operator-command parse FIRST (Section 9, Workflow 7): the "
+              "operator answers the review email inside the prospect's thread, so a one-word \"no\" from "
+              "them would otherwise thread-match the prospect and blocklist it. Then the classification, "
+              "from only what they wrote above the quoted thread -- our own email says \"reply 'no'\" and "
               "every reply quotes it. bounce > auto-reply > opt-out > reply."),
+    pg_node("Load Command Context", COMMAND_CONTEXT_SQL, "={{ [JSON.stringify({ msg: $json.payload, "
+            "cmd: $json.command })] }}", [-550, 420],
+            "Read-only, and the only place that can answer the three questions one message cannot: is the "
+            "sender the operator's address (settings, migration 008 -- never baked into this JSON), does "
+            "the quoted code exist, is it unused and unexpired, and what state is its draft in."),
+    code_node("Decide Command", COMMAND_JS, "runOnceForEachItem", [-330, 420],
+              "Three separate questions: is it command-SHAPED (record it), is it really FROM the operator "
+              "(then it is never a prospect reply), and is it accepted. A refusal is logged; a message "
+              "that only looks like a command falls through to Record Inbound."),
+    if_node("Command Shaped?", "iscommand", "={{ $json.record }}", [-110, 420],
+            "APPROVE / REJECT / EDIT on a line of its own. False goes straight to Record Inbound -- a "
+            "plain \"no\" from the operator included, which Record Inbound then refuses to match to any "
+            "lead."),
+    pg_node("Apply Operator Command", COMMAND_APPLY_SQL, "={{ [JSON.stringify($json)] }}", [110, 420],
+            "Records every command-shaped message in operator_commands, accepted or refused, keyed on "
+            "Message-ID. Re-derives the operator address, re-checks the code through "
+            "reply_approval_usable(), and only then moves the draft -- migration 017's CHECK makes "
+            "`accepted` impossible without SPF, DKIM and the sender. The code is marked used only if the "
+            "draft actually moved."),
+    if_node("Operator Mail?", "handled", "={{ $json.handled }}", [330, 420],
+            "True: the operator's own mail, so it is never classified as a prospect reply. False: it only "
+            "looked like a command (a spoofed sender, failed SPF or DKIM) and may be a prospect writing, "
+            "so it goes on to Record Inbound as well as into operator_commands."),
+    code_node("Build Command Ack", COMMAND_ACK_JS, "runOnceForEachItem", [330, 620],
+              "The answer, built from what the statement actually did. Only an authenticated operator gets "
+              "one -- answering a forgery would turn the mailbox into an oracle for guessing codes -- and "
+              "only on the first delivery of that Message-ID."),
+    if_node("Tell Operator?", "notifyack", "={{ $json.notify }}", [550, 620],
+            "Accepted or refused, the operator hears. Nobody else does."),
+    email_node("Send Command Ack", "={{ $json.notify_to }}", "={{ $json.subject }}", "={{ $json.text }}",
+               [770, 620],
+               "To the operator's own inbox. Sent only to that address, so it counts toward no warm-up "
+               "ceiling (Section 9)."),
     pg_node("Record Inbound", RECORD_INBOUND_SQL, "={{ [JSON.stringify($json.payload)] }}", [-440, 160],
             "Match to a lead, record once (keyed on Message-ID), and act: reply -> outreach_log + lead "
-            "'replied' (kills follow-ups); opt-out -> that plus blocklist, permanent (Section 5); bounce -> "
-            "outreach_log 'bounced'."),
+            "'replied' (kills follow-ups, and retires the lead's pending LinkedIn DM -- migration 018); "
+            "opt-out -> that plus blocklist, permanent (Section 5); bounce -> outreach_log 'bounced'. A "
+            "message from the operator's own address is recorded and matched to NOTHING."),
     code_node("Detect Positive Signal", DETECT_SIGNAL_JS, "runOnceForEachItem", [-330, 160],
               "Deterministic keyword check (build rule 3, no model) of a reply's own text for the operator "
               "notification only -- it does not touch Record Inbound's classification. Only classification "
@@ -2035,12 +3005,33 @@ mailwatch_connections = {
     "Load Settings": edge("Normalise Sent"),
     "Normalise Sent": edge("Mirror Sent"),
     "Inbox": edge("Classify Inbound"),
-    "Classify Inbound": edge("Record Inbound"),
+    # The operator fork comes FIRST, which is the whole point of Section 9,
+    # Workflow 7's hazard: Record Inbound is only ever reached by a message that
+    # is not the operator's own command.
+    "Classify Inbound": edge("Load Command Context"),
+    "Load Command Context": edge("Decide Command"),
+    "Decide Command": edge("Command Shaped?"),
+    "Command Shaped?": branch("Apply Operator Command", "Record Inbound"),
+    "Apply Operator Command": edge("Operator Mail?", "Build Command Ack"),
+    "Operator Mail?": branch("Tell Operator?", "Record Inbound"),
+    "Build Command Ack": edge("Tell Operator?"),
+    "Tell Operator?": branch("Send Command Ack"),
     "Record Inbound": edge("Detect Positive Signal"),
     "Detect Positive Signal": edge("Build Notification"),
     "Build Notification": edge("Notify Operator?"),
     "Notify Operator?": branch("Notify Operator"),
 }
+
+# Record Inbound must be reachable ONLY from the two not-an-operator-command
+# branches -- never straight from Classify Inbound, which is the wiring the
+# hazard in Section 13 described.
+_into_record = sorted(src for src, outs in mailwatch_connections.items()
+                      for br in outs["main"] for e in br if e["node"] == "Record Inbound")
+assert _into_record == ["Command Shaped?", "Operator Mail?"], (
+    "Record Inbound is reached from %r. It must be reached only after the operator-command fork, or the "
+    "operator's own \"no\" can blocklist a prospect (Section 9, Workflow 7)." % _into_record)
+assert mailwatch_connections["Command Shaped?"]["main"][1] == [{"node": "Record Inbound", "type": "main", "index": 0}]
+assert mailwatch_connections["Operator Mail?"]["main"][1] == [{"node": "Record Inbound", "type": "main", "index": 0}]
 
 # ---------------------------------------------------------------------------
 # Workflow: Follow-Ups
@@ -2251,9 +3242,11 @@ digest_nodes = [
         "notes": ("digest_hour: the operator's hour (%s) from which today's digest is due. now_override must stay "
                   "empty (dry-run only)." % SENDER_ZONE),
     },
-    pg_node("Load Digest", DIGEST_LOAD_SQL, "={{ [$json.now_override] }}", [-660, 130],
+    pg_node("Load Digest", DIGEST_LOAD_SQL, "={{ [$json.now_override, $json.digest_hour] }}", [-660, 130],
             "One snapshot: drafts auto-approved and emails sent since the last digest, and every pending draft "
-            "with its hold_reason -- the exceptions queue. Plus the operator's address and the flag."),
+            "with its hold_reason -- the exceptions queue. Plus the operator's address and the flag. On the tick "
+            "that actually sends (hence digest_hour here too), each held EMAIL draft also gets a one-time "
+            "approval code, so the operator can approve, reject or edit it by replying (Workflow 7)."),
     code_node("Build Digest", DIGEST_JS, "runOnceForAllItems", [-440, 130],
               "Due once per operator day from digest_hour, if the settings table holds an operator address. The "
               "plain-text digest: AUTO-APPROVED, SENT, HELD FOR A PERSON (with reasons)."),
@@ -2276,6 +3269,269 @@ digest_connections = {
     "Send Digest?": branch("Send Digest"),
     "Send Digest": edge("Record Digest"),
 }
+
+# ---------------------------------------------------------------------------
+# Workflow: Reply Assistant (Section 9, Workflow 7, migrations 017 + 018)
+# ---------------------------------------------------------------------------
+#
+# Two lanes off one trigger. The drafting lane answers prospect messages; the
+# reminder lane nudges the operator about any code still open. Both are
+# queue-driven, so a missed run only means the next one finds more (Section 7).
+#
+# Every reply costs a paid Claude call, so the batch is bounded like Workflow
+# 4's. batch_size is small on purpose: a reply is rare and the operator reads
+# each one, so there is no value in drafting ten at once.
+REPLY_CONFIG = {"now_override": "", "batch_size": 5, "remind_hours": 4}
+REPLY_TRIGGER = "Every 30 Minutes"
+
+reply_nodes = [
+    {"parameters": {"rule": {"interval": [{"field": "minutes", "minutesInterval": 30}]}},
+     "name": REPLY_TRIGGER, "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2, "position": [-1100, 40],
+     "notes": ("Every 30 minutes, queue-driven both ways: an unanswered prospect message and an unanswered "
+               "code are both still there on the next tick (Section 7). Not an hours interval -- n8n gates "
+               "those on the clock value of the last run and skips ticks on a host that sleeps (Follow-Ups, "
+               "2026-10-02; the build refuses one).")},
+    {"parameters": {}, "name": "Manual Trigger", "type": "n8n-nodes-base.manualTrigger", "typeVersion": 1,
+     "position": [-1100, 320]},
+    {
+        "parameters": {"assignments": {"assignments": [
+            {"id": "nowoverride", "name": "now_override", "value": REPLY_CONFIG["now_override"], "type": "string"},
+            {"id": "batch", "name": "batch_size", "value": REPLY_CONFIG["batch_size"], "type": "number"},
+            {"id": "remind", "name": "remind_hours", "value": REPLY_CONFIG["remind_hours"], "type": "number"},
+        ]}, "options": {}},
+        "name": "Config", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [-880, 180],
+        "notes": ("batch_size: prospect messages answered per run, each one a paid call. remind_hours: how "
+                  "long an unanswered one-time code waits before the operator is nudged, and between "
+                  "nudges (Section 9, Workflow 7). now_override must stay empty (dry-run only)."),
+    },
+    pg_node("Find Replies To Answer", REPLY_QUEUE_SQL, "={{ [$json.now_override, $json.batch_size] }}",
+            [-660, 40],
+            "Read-only. Every inbound message classified 'reply', matched to a lead, with no reply_approvals "
+            "row against its Message-ID -- so one drafted reply per prospect MESSAGE, for ever. A rejected "
+            "reply is never redrafted (delete its row to ask for another); a prospect who writes again gets "
+            "a new answer. Blocklisted either way is skipped before any model call."),
+    code_node("Build Reply", REPLY_JS, "runOnceForAllItems", [-440, 40],
+              "The request: their message, the thread as sent, their enrichment record with its boundary "
+              "sentences, the confirmed claims and how we found them -- and nothing else. The five topics "
+              "nothing we have confirmed can settle (pricing, integrations, languages, security, timelines) "
+              "are detected in THEIR text here, so the model is told to defer them rather than tagged "
+              "afterwards for having guessed."),
+    {
+        "parameters": {
+            "method": "POST",
+            "url": "https://api.anthropic.com/v1/messages",
+            "authentication": "predefinedCredentialType",
+            "nodeCredentialType": "anthropicApi",
+            "sendHeaders": True,
+            "headerParameters": {"parameters": [{"name": "anthropic-version", "value": "2023-06-01"}]},
+            "sendBody": True,
+            "specifyBody": "json",
+            "jsonBody": "={{ JSON.stringify($json.request) }}",
+            "options": {"timeout": 300000},
+        },
+        "name": "Claude Reply", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [-220, 40],
+        "credentials": ANTHROPIC_CRED, "onError": "continueRegularOutput", "retryOnFail": True, "maxTries": 2,
+        "waitBetweenTries": 5000,
+        "notes": ("%s through the Anthropic Messages API, effort %s (Section 3) -- the drafting model, with "
+                  "the drafting node's request parameters and its prompt caching. The key is the n8n "
+                  "credential %s, never in this JSON. A failed call writes nothing and the message is queued "
+                  "again next run: no fallback to the local model (skill section 6). This is the ONLY model "
+                  "call in the reply path -- a reply is never claim-checked, because the operator reads every "
+                  "one." % (DRAFT_MODEL, DRAFT_EFFORT, ANTHROPIC_CRED["anthropicApi"]["id"])),
+    },
+    code_node("Assemble Reply", REPLY_ASSEMBLE_JS, "runOnceForEachItem", [0, 40],
+              "Drafting's own claim rules (code_assemble.js above its 'Node body' marker, embedded verbatim) "
+              "plus the reply's: 40-120 words, one next step, the one-URL cap, no \"two CROs\" line and never "
+              "Vertex Clinical Research as a CRO, and a deferral sentence for every topic they raised. "
+              "Violations tag the variant; the operator reads the tags in the review email. The greeting, the "
+              "signature and their quoted message are appended here, never generated."),
+    {
+        "parameters": {"conditions": boolean_condition("writable", "={{ $json.write }}"), "options": {}},
+        "name": "Drop Failed Generations", "type": "n8n-nodes-base.filter", "typeVersion": 2.2,
+        "position": [220, 40],
+        "notes": "A failed Claude call writes nothing; the message is queued again on the next run.",
+    },
+    pg_node("Write Reply Draft & Issue Code", REPLY_WRITE_SQL, "={{ [JSON.stringify($json.payload)] }}",
+            [440, 40],
+            "The draft into `drafts` as PENDING -- a reply is never auto-approved, and migration 018 refuses "
+            "one on the table too -- and its one-time code from reply_approval_issue(), the only thing that "
+            "knows to reuse an open code and reap a dead one. hold_reason names the waiting command, so the "
+            "daily digest lists it like any other held draft."),
+    code_node("Build Review Email", REPLY_REVIEW_JS, "runOnceForEachItem", [660, 40],
+              "What they wrote, the exact bytes that would be sent, what the reply does NOT answer and why, "
+              "the rule tags, and the three commands with the code. Built from what the database holds, not "
+              "from what the drafter proposed."),
+    if_node("Review Email?", "review", "={{ $json.notify }}", [880, 40],
+            "Only with a draft written, a code issued and an operator address in `settings`. No address, no "
+            "review email -- and the draft stays pending, which is the safe end of that."),
+    email_node("Send Review Email", "={{ $json.notify_to }}", "={{ $json.subject }}", "={{ $json.text }}",
+               [1100, -60],
+               "To the operator's own inbox, never the outreach mailbox. Sent only to that address, so it "
+               "counts toward no warm-up ceiling (Section 9)."),
+    pg_node("Record Review Sent", REMINDER_STAMP_SQL,
+            "={{ [JSON.stringify($('Build Review Email').item.json.record), JSON.stringify($json)] }}",
+            [1320, -60],
+            "Stamps reply_approvals.reminded_at -- 'the operator has been told' -- and only once SMTP "
+            "accepted it. A review email that could not go out leaves it NULL, which the reminder lane reads "
+            "as due at once rather than in four hours."),
+    pg_node("Find Due Reminders", REMINDER_DUE_SQL, "={{ [$json.now_override, $json.remind_hours] }}",
+            [-660, 420],
+            "Read-only. Every unused, unexpired code whose draft is still pending and whose operator has not "
+            "been told in remind_hours -- or at all, which is the self-heal for a review email or a digest "
+            "SMTP refused. Both kinds: a drafted reply, and an email the claim check held after its repairs."),
+    code_node("Build Reminder", REPLY_REMIND_JS, "runOnceForEachItem", [-440, 420],
+              "Short: what is waiting, how long the code has left, the draft itself, and the three commands."),
+    if_node("Remind?", "remind", "={{ $json.notify }}", [-220, 420],
+            "Only with an operator address in `settings`."),
+    email_node("Send Reminder", "={{ $json.notify_to }}", "={{ $json.subject }}", "={{ $json.text }}",
+               [0, 420],
+               "To the operator's own inbox. Sent only to that address, so it uses no warm-up slot."),
+    pg_node("Record Reminder", REMINDER_STAMP_SQL,
+            "={{ [JSON.stringify($('Build Reminder').item.json.record), JSON.stringify($json)] }}",
+            [220, 420],
+            "The same statement Record Review Sent runs, so 'the operator has been told about this code' can "
+            "only mean one thing. Stamped only once SMTP accepted the reminder."),
+]
+
+reply_connections = {
+    REPLY_TRIGGER: edge("Config"),
+    "Manual Trigger": edge("Config"),
+    "Config": edge("Find Replies To Answer", "Find Due Reminders"),
+    "Find Replies To Answer": edge("Build Reply"),
+    "Build Reply": edge("Claude Reply"),
+    "Claude Reply": edge("Assemble Reply"),
+    "Assemble Reply": edge("Drop Failed Generations"),
+    "Drop Failed Generations": edge("Write Reply Draft & Issue Code"),
+    "Write Reply Draft & Issue Code": edge("Build Review Email"),
+    "Build Review Email": edge("Review Email?"),
+    "Review Email?": branch("Send Review Email"),
+    "Send Review Email": edge("Record Review Sent"),
+    "Find Due Reminders": edge("Build Reminder"),
+    "Build Reminder": edge("Remind?"),
+    "Remind?": branch("Send Reminder"),
+    "Send Reminder": edge("Record Reminder"),
+}
+
+# Nothing in this workflow may approve a draft: the operator's one-time code is
+# the only way a reply becomes sendable (migration 018 enforces it on the table
+# as well). A gate or a claim-check node here would be that rule being quietly
+# dropped.
+for _n in reply_nodes:
+    assert _n["name"] not in ("Approval Gate", "Apply Claim Check"), (
+        "the Reply Assistant has grown an approval gate. A reply is approved by the operator's code and by "
+        "nothing else (Section 9, Workflow 7).")
+assert "status = 'approved'" not in REPLY_WRITE_SQL and "'approved'" not in REPLY_WRITE_SQL, (
+    "Write Reply Draft can approve a draft. It must write 'pending' only.")
+
+# ---------------------------------------------------------------------------
+# Workflow: Send Reply (Section 9, Workflow 7)
+# ---------------------------------------------------------------------------
+#
+# A separate lane from Send, deliberately: the cold path keeps its ceiling, its
+# business hours, its pacing and its Send Email node, and nothing here can
+# change any of that. What this lane has that the cold one cannot is the two
+# threading headers -- the installed Send Email node builds nodemailer's
+# mailOptions from a fixed field set with no headers option (read 2026-10-09;
+# smtp_send_server.py has the quotation), so a reply submits through the
+# smtp-send sidecar instead.
+SENDREPLY_CONFIG = {"now_override": "", "send_url": "http://%s:%s/send" % ("smtp-send", 8766)}
+SENDREPLY_TRIGGER = "Every 10 Minutes"
+
+_smtp_send_py = js("smtp_send_server.py")
+_smtp_port = re.search(r"^PORT = (\d+)$", _smtp_send_py, re.M)
+assert _smtp_port, "PORT not found in smtp_send_server.py"
+SENDREPLY_CONFIG["send_url"] = "http://smtp-send:%s/send" % _smtp_port.group(1)
+
+sendreply_nodes = [
+    {"parameters": {"rule": {"interval": [{"field": "minutes", "minutesInterval": 10}]}},
+     "name": SENDREPLY_TRIGGER, "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2,
+     "position": [-1100, 40],
+     "notes": ("Every 10 minutes, like Send. There is no business-hours filter and no pacing here -- a reply "
+               "goes out as soon as the operator has approved it (Section 9, Workflow 7) -- so this interval "
+               "is just how long an approved reply may wait.")},
+    {"parameters": {}, "name": "Manual Trigger", "type": "n8n-nodes-base.manualTrigger", "typeVersion": 1,
+     "position": [-1100, 220]},
+    {
+        "parameters": {"assignments": {"assignments": [
+            {"id": "nowoverride", "name": "now_override", "value": SENDREPLY_CONFIG["now_override"],
+             "type": "string"},
+            {"id": "sendurl", "name": "send_url", "value": SENDREPLY_CONFIG["send_url"], "type": "string"},
+        ]}, "options": {}},
+        "name": "Config", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [-880, 130],
+        "notes": ("send_url: the smtp-send service in docker-compose.yml, which is the only sender in this "
+                  "project that can set In-Reply-To and References. now_override must stay empty "
+                  "(dry-run only)."),
+    },
+    pg_node("Load Reply Send State", REPLY_SEND_STATE_SQL, "={{ [$json.now_override] }}", [-660, 130],
+            "Every approved `reply/` draft with what each guard needs: the used approval code and its "
+            "outcome, the address that wrote to us, the thread headers, and both blocklist checks. No "
+            "warm-up history and no clock table -- a reply skips the ceiling and business hours."),
+    code_node("Decide Reply Send", REPLY_DECIDE_JS, "runOnceForAllItems", [-440, 130],
+              "The per-draft checks, and the threading headers built from what the database really holds "
+              "(migration 017), falling back to the Message-IDs it does have rather than inventing a chain. "
+              "Emits exactly one item: send true with one payload, or send false with the reason."),
+    if_node("Send Now?", "send", "={{ $json.send }}", [-220, 130],
+            "False ends the tick. The reason is in Decide Reply Send's output for anyone reading the "
+            "execution."),
+    pg_node("Claim Send", REPLY_CLAIM_SQL, "={{ [JSON.stringify($json.payload)] }}", [0, 40],
+            "The last line of defence: the variant, the approval code and its outcome, the unchanged body, "
+            "the replied lead, the address that wrote and both blocklists, re-checked in one statement -- and "
+            "the draft flipped to 'sent' with a claim row BEFORE the SMTP call (at-most-once). Named as Send "
+            "names it, because Check SMTP Result is the same file."),
+    if_node("Claimed?", "claimed", "={{ $json.claimed }}", [220, 40],
+            "False means the draft, the code or the recipient changed between Decide and Claim. Nothing is "
+            "sent."),
+    http_post_node("Send Reply", "={{ $('Config').first().json.send_url }}",
+                   "={{ JSON.stringify({ to: $json.to_addr, subject: $json.subject, text: $json.body, "
+                   "in_reply_to: $json.in_reply_to, references: $json.references }) }}", 120000, [440, -60],
+                   "The smtp-send sidecar: one SMTP submission carrying In-Reply-To and References, which "
+                   "n8n's Send Email node cannot set. It answers in nodemailer's own shape, so Check SMTP "
+                   "Result classifies a failure exactly as it does on the cold path. No retry: a timeout "
+                   "after the server accepted would send twice."),
+    code_node("Check SMTP Result", CHECK_JS, "runOnceForEachItem", [660, -60],
+              "The same file the cold path runs. ok -> confirm. account failure (auth, TLS, DNS, 4xx) -> back "
+              "to approved, retried next tick. recipient failure (5xx on the address) -> back to pending, "
+              "tagged +smtp-rejected, for a human."),
+    if_node("Sent OK?", "ok", "={{ $json.ok }}", [880, -60], "Accepted by the server, with a Message-ID."),
+    pg_node("Confirm Send", CONFIRM_SQL, "={{ [JSON.stringify($json.payload)] }}", [1100, -140],
+            "The same statement the cold path runs: Message-ID onto the claim and the send into "
+            "mailbox_sent. The lead stays 'replied' -- that statement only advances a draft/approved lead -- "
+            "and the reply does count in the Sent mirror afterwards, because it is external mail."),
+    pg_node("Revert Claim", REVERT_SQL, "={{ [JSON.stringify($json.payload)] }}", [1100, 40],
+            "Nothing went out: the claim is removed and the draft handed back. A recipient refusal lands it "
+            "pending with +smtp-rejected, where the operator can see it."),
+]
+
+sendreply_connections = {
+    SENDREPLY_TRIGGER: edge("Config"),
+    "Manual Trigger": edge("Config"),
+    "Config": edge("Load Reply Send State"),
+    "Load Reply Send State": edge("Decide Reply Send"),
+    "Decide Reply Send": edge("Send Now?"),
+    "Send Now?": branch("Claim Send"),
+    "Claim Send": edge("Claimed?"),
+    "Claimed?": branch("Send Reply"),
+    "Send Reply": edge("Check SMTP Result"),
+    "Check SMTP Result": edge("Sent OK?"),
+    "Sent OK?": branch("Confirm Send", "Revert Claim"),
+}
+
+# The sidecar must be what docker-compose.yml actually runs, reachable only on
+# the compose network: it holds the mailbox password and can send mail, with no
+# authentication of its own.
+_svc = re.search(r"^  smtp-send:\n((?:    .*\n|[ \t]*\n)+)", COMPOSE_TEXT, re.M)
+assert _svc, ("Send Reply posts to %s, but docker-compose.yml has no 'smtp-send' service."
+              % SENDREPLY_CONFIG["send_url"])
+assert "smtp_send_server.py" in _svc.group(1), (
+    "the smtp-send service in docker-compose.yml does not run smtp_send_server.py")
+assert not re.search(r"^    ports:", _svc.group(1), re.M), (
+    "the smtp-send service publishes a port. It can send mail as the outreach mailbox and has no "
+    "authentication -- keep it on the compose network only.")
+assert "NOVASCOUT_MAILBOX_PASSWORD" in _svc.group(1) and "ANTHROPIC_API_KEY" not in _svc.group(1), (
+    "the smtp-send service's environment is not the mailbox's SMTP settings alone")
+# It may only ever send as the mailbox itself.
+assert "is not this mailbox" in _smtp_send_py, (
+    "smtp_send_server.py no longer refuses a From that is not the configured mailbox")
 
 # The Load Health State payload is built in an expression: every field its SQL
 # reads must be put there.
@@ -2310,7 +3566,8 @@ def _config_values(nodes):
     return {a["name"]: a["value"] for a in cfg["parameters"]["assignments"]["assignments"]}
 
 
-for _nodes in (send_nodes, mailwatch_nodes, followup_nodes, health_nodes, digest_nodes):
+for _nodes in (send_nodes, mailwatch_nodes, followup_nodes, health_nodes, digest_nodes, reply_nodes,
+               sendreply_nodes):
     for _n in _nodes:
         if _n["type"] == "n8n-nodes-base.emailSend":
             p = _n["parameters"]
@@ -2362,6 +3619,17 @@ assert (_cfg["follow_up_days"], _cfg["max_follow_ups"]) == (FOLLOW_UP_DAYS, MAX_
 _cfg = _config_values(digest_nodes)
 assert _cfg["now_override"] == "", "the shipped Daily Digest workflow has a clock override set"
 assert 0 <= _cfg["digest_hour"] <= 23, "digest_hour is an hour of the operator's day"
+_cfg = _config_values(reply_nodes)
+assert _cfg["now_override"] == "", "the shipped Reply Assistant workflow has a clock override set"
+assert _cfg["batch_size"] >= 1 and _cfg["remind_hours"] >= 1, (
+    "the shipped Reply Assistant has its batch or its reminder switched off: %r" % _cfg)
+assert _cfg["remind_hours"] == 4, (
+    "Section 9, Workflow 7 says the operator is reminded after 4 hours; Config says %r"
+    % _cfg["remind_hours"])
+_cfg = _config_values(sendreply_nodes)
+assert _cfg["now_override"] == "", "the shipped Send Reply workflow has a clock override set"
+assert _cfg["send_url"] == SENDREPLY_CONFIG["send_url"] and _cfg["send_url"].startswith("http://smtp-send:"), (
+    "the shipped Send Reply workflow does not post to the smtp-send service: %r" % _cfg["send_url"])
 _cfg = _config_values(health_nodes)
 assert set(_cfg) == HEALTH_CONFIG_FIELDS and _cfg["checker_url"] == HEALTH_CONFIG["checker_url"], (
     "the shipped IMAP Health Config is not what the build asserts against: %r" % _cfg)
@@ -2381,6 +3649,10 @@ SHIPPED = [
     ("follow-ups.json", workflow("followup0001", "Send & Track - Follow-Ups", followup_nodes, followup_connections)),
     ("imap-health.json", workflow("imaphealth0001", "Send & Track - IMAP Health", health_nodes, health_connections)),
     ("daily-digest.json", workflow("digest0001", "Send & Track - Daily Digest", digest_nodes, digest_connections)),
+    ("reply-assistant.json", workflow("reply0001", "Send & Track - Reply Assistant", reply_nodes,
+                                      reply_connections)),
+    ("send-reply.json", workflow("sendreply0001", "Send & Track - Send Reply", sendreply_nodes,
+                                 sendreply_connections)),
 ]
 
 # No literal email address in a committed workflow except the sender's own From.
@@ -2604,6 +3876,19 @@ print("  From: %s    own domain: %s" % (FROM_HEADER, OWN_DOMAIN))
 print("  signature checked on every body: %r" % SIGNATURE)
 print("  operator notification address: read at runtime from settings.operator_email "
       "(sync_settings.py) -- not baked in")
+print("  reply assistant (Section 9, Workflow 7): %d message(s)/run composed by %s (effort %s), %d-%d words, "
+      "always PENDING -- approved only by a one-time code from the operator address with SPF+DKIM passing"
+      % (REPLY_CONFIG["batch_size"], DRAFT_MODEL, DRAFT_EFFORT,
+         _js_int(js("code_reply.js"), "REPLY_MIN_WORDS", "code_reply.js"),
+         _js_int(js("code_reply.js"), "REPLY_MAX_WORDS", "code_reply.js")))
+print("    codes: NS-XXXXXXXXXX, one use, 48 h (migration 017's CHECK), minted by "
+      "reply_approval_issue() (migration 018); operator reminded every %d h while one is open"
+      % REPLY_CONFIG["remind_hours"])
+print("    never answered, deferred to the operator: %s" % ", ".join(REPLY_TOPICS))
+print("    reply send: no warm-up ceiling, no business hours, no pacing; blocklist, approval code, "
+      "signature and the one-URL cap all still apply")
+print("    threaded through %s -- the installed Send Email node cannot set In-Reply-To/References"
+      % SENDREPLY_CONFIG["send_url"])
 print("  IMAP health (Section 9): every %d min -> %s; problems %r" % (
     HEALTH_INTERVAL_MIN, HEALTH_CONFIG["checker_url"], HEALTH_PROBLEMS))
 print("  literal email addresses in the shipped JSON: %s" % (

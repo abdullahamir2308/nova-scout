@@ -13,9 +13,17 @@ const fs = require('fs');
 const path = require('path');
 
 const SRC = path.join(__dirname, 'code_operator_command.js');
-const lib = fs.readFileSync(SRC, 'utf8');
+// Everything above the 'Node body' marker, with the build's substitutions
+// applied -- the same source build_workflow.py prepends to Classify Inbound and
+// ships as the Decide Command node. Slicing at the marker is what lets the node
+// body itself ($input, which cannot run outside n8n) live in the same file.
+const SIGNATURE = 'Abdullah Amir\nFounder, Amitrix Labs\n+923178485713';
+const lib = fs.readFileSync(SRC, 'utf8')
+  .split('// Node body')[0]
+  .replace('__SIGNATURE__', JSON.stringify(SIGNATURE))
+  .replace('__MAX_URLS__', '1');
 const M = new Function(
-  lib + '\nreturn { operatorCommand, parseCommand, authResults, stripComments };')();
+  lib + '\nreturn { operatorCommand, parseCommand, authResults, stripComments, commandDecision, framedEdit };')();
 
 // The header exactly as it arrived on the Pharmahungary reply (n8n execution
 // 2336) -- tabs between the method results, a parenthesised SPF comment.
@@ -184,6 +192,147 @@ console.log('\nFailing closed');
   // A non-command is never given a refusal reason: it is not being refused, it
   // is simply a prospect message.
   ok('a non-command carries no refusal reason', run(null, 'no').refused_reason === null);
+}
+
+// ---------------------------------------------------------------------------
+// The decision -- Decide Command, with the database facts Load Command Context
+// reads: the operator's address, the code's state, and the draft's.
+//
+// Three outputs, and they are deliberately not the same question:
+//   record   -- goes into operator_commands, accepted or refused
+//   handled  -- really the operator's mail, so never a prospect reply
+//   accepted -- a draft moves
+// ---------------------------------------------------------------------------
+
+const OPERATOR = 'abdullah@amitrixlabs.com';
+const CODE2 = 'NS-2345678ABC';
+const REPLY_BODY = [
+  'Hello,',
+  '',
+  'Thanks for coming back to me. I will confirm the hosting detail and come back on that.',
+  '',
+  'Would a 48-hour demo on your own material be worth a look?',
+  '',
+  SIGNATURE,
+  '',
+  'On Wed, 07 Oct 2026, andras.nogradi@pharmahungary.com wrote:',
+  '> We are currently not planning a project.',
+].join('\n');
+
+function ctx(over) {
+  const body = 'APPROVE ' + CODE2;
+  return Object.assign({
+    payload: { message_id: '<op-1@amitrixlabs.com>', from_addr: OPERATOR, subject: 'Re: REPLY DRAFTED' },
+    command: M.operatorCommand(msg(REAL_AUTH, body), body),
+    operator_email: OPERATOR,
+    now: '2026-10-09T10:00:00.000Z',
+    code_found: true,
+    code_used_at: null,
+    code_expires_at: '2026-10-11T08:00:00.000Z',
+    code_kind: 'reply',
+    code_outcome: null,
+    draft_id: 261,
+    draft_status: 'pending',
+    draft_channel: 'email',
+    draft_variant: 'reply/D2.BEN-BRIEF',
+    draft_body: REPLY_BODY,
+  }, over || {});
+}
+
+function withBody(body, over) {
+  return ctx(Object.assign({ command: M.operatorCommand(msg(REAL_AUTH, body), body) }, over || {}));
+}
+
+console.log('\nDecide Command -- the verdict');
+{
+  let d = M.commandDecision(ctx());
+  ok('a clean APPROVE from the operator: recorded, handled, accepted',
+    d.record === true && d.handled === true && d.accepted === true && d.refused_reason === null &&
+    d.outcome === 'approved' && d.draft_id === 261, d);
+
+  // THE SPOOF. SPF and DKIM pass -- an attacker's own domain can pass its own
+  // -- but the address is not the operator's. Recorded as refused, and NOT
+  // handled, so it still reaches Record Inbound as the prospect message it may
+  // actually be.
+  d = M.commandDecision(ctx({ payload: { message_id: '<spoof@evil.example>',
+    from_addr: 'andras.nogradi@pharmahungary.com', subject: 'Re: REPLY DRAFTED' } }));
+  ok('a spoofed sender with passing SPF/DKIM is refused, logged, and falls through to Record Inbound',
+    d.record === true && d.handled === false && d.accepted === false &&
+    d.refused_reason === 'not sent from the operator address', d);
+
+  d = M.commandDecision(ctx({ operator_email: null }));
+  ok('no operator address configured: nothing is accepted',
+    d.accepted === false && d.handled === false &&
+    d.refused_reason === 'no operator address is configured (settings.operator_email)', d);
+
+  d = M.commandDecision(ctx({ code_found: false }));
+  ok('a wrong code is refused -- and it IS handled, because the operator really sent it',
+    d.record === true && d.handled === true && d.accepted === false &&
+    d.refused_reason === 'no such one-time code', d);
+
+  d = M.commandDecision(ctx({ code_expires_at: '2026-10-09T09:59:59.000Z' }));
+  ok('an expired code is refused, naming when it expired',
+    d.accepted === false && /expired at 2026-10-09T09:59:59/.test(d.refused_reason), d);
+
+  d = M.commandDecision(ctx({ code_used_at: '2026-10-09T09:00:00.000Z', code_outcome: 'approved' }));
+  ok('a reused code is refused, naming when and how it was used',
+    d.accepted === false && /already used at 2026-10-09T09:00:00/.test(d.refused_reason), d);
+
+  d = M.commandDecision(ctx({ draft_status: 'rejected' }));
+  ok('a draft that is no longer waiting is refused',
+    d.accepted === false && d.refused_reason === 'draft 261 is no longer waiting (it is rejected)', d);
+
+  // A failed SPF on a message that really is from the operator's address: still
+  // refused, and still not handled -- the authentication is the gate, not the
+  // From line.
+  d = M.commandDecision(withBody('APPROVE ' + CODE2, { command: M.operatorCommand(
+    msg('mx; dkim=pass; spf=fail', 'APPROVE ' + CODE2), 'APPROVE ' + CODE2) }));
+  ok('SPF fail from the operator address: refused and not handled',
+    d.accepted === false && d.handled === false && /SPF pass/.test(d.refused_reason), d);
+
+  // THE PLAIN "no". Not command-shaped at all, so nothing is recorded and
+  // nothing is handled: Record Inbound sees it, and refuses to match it to a
+  // lead because it came from the operator (its own guard).
+  d = M.commandDecision(withBody('no'));
+  ok('a plain "no" from the operator is not a command: nothing recorded, nothing handled, nothing accepted',
+    d.record === false && d.handled === false && d.accepted === false &&
+    d.refused_reason === 'not an operator command' && d.outcome === null, d);
+  ok('... and it carries no code and no draft to act on', d.code === null && d.command === null);
+
+  d = M.commandDecision(withBody('REJECT ' + CODE2));
+  ok('REJECT is accepted and its outcome is rejected', d.accepted === true && d.outcome === 'rejected', d);
+}
+
+console.log('\nEDIT -- the operator\'s own words, in the draft\'s own frame');
+{
+  let d = M.commandDecision(withBody('EDIT ' + CODE2 + ' Thanks Andras. We host in the EU and the data stays there.'));
+  ok('EDIT is accepted and its outcome is edited', d.accepted === true && d.outcome === 'edited', d);
+  ok('... the greeting and the signature are the draft\'s, not regenerated',
+    d.edited_body.indexOf('Hello,\n\nThanks Andras. We host in the EU and the data stays there.\n\n' + SIGNATURE) === 0,
+    d.edited_body);
+  ok('... and the quoted message being answered is kept verbatim',
+    d.edited_body.indexOf('> We are currently not planning a project.') !== -1, d.edited_body);
+  ok('... so nothing of the model\'s text survives',
+    d.edited_body.indexOf('48-hour demo') === -1 && d.edited_body.indexOf('hosting detail') === -1);
+
+  // Section 5 allows one plain URL. Two is refused -- and the code is NOT spent,
+  // so the same code works for a corrected EDIT.
+  d = M.commandDecision(withBody('EDIT ' + CODE2 + ' See https://a.example/x and https://b.example/y'));
+  ok('an EDIT that would carry two links is refused, and says the code still works',
+    d.accepted === false && d.edited_body === null &&
+    /carries 2 links/.test(d.refused_reason) && /still good/.test(d.refused_reason), d);
+  d = M.commandDecision(withBody('EDIT ' + CODE2 + ' One link is fine: https://a.example/x'));
+  ok('... one link is fine', d.accepted === true, d);
+
+  d = M.commandDecision(withBody('EDIT ' + CODE2));
+  ok('EDIT with no replacement text is refused', d.accepted === false &&
+    d.refused_reason === 'EDIT with no replacement text after the code', d);
+
+  // A draft whose body has no signature at all (nothing this workflow writes,
+  // but a hand-edited row could): the frame falls back rather than throwing.
+  d = M.commandDecision(withBody('EDIT ' + CODE2 + ' Short answer.', { draft_body: 'Hello,\n\nold text' }));
+  ok('a draft with no signature in it still frames the edit, with the signature appended',
+    d.accepted === true && d.edited_body === 'Hello,\n\nShort answer.\n\n' + SIGNATURE, d.edited_body);
 }
 
 console.log('\n%d passed, %d failed\n', pass, fail);

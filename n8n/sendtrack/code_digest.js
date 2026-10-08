@@ -95,7 +95,25 @@ function buildDigest(row, cfg) {
     lines.push('  #' + r.draft_id + '  ' + company(r) + '  ' + dStr(r.channel) + ' ' + kindOf(r.variant) +
       (r.new === true ? '  [new]' : '') + '  since ' + local(r.created_at, z));
     lines.push('        ' + (dStr(r.hold_reason) || 'no reason recorded (drafted before auto-approval existed)'));
+    // One-time codes on held EMAIL drafts, 2026-10-09 (Section 9, Workflow 7):
+    // an email the claim check held after its repairs can be approved, rejected
+    // or edited by answering this digest, exactly as a drafted reply can. Load
+    // Digest issues the code only on the tick that sends, and reuses an open
+    // one, so the code here is the one the database holds. A LinkedIn DM, a
+    // low-context note and a no-send-clock note get none: the first is sent by
+    // hand (Section 6) and the other two can never be sent at all.
+    if (dStr(r.code)) {
+      lines.push('        reply with:  APPROVE ' + dStr(r.code) + '   |   REJECT ' + dStr(r.code) +
+        '   |   EDIT ' + dStr(r.code) + ' <your text>');
+    }
   });
+  const codes = held.filter(function (r) { return dStr(r.code); }).length;
+  if (codes) {
+    lines.push('');
+    lines.push('Those ' + codes + ' code(s) work once each and expire 48 hours from now. Only this address');
+    lines.push('can use them, and only with SPF and DKIM passing; anything else is logged and');
+    lines.push('ignored. I will remind you about any you have not answered in 4 hours.');
+  }
   lines.push('', '-- Nova Scout (Workflow 6, Daily Digest). Sent only to this address; it uses no warm-up slot.');
 
   return {
@@ -108,11 +126,18 @@ function buildDigest(row, cfg) {
       digest_day: dStr(row.digest_day),
       covers_from: row.covers_from,
       covers_to: row.covers_to,
+      // The one-time codes this digest carried. Record Digest stamps
+      // reply_approvals.reminded_at for each one, because the digest IS how the
+      // operator was told about them -- otherwise the reply assistant's
+      // reminder lane would read them as never mentioned and nudge about every
+      // held draft half an hour later.
+      coded: held.filter(function (r) { return dStr(r.code); }).map(function (r) { return dStr(r.code); }),
       summary: {
         auto_approved: autoApproved.map(function (r) { return r.draft_id; }),
         sent: sent.map(function (r) { return r.draft_id; }),
         held: held.length,
         held_new: newHeld,
+        held_coded: codes,
         auto_approve_email: row.auto_approve_email === true,
       },
     },

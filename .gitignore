@@ -7,3 +7,6 @@ n8n/enrichment/fetch_out.json
 
 # Per-run report of scraper/scrape_ichgcp.py (uploaded as an Action artifact instead)
 scrape_report.json
+
+# Full output of each run-all.ps1 prompt-queue task
+logs/

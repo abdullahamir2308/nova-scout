@@ -43,3 +43,7 @@ bridge to the host's real network interface.
 
 Copy `.env.example` to `.env` and fill in real values. **`.env` is never
 committed** — it holds the Postgres credentials and the n8n encryption key.
+
+claude --resume fe99025d-ea7d-4e3d-b31d-7bcbc3d2353c
+powershell -ExecutionPolicy Bypass -File .\run-all.ps1 -SkipPreflight
+-TaskTimeoutMinutes 60

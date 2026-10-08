@@ -70,15 +70,36 @@ t.check('held: every pending draft, new ones marked, each with its reason on its
   [true, true, true]);
 t.check('a pending draft from before auto-approval says so instead of a blank',
   d.text.indexOf('#97  Vedic  email low-context note  since 2026-10-02 00:50 PKT\n        no reason recorded (drafted before auto-approval existed)') !== -1, true);
+// One-time codes on held email drafts, 2026-10-09 (Section 9, Workflow 7). Load
+// Digest issues them (and only on the tick that sends), so what is tested here
+// is that the digest shows the code it was handed and says nothing when it was
+// handed none -- a LinkedIn DM and a low-context note get none by design.
+const CODED = with_({
+  held: ROW.held.map((h) => (h.draft_id === 106 ? Object.assign({}, h, { code: 'NS-2345678ABC' }) : h)),
+});
+const coded = buildDigest(CODED, CFG);
+t.check('a held email draft carries its three commands, with the code',
+  coded.text.indexOf('        reply with:  APPROVE NS-2345678ABC   |   REJECT NS-2345678ABC   |   '
+    + 'EDIT NS-2345678ABC <your text>') !== -1, true);
+t.check('... and the rules of the code are stated once, not per draft',
+  [coded.text.split('work once each and expire 48 hours').length - 1,
+    coded.text.indexOf('Those 1 code(s) work once each') !== -1], [1, true]);
+t.check('the LinkedIn DM and the low-context note get no command line (neither can be sent that way)',
+  [(coded.text.match(/reply with:/g) || []).length, (coded.text.match(/APPROVE NS-/g) || []).length], [1, 1]);
+t.check('Record Digest is told which codes went out, so the reminder lane knows they were mentioned',
+  [coded.record.coded, coded.record.summary.held_coded], [['NS-2345678ABC'], 1]);
+t.check('no codes at all -> no code paragraph', d.text.indexOf('work once each') === -1, true);
+
 const empty = buildDigest(with_({ auto_approved: [], sent: [], held: [] }), CFG);
 t.check('an empty day still sends, saying "none" three times (the digest is also the proof the stack ran)',
   [empty.send, empty.text.split('  none').length - 1], [true, 3]);
 t.check('kinds: first touch, follow-up N, low-context note',
   [kindOf('unnamed/D2.A1'), kindOf('follow-up-1/BEN-SEE.A1+long'), kindOf('low-context/role-inbox')],
   ['first touch', 'follow-up 1', 'low-context note']);
-t.check('what Record Digest stores: the day, the window, the ids',
+t.check('what Record Digest stores: the day, the window, the ids, and the codes it carried',
   d.record, { digest_day: '2026-10-05', covers_from: '2026-10-04T03:00:00.000Z', covers_to: '2026-10-05T03:00:00.000Z',
-    summary: { auto_approved: [105], sent: [99], held: 3, held_new: 1, auto_approve_email: true } });
+    coded: [],
+    summary: { auto_approved: [105], sent: [99], held: 3, held_new: 1, held_coded: 0, auto_approve_email: true } });
 
 const node = runOnceForAll(DIGEST, [{ json: ROW }], { Config: [{ json: CFG }] }, bake);
 t.check('the node emits exactly one item: Build Digest\'s answer', [node.length, node[0].json.send, node[0].json.subject],
