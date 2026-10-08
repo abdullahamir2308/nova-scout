@@ -115,7 +115,12 @@ t.check('nothing about the prospect reaches the model but the first email -- no 
   P1.indexOf('Company:'), -1);
 t.check('the request is the drafting request plus this system prompt and message',
   [B1.json.request.model, B1.json.request.max_tokens, B1.json.request.output_config.effort, B1.json.request.system,
-   B1.json.request.messages], ['claude-sonnet-5-5', 16000, 'high', SYSTEM, [{ role: 'user', content: P1 }]]);
+   B1.json.request.messages],
+  ['claude-sonnet-5-5', 16000, 'high',
+   [{ type: 'text', text: SYSTEM, cache_control: { type: 'ephemeral' } }],
+   [{ role: 'user', content: P1 }]]);
+t.check('the follow-up system prompt is the one cached block, nothing per-lead (prompt caching, 2026-10-08)',
+  JSON.stringify(B1.json.request.messages).indexOf('cache_control'), -1);
 t.check('no sampling parameter is sent (a 400 on Sonnet 5.5)',
   ['temperature', 'top_p', 'top_k'].filter((k) => k in B1.json.request), []);
 t.check('the areas the first email names are not "absent"; the others are',

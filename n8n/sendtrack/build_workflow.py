@@ -593,6 +593,26 @@ def _assert_followup_matches_spec():
     missing = [a for a in SKILL_BANNED if a not in banned]
     assert not missing, "the drafting skill bans %r, which the embedded rules do not" % missing
 
+    # Prompt caching (Section 3, on since 2026-10-08). The composing call's
+    # system prompt is the cached block; nothing per-follow-up may be, because
+    # caching is a prefix match and everything about the lead differs per call.
+    assert re.search(r"system: \[\{ type: 'text', text: SYSTEM_PROMPT, cache_control: CACHE_CONTROL \}\]",
+                     src), (
+        "the follow-up request's cached block is no longer exactly its system prompt. That prompt "
+        "is ~1,169 tokens and build-substituted, so it is identical for every follow-up and every "
+        "run -- the one prefix here worth a breakpoint.")
+    assert not re.search(r"messages: \[\{ role: 'user', content: prompt \}\][^}]*cache_control", src), (
+        "a message block in the follow-up request is marked for caching; everything there is "
+        "per-lead, so the entry would be read by nothing.")
+    # The TTL is the measured judgement drafting's build records; the two copies
+    # must agree, or a follow-up and a first touch would be billed differently
+    # for the same decision.
+    assert "const CACHE_CONTROL = { type: 'ephemeral' };" in src, (
+        "code_followup.js no longer uses the 5-minute (default) cache TTL. A 1-hour entry costs "
+        "2x base input to write instead of 1.25x and only pays if calls sharing the prefix land "
+        "more than 5 minutes but less than an hour apart -- measured 2026-10-08, this pipeline's "
+        "do not. Change drafting's CACHE_TTL_JS and Section 3 at the same time.")
+
 
 _assert_decide_matches_spec()
 _assert_classify_matches_spec()

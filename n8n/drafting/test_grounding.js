@@ -734,8 +734,11 @@ t.check('the request carries the build\'s model, max_tokens and effort',
   [P.request.model, P.request.max_tokens, P.request.output_config.effort], ['claude-sonnet-5-5', 16000, 'high']);
 t.check('no sampling parameter is sent (a 400 on Sonnet 5.5)',
   ['temperature', 'top_p', 'top_k'].filter(function (k) { return k in P.request; }), []);
-t.check('the system prompt goes in as-is, uncached (concurrent calls never read a cache; see code_assess.js)',
-  P.request.system, SYSTEM_PROMPT);
+t.check('the system prompt goes in as-is, as the one cached block (prompt caching, 2026-10-08)',
+  P.request.system, [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }]);
+t.check('nothing per-lead is inside a cache breakpoint -- caching is a prefix match, so an entry '
+      + 'written behind the fact sheet would be read by nothing',
+  JSON.stringify(P.request.messages).indexOf('cache_control'), -1);
 t.check('the user message is the prompt itself', P.request.messages, [{ role: 'user', content: P.prompt }]);
 
 // --- what the subject line is built from -------------------------------------

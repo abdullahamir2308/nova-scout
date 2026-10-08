@@ -109,7 +109,7 @@ t.check('the prompt carries every confirmed claim, the record, the subject and t
   [prompt.indexOf('[BEN-SEE] (benefit) You can see every sponsor lead') !== -1, prompt.indexOf('based in Pune') !== -1,
    prompt.indexOf('Subject: ' + SUBJECT) !== -1, prompt.indexOf(BODY) !== -1], [true, true, true, true]);
 t.check('the system prompt\'s widening example is not draft 99\'s sentence (that one is the held-out test)',
-  req.system.indexOf('exactly what came in'), -1);
+  req.system[0].text.indexOf('exactly what came in'), -1);
 t.check('a first touch has no FIRST EMAIL section', prompt.indexOf('THE FIRST EMAIL'), -1);
 
 const input = firstTouch(CLEAN);
@@ -276,7 +276,7 @@ t.check('near miss: the subject quoted WITH the prompt\'s "Subject:" label still
 t.check('... but "Subject:" is only dropped when the quote leads with it -- a made-up quote is still foreign',
   holdWith(SENTENCES.concat([st('We built a Subject: line generator.', 'claim', 'D2', 'supported')])).indexOf('claim-check-incomplete: quoted text that is not in the email'), 0);
 t.check('the checker is told the bracketed product name is a name, not a claim (measured, dry run 1: "we call it Nova" judged unsupported)',
-  gate(firstTouch(CLEAN)).check_request.system.indexOf('"(we call it Nova)", only names what the sentence describes') !== -1, true);
+  gate(firstTouch(CLEAN)).check_request.system[0].text.indexOf('"(we call it Nova)", only names what the sentence describes') !== -1, true);
 t.check('a first email in which the check found no product claim at all is held',
   holdWith([st(SUBJECT + ' ' + BODY, 'none', '', 'none')]), 'claim-check-incomplete: no product claim found in a first email');
 
@@ -346,6 +346,15 @@ t.check('... carrying the email, the flagged sentence and the checker\'s exact r
 t.check('... told to rewrite only the flagged sentences, in the claim\'s own words, adding nothing',
   [rq.system.indexOf('Rewrite ONLY those sentences') !== -1, rq.system.indexOf('in its own') !== -1,
    rq.system.indexOf('Add nothing') !== -1], [true, true, true]);
+// Prompt caching, 2026-10-08: the claim check's prompt is the cached block; the
+// repair's is 448 tokens, under Sonnet 5.5's 512-token minimum, so it is a bare
+// string on purpose -- a breakpoint there would cache nothing and still bill the
+// write premium.
+t.check('the claim check marks its system prompt for caching, with the 5-minute default TTL',
+  gate(firstTouch(CLEAN)).check_request.system.map(function (b) { return b.cache_control; }),
+  [{ type: 'ephemeral' }]);
+t.check('the repair request does NOT mark its system prompt (448 tokens, under the 512 minimum)',
+  typeof rq.system, 'string');
 t.check('an unconfirmed line is never offered to the repair as something it may say',
   apply(repairable({ claims: CLAIMS.concat([claim('BEN-FIT', 'benefit', 'Configured around you.', false)]) }), response(widened))
     .repair_request.messages[0].content.indexOf('BEN-FIT'), -1);

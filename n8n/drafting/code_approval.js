@@ -305,12 +305,36 @@ function checkPrompt(ctx) {
   return out.join('\n');
 }
 
+// PROMPT CACHING -- on since 2026-10-08 for the claim check, off for the repair.
+// The reasoning and the measurements are in code_assess.js's comment; what is
+// specific to these two call sites:
+//
+//   * CHECK_SYSTEM_PROMPT is 1,080 tokens, over Sonnet 5.5's 512-token minimum
+//     cacheable prefix (live docs, 2026-10-08), and byte-identical for every
+//     draft -- first touch or follow-up, every repair round. So one check's
+//     write is read by every later check inside the window, including the
+//     repair rounds' own checks in the same run.
+//   * REPAIR_SYSTEM_PROMPT is 448 tokens. That is BELOW the 512-token minimum,
+//     so a breakpoint on it would silently cache nothing and simply bill the
+//     write premium -- the docs are explicit that a short prefix fails with no
+//     error, and measured here it is 448. It is left uncached deliberately.
+//     Padding it to clear the minimum would mean adding text to a prompt to win
+//     a few cents, which is the wrong trade. Repairs are rare anyway (only after
+//     a claim-check hold, at most 2) and are 25 of the last 206 calls.
+const CACHE_CONTROL = { type: 'ephemeral' };
+
+// Sonnet 5.5's documented minimum cacheable prefix (live prompt-caching docs,
+// read 2026-10-08). A prefix shorter than this does not cache and does not
+// error, so marking one is a pure surcharge -- the build refuses a breakpoint
+// on a prompt this short rather than let it go unnoticed.
+const MIN_CACHEABLE_TOKENS = 512;
+
 function checkRequest(ctx) {
   return {
     model: CHECK_MODEL,
     max_tokens: CHECK_MAX_TOKENS,
     output_config: { effort: CHECK_EFFORT, format: { type: 'json_schema', schema: CHECK_SCHEMA } },
-    system: CHECK_SYSTEM_PROMPT,
+    system: [{ type: 'text', text: CHECK_SYSTEM_PROMPT, cache_control: CACHE_CONTROL }],
     messages: [{ role: 'user', content: checkPrompt(ctx) }],
   };
 }
@@ -529,6 +553,8 @@ function repairPrompt(ctx, flagged) {
   return out.join('\n');
 }
 
+// No cache_control here on purpose -- REPAIR_SYSTEM_PROMPT is 448 tokens, under
+// the 512-token minimum (see the comment above checkRequest).
 function repairRequest(ctx, flagged) {
   return {
     model: CHECK_MODEL,

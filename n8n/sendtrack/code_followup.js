@@ -33,6 +33,9 @@ const SYSTEM_PROMPT = __FOLLOWUP_SYSTEM_PROMPT__;
 // Model, max_tokens, effort and the JSON schema -- the drafting node's request
 // parameters (Master Ref Section 3), substituted at build time.
 const CLAUDE_REQUEST = __CLAUDE_REQUEST__;
+// Prompt caching (Section 3). The same breakpoint the drafting node uses, so
+// the two cannot drift; the build checks it against drafting's own constant.
+const CACHE_CONTROL = { type: 'ephemeral' };
 // Section 9's locked taxonomy: a follow-up may name only the areas the first
 // email named.
 const THERAPEUTIC_AREAS = __THERAPEUTIC_AREAS__;
@@ -303,8 +306,14 @@ function followUpRequest(r, item) {
       check_claims: checkClaims(r),
       first_core: core,
       prompt: prompt,
+      // Prompt caching, on since 2026-10-08. SYSTEM_PROMPT is 1,169 tokens,
+      // over Sonnet 5.5's 512-token minimum, and build-time substituted so it is
+      // byte-identical for every follow-up and every run; everything about the
+      // lead is in the user message after it. The default 5-minute TTL, the
+      // measurements behind it, and why a run's own calls cannot read each
+      // other's write are all in drafting's code_assess.js.
       request: Object.assign({}, CLAUDE_REQUEST, {
-        system: SYSTEM_PROMPT,
+        system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: CACHE_CONTROL }],
         messages: [{ role: 'user', content: prompt }],
       }),
     },

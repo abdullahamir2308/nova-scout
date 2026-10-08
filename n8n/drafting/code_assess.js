@@ -700,14 +700,64 @@ const fullPrompt = prompt + '\n\nAPPROVED CLAIMS FOR THIS EMAIL. Nothing about t
   'Write no greeting and no sign-off -- those are added afterwards. In email_claims\n' +
   'and linkedin_claims, list the code of every claim that message used.';
 
-// No cache_control on the system prompt. Measured on the 2026-10-02 run: the
-// HTTP node dispatches every item's request before awaiting any, so a batch's
-// calls run concurrently and none can read a cache another has not yet written
-// (four calls, four cache writes, zero reads); and cron runs are 30 minutes
-// apart, past the 5-minute cache lifetime. Caching only added the 25% write
-// premium.
+// PROMPT CACHING -- on since 2026-10-08, one breakpoint, on the system prompt.
+//
+// The system prompt is the only part of this request that is byte-identical
+// across leads and across runs: build_workflow.py substitutes it at build time,
+// so every item in every batch carries the same 1,818 tokens of it. Everything
+// per-lead -- the company, the fact sheet, the geography-matched claims, which
+// fact to open on -- is in the user message, AFTER the breakpoint, which is the
+// order caching needs (a prefix match: one differing byte invalidates
+// everything after it).
+//
+// MEASURED against the live API on 2026-10-08, not assumed:
+//   * the cached prefix is 2,224 tokens, not the 1,818 of the prompt alone --
+//     `output_config.format`'s schema renders into the prefix too and caches
+//     with it;
+//   * a DIFFERENT lead's call reads the same 2,224 (write=0, read=2224), which
+//     is what makes this worth anything across a batch;
+//   * Sonnet 5.5's minimum cacheable prefix is 512 tokens (live docs, same
+//     day), so 2,224 clears it comfortably. Below the minimum nothing caches
+//     and nothing errors -- which is why code_approval.js leaves the 448-token
+//     repair prompt alone.
+//
+// WHY THE DEFAULT 5-MINUTE TTL AND NOT `ttl: '1h'`. The saving comes from reads,
+// and reads only happen when two calls share the prefix inside the window. The
+// real call pattern was measured from n8n's own execution history: calls arrive
+// in bursts of two runs 0.1-2 minutes apart, and the bursts themselves are
+// 57-60 minutes apart or hours apart. A 5-minute entry catches every read that
+// actually happens (the paired run seconds later) at a 1.25x write; a 1-hour
+// entry costs 2x to write and would only earn more if the 59.9-minute gaps
+// landed inside a 60-minute window measured from the first request's START --
+// a coin flip this does not need to bet on. If the schedule ever puts bursts
+// well inside the hour, `ttl: '1h'` becomes the better choice.
+//
+// WHAT IS NOT DONE HERE, AND WHY. A run's own calls are concurrent -- this
+// node starts every item's request inside its item loop and awaits them
+// together at the end (read from the installed HttpRequestV3.node.js:
+// `requestPromises.push(...)` in the loop, one `Promise.allSettled` after it),
+// and its `batchSize`/`batchInterval` options only `sleep()` between
+// dispatches, never awaiting a response. So within one run each call writes the
+// entry and none reads a sibling's; the reads come from the run that follows.
+// Sending the batch's first lead through its own node first WOULD win those
+// reads, and it was built and then rejected on evidence: n8n carries an item's
+// ancestry in `pairedItem`, a rest lane hanging off the first call collapses
+// every item's ancestry onto the first one, and Assemble Drafts' own
+// `$('Assess Grounding').item` then returns the WRONG lead's facts -- silently,
+// with no error (probed in the live instance: items 2 and 3 both resolved item
+// 1's record). The lineage-preserving variant passed that test and then stopped
+// the workflow dead on a one-lead batch, which the measured history says is the
+// commonest size. Section 9, Workflow 4 records both probes and the fix that
+// would make it safe.
+//
+// CACHING MUST NOT CHANGE WHAT A DRAFT SAYS, and it cannot: the bytes the model
+// reads are identical either way -- `cache_control` is a billing instruction
+// about a prefix, not part of it. build_workflow.py asserts that the only cached
+// block is this system prompt and that no per-lead text is ever inside one.
+const CACHE_CONTROL = { type: 'ephemeral' };
+
 const request = Object.assign({}, CLAUDE_REQUEST, {
-  system: SYSTEM_PROMPT,
+  system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: CACHE_CONTROL }],
   messages: [{ role: 'user', content: fullPrompt }],
 });
 

@@ -26,6 +26,20 @@ import re
 
 MARKER = "// Node body"
 
+# Prompt caching note for the claim-check node (Section 3). The batch's calls are
+# concurrent, so within one run they all WRITE the entry and none reads it; the
+# reads come from the next run inside the 5-minute window, which the measured
+# call pattern says is the common case (paired executions seconds apart). The
+# first/rest split that would also win the within-batch reads was built and
+# rejected on evidence -- Section 9, Workflow 4.
+_CACHE_NOTE = (
+    "PROMPT CACHING (2026-10-08): the system prompt carries a cache_control breakpoint, so this "
+    "call's 1,080-token prompt plus the output schema are read from cache whenever another check "
+    "ran in the last 5 minutes. A run's own calls are concurrent and cannot read each other's "
+    "write; the reads come from the run that follows. Verify with usage.cache_read_input_tokens "
+    "(n8n/drafting/cache_report.py)."
+)
+
 
 def _read(path):
     with io.open(path, encoding="utf-8") as fh:
@@ -154,10 +168,10 @@ def build(code, assemble, assemble_js, write, cred, model, effort, origin):
         _if(r0["needs_check"], "needscheck", "={{ $json.needs_check }}", [x0 + 220, y0],
             "true: an email draft that passed rules 1-4. false: everything is held; straight to the write."),
         _claude(r0["check"], "check_request", [x0 + 440, y0 - 100], cred,
-                "Auto-approval, rule 5: a second %s call (effort %s, Section 3's parameters) that compares each "
-                "product claim with the confirmed claims and each prospect fact with the record the draft was "
-                "written from, sentence by sentence. A widened claim fails. Errors continue as items: the draft is "
-                "held for a human. No fallback to another model." % (model, effort)),
+                ("Auto-approval, rule 5: a second %s call (effort %s, Section 3's parameters) that compares each "
+                 "product claim with the confirmed claims and each prospect fact with the record the draft was "
+                 "written from, sentence by sentence. A widened claim fails. Errors continue as items: the draft is "
+                 "held for a human. No fallback to another model.\n\n%s") % (model, effort, _CACHE_NOTE)),
         _code(r0["apply"], _bake(code["apply"], "__GATE__", r0["gate"]), [x0 + 660, y0 - 100],
               "Approved by the workflow only if every statement the check found is supported AND its quotes cover the "
               "whole email. A hold that names widened or unsupported statements goes to a repair (up to %d); any other "

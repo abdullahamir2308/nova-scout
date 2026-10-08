@@ -1106,6 +1106,79 @@ _assess_js = _assess_raw.replace(
     "__SEND_CLOCK_COUNTRIES__", json.dumps(sorted(CLOCK_COUNTRIES), ensure_ascii=False)
 )
 assert "__SYSTEM_PROMPT__" not in _assess_js, "system prompt placeholder was not substituted"
+
+# ---------------------------------------------------------------------------
+# Prompt caching (Section 3, on since 2026-10-08) -- the contract, at build time
+#
+# Caching is a prefix match and it fails SILENTLY in both directions: a prefix
+# under the model's minimum caches nothing and does not error, and a breakpoint
+# placed after per-lead text writes an entry nothing will ever read. Both show
+# up only as a bigger bill. So the shape is pinned here rather than trusted.
+# ---------------------------------------------------------------------------
+
+# Claude Sonnet 5.5's documented minimum cacheable prefix, from the live
+# prompt-caching docs read on 2026-10-08. It is NOT monotonic across generations
+# (512 here, 1,024 on Sonnet 5, 4,096 on Opus 4.6), which is why it is re-read
+# from the docs rather than carried forward from an older note.
+MIN_CACHEABLE_TOKENS = 512
+
+# Characters per token, from /v1/messages/count_tokens on this project's own
+# prompts (2026-10-08): drafting 5,185 ch -> 1,825 tok (2.84), claim check 3,289
+# -> 1,080 (3.05), follow-up 3,389 -> 1,169 (2.90), repair 1,323 -> 448 (2.95).
+# The build cannot call the API, so it uses the most pessimistic of those: a
+# prompt this calls cacheable really is.
+CHARS_PER_TOKEN = 3.1
+
+
+def _assert_cacheable(name, prompt):
+    est = len(prompt) / CHARS_PER_TOKEN
+    assert est >= MIN_CACHEABLE_TOKENS, (
+        "%s is marked for prompt caching but is only ~%d tokens (%d chars), under Sonnet 5.5's "
+        "%d-token minimum. A prefix that short does not cache and does not error -- it would bill "
+        "the write premium on every call and read nothing back."
+        % (name, est, len(prompt), MIN_CACHEABLE_TOKENS))
+
+
+# The drafting system prompt is the cached prefix, so it has to clear the
+# minimum. It is ~1,825 tokens today; this fires if it is ever cut down.
+_assert_cacheable("the drafting system prompt (code_assess.js SYSTEM_PROMPT)", SYSTEM_PROMPT)
+
+# Exactly one breakpoint, and it is on the system prompt -- not on anything
+# per-lead. Checked against the shipped JS rather than against intent: the
+# request is built in code_assess.js, so that is where a stray breakpoint would
+# appear.
+_cache_sites = re.findall(r"cache_control", _assess_js)
+assert len(_cache_sites) == 2, (
+    "code_assess.js mentions cache_control %d times; expected 2 (the CACHE_CONTROL constant and "
+    "the one system block that uses it). A second breakpoint in this request would sit after "
+    "per-lead text and write an entry nothing reads." % len(_cache_sites))
+assert re.search(r"system: \[\{ type: 'text', text: SYSTEM_PROMPT, cache_control: CACHE_CONTROL \}\]",
+                 _assess_js), (
+    "the drafting request's cached block is no longer exactly the system prompt. Everything "
+    "per-lead must stay in `messages`, after the breakpoint -- caching is a prefix match, so a "
+    "breakpoint behind the fact sheet writes a distinct entry per lead.")
+assert not re.search(r"messages: \[[^\]]*cache_control", _assess_js, re.S), (
+    "a message block in the drafting request is marked for caching. Everything in `messages` here "
+    "is per-lead, so that entry would be written once per call and read by nothing.")
+
+# The TTL is a measured judgement, not a default to drift: the 5-minute entry
+# (1.25x to write) catches every read the real call pattern produces -- bursts of
+# two runs 0.1-2 minutes apart -- while `ttl: '1h'` costs 2x to write and would
+# only earn more if the observed 57-60 minute gaps between bursts landed inside
+# a 60-minute window measured from the first request's start. Changing it means
+# changing this line too, which is the point.
+# Follow-Ups carries the same constant and n8n/sendtrack/build_workflow.py
+# guards its own copy -- this build may not read that directory (the drift
+# harness copies only this one).
+CACHE_TTL_JS = "const CACHE_CONTROL = { type: 'ephemeral' };"
+for _name, _src in (("code_assess.js", _assess_js),
+                    ("code_approval.js", js("code_approval.js"))):
+    assert CACHE_TTL_JS in _src, (
+        "%s no longer uses the 5-minute (default) cache TTL. If the schedule or the call pattern "
+        "has changed so that `ttl: '1h'` now pays, change CACHE_TTL_JS here and record the new "
+        "measurement in Section 3 -- a 1-hour entry costs 2x base input to write instead of "
+        "1.25x, so this is a cost decision, not a detail." % _name)
+
 assert "__SEND_CLOCK_COUNTRIES__" not in _assess_js, "the clock-country list was not substituted"
 assert "__CLAUDE_REQUEST__" not in _assess_js, "Claude request placeholder was not substituted"
 assert '"model": "%s"' % DRAFT_MODEL in _assess_js, "the shipped request does not name %s" % DRAFT_MODEL
@@ -1137,6 +1210,20 @@ assert _check_model and _check_model.group(1) == DRAFT_MODEL, (
     "the claim check (code_approval.js CHECK_MODEL) is not Section 3's drafting model %s" % DRAFT_MODEL)
 assert _check_effort and _check_effort.group(1) == DRAFT_EFFORT, (
     "the claim check's effort (code_approval.js CHECK_EFFORT) is not Section 3's %r" % DRAFT_EFFORT)
+
+# The claim check caches; the repair deliberately does not (448 tokens, under
+# the minimum). Both halves are asserted, so dropping either is a build error
+# rather than a silent cost change.
+assert re.search(r"system: \[\{ type: 'text', text: CHECK_SYSTEM_PROMPT, cache_control: CACHE_CONTROL \}\]",
+                 APPROVAL_RULES), (
+    "the claim check's system prompt is no longer the cached block (code_approval.js). It is "
+    "1,080 tokens and identical for every draft and every repair round, so it is the one prefix "
+    "worth caching in that chain.")
+assert re.search(r"system: REPAIR_SYSTEM_PROMPT,", APPROVAL_RULES), (
+    "the repair request's system prompt has been marked for caching. Measured 2026-10-08 it is "
+    "448 tokens, UNDER Sonnet 5.5's 512-token minimum: it would cache nothing, raise no error, "
+    "and bill the write premium for ever. Leave it uncached, or lengthen the prompt for a reason "
+    "that is not caching.")
 assert not re.search(r"\b(temperature|top_p|top_k|budget_tokens)\b", re.sub(r"//.*", "", APPROVAL_RULES)), (
     "the claim check request sets a sampling or thinking-budget parameter -- a 400 on %s (Section 3)" % DRAFT_MODEL)
 # Section 6: a LinkedIn draft never auto-approves. The gate's first test.
@@ -1146,6 +1233,8 @@ assert re.search(r"if \(!draft \|\| draft\.channel !== 'email'\) \{\s*\n\s*reaso
 # The Write statement can only approve what the Apply node marks approved by
 # 'auto', and only an email.
 assert "target.approved_by = 'auto'" in js("code_approval_apply.js")
+
+
 
 CHECK_BODY = "={{ JSON.stringify($json.check_request) }}"
 _assert_emitted_upstream(APPROVAL_JS, set(re.findall(r"\$json\.(\w+)", CHECK_BODY)) | {"needs_check"},
@@ -1189,6 +1278,68 @@ assert not _unread, (
     "code_assess.js reads lead.%s, but Get Draft Batch returns no such column. It would be "
     "undefined at runtime with no error." % ", lead.".join(_unread)
 )
+
+# Prompt caching for the drafting call (Section 3, on since 2026-10-08). What
+# the node's own notes say, and why it is one node and not two.
+CACHE_NOTE = (
+    "PROMPT CACHING (2026-10-08): Assess Grounding marks the system prompt with a cache_control "
+    "breakpoint, so the stable part of this request -- the system prompt plus the output schema, "
+    "2,224 tokens measured against the live API -- is read from cache instead of re-billed at the "
+    "base input rate whenever another drafting call ran in the last 5 minutes. Everything "
+    "per-lead is in the user message, after the breakpoint, which is the order a prefix match "
+    "needs.\n\n"
+    "This node dispatches every item's request before awaiting any (read from the installed "
+    "HttpRequestV3.node.js), so a RUN's own calls are concurrent and each one writes the entry "
+    "rather than reading a sibling's. The reads come from the next run inside the window; the "
+    "measured call pattern is bursts of paired runs seconds apart, so most calls do read. A "
+    "first/rest split that would also win the within-batch reads was built and REJECTED on "
+    "evidence -- it breaks n8n's paired-item lineage, so Assemble Drafts resolved the wrong "
+    "lead's facts for every item after the first, and a one-lead batch stopped the workflow "
+    "dead. Section 9, Workflow 4 records the probes.\n\n"
+    "Verify with the usage fields on real runs: n8n/drafting/cache_report.py."
+)
+
+
+def claude_draft_node(name, pos):
+    """The drafting call -- one node for the whole batch."""
+    return {
+        "parameters": {
+            "method": "POST",
+            "url": "https://api.anthropic.com/v1/messages",
+            "authentication": "predefinedCredentialType",
+            "nodeCredentialType": "anthropicApi",
+            "sendHeaders": True,
+            "headerParameters": {"parameters": [{"name": "anthropic-version", "value": "2023-06-01"}]},
+            "sendBody": True,
+            "specifyBody": "json",
+            "jsonBody": CLAUDE_BODY,
+            "options": {"timeout": 300000},
+        },
+        "name": name,
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": list(pos),
+        "credentials": ANTHROPIC_CRED,
+        "onError": "continueRegularOutput",
+        "retryOnFail": True,
+        "maxTries": 2,
+        "waitBetweenTries": 5000,
+        "notes": (
+            "Drafting skill v3: %s through the Anthropic Messages API, drafting node only "
+            "(Section 3). Enrichment and scoring stay on local qwen3.5:9b.\n\n"
+            "The body is $json.request, built per lead by Assess Grounding: model, max_tokens, "
+            "effort %s, the JSON schema (output_config.format), the system prompt and the "
+            "lead's facts plus its approved claims. No temperature/top_p: a non-default value is a "
+            "400 on this model. Thinking is left at the model default (adaptive).\n\n"
+            "The API key is the n8n credential %s, made from ANTHROPIC_API_KEY in .env by "
+            "provision_anthropic_credential.py. It is never in this JSON.\n\n"
+            "Skill section 6: if the call fails the lead stays queued and the next run retries. "
+            "There is NO fallback to the local model. Errors continue as items so Assemble Drafts "
+            "can drop them; it also drops a refusal, a max_tokens cut-off, or text that is not the "
+            "schema.\n\n%s"
+        ) % (DRAFT_MODEL, DRAFT_EFFORT, ANTHROPIC_CRED["anthropicApi"]["id"], CACHE_NOTE),
+    }
+
 
 # The auto-approval chain with its repair rounds, generated (approval_chain.py)
 # -- the same chain Follow-Ups carries.
@@ -1360,47 +1511,7 @@ nodes = [
             "under-informed, so the design assumption is that they will."
         ),
     },
-    {
-        "parameters": {
-            "method": "POST",
-            "url": "https://api.anthropic.com/v1/messages",
-            "authentication": "predefinedCredentialType",
-            "nodeCredentialType": "anthropicApi",
-            "sendHeaders": True,
-            "headerParameters": {"parameters": [{"name": "anthropic-version", "value": "2023-06-01"}]},
-            "sendBody": True,
-            "specifyBody": "json",
-            "jsonBody": CLAUDE_BODY,
-            "options": {"timeout": 300000},
-        },
-        "name": "Claude Draft",
-        "type": "n8n-nodes-base.httpRequest",
-        "typeVersion": 4.2,
-        "position": [660, 20],
-        "credentials": ANTHROPIC_CRED,
-        "onError": "continueRegularOutput",
-        "retryOnFail": True,
-        "maxTries": 2,
-        "waitBetweenTries": 5000,
-        "notes": (
-            "Drafting skill v3: %s through the Anthropic Messages API, drafting node only "
-            "(Section 3). Enrichment and scoring stay on local qwen3.5:9b.\n\n"
-            "The body is $json.request, built per lead by Assess Grounding: model, max_tokens, "
-            "effort %s, the JSON schema (output_config.format), the system prompt and the "
-            "lead's facts plus its approved claims. No temperature/top_p: a non-default value is a "
-            "400 on this model. Thinking is left at the model default (adaptive).\n\n"
-            "The API key is the n8n credential %s, made from ANTHROPIC_API_KEY in .env by "
-            "provision_anthropic_credential.py. It is never in this JSON.\n\n"
-            "Skill section 6: if the call fails the lead stays queued and the next run retries. "
-            "There is NO fallback to the local model. Errors continue as items so Assemble Drafts "
-            "can drop them; it also drops a refusal, a max_tokens cut-off, or text that is not the "
-            "schema.\n\n"
-            "One call per lead, all of a run's calls in flight at once (at most Config's batch_size). "
-            "This node dispatches every item's request before awaiting any, which is also why the "
-            "system prompt is not marked for prompt caching: measured, four calls wrote the cache "
-            "four times and read it never."
-        ) % (DRAFT_MODEL, DRAFT_EFFORT, ANTHROPIC_CRED["anthropicApi"]["id"]),
-    },
+    claude_draft_node("Claude Draft", (660, 20)),
     {
         "parameters": {"mode": "runOnceForEachItem", "jsCode": _assemble_js},
         "name": "Assemble Drafts",
