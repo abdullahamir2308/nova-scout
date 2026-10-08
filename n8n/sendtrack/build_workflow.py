@@ -64,6 +64,10 @@ ENV_FILE = os.environ.get("NOVASCOUT_ENV_FILE", os.path.join(HERE, "..", "..", "
 VARIANTS_OUT = os.environ.get("SENDTRACK_VARIANTS_OUT", "")
 DRYRUN_NOW = os.environ.get("SENDTRACK_DRYRUN_NOW", "")
 FIXTURES = os.environ.get("SENDTRACK_FIXTURES", "")
+# Send Reply posts to the smtp-send sidecar by hostname in production; a dry
+# run cannot reach that container's real mailbox credentials, so its Config's
+# send_url is overridden to a loopback sink instead (reply_dryrun.py runs one).
+SENDREPLY_SINK_URL = os.environ.get("SENDTRACK_SENDREPLY_SINK_URL", "http://127.0.0.1:18766/send")
 
 
 def js(name):
@@ -630,8 +634,18 @@ def iso(expr):
 
 
 def with_iso(sql):
-    """ISO(x) in a statement here -> iso(x), so every clock value leaves in one format."""
-    return re.sub(r"ISO\(([\w.]+)\)", lambda m: iso(m.group(1)), sql)
+    """ISO(x) in a statement here -> iso(x), so every clock value leaves in one format.
+
+    Fixed 2026-10-09: a stray literal backspace byte had landed inside this
+    function's own regex (between `r"` and `ISO`), so it matched nothing at
+    all -- every ISO(...) call in every statement below was shipping as
+    literal, uppercase, unsubstituted text, and Postgres has no such function.
+    The `(?:\\(\\))?` tail is new on top of that: `ISO(now())`, the one call
+    site whose argument is a function call rather than a dotted column
+    reference, still would not have matched the plain `[\\w.]+` class. Found
+    by reply_dryrun.py's first real execution against a real Postgres --
+    no earlier guard runs the generated SQL at all, only reads its text."""
+    return re.sub(r"ISO\(([\w.]+(?:\(\))?)\)", lambda m: iso(m.group(1)), sql)
 
 
 BLOCKED_DOMAIN = ("EXISTS (SELECT 1 FROM blocklist b WHERE {d} = b.domain OR {d} LIKE '%.' || b.domain)")
@@ -3850,6 +3864,35 @@ if VARIANTS_OUT:
                    ("Send Digest", "credentials"), ("Record Digest", "credentials")])
     assert sorted(got) == want, "the dry-run Daily Digest variant drifted: %r" % sorted(got)
     VARIANTS.append(("digest-dryrun.json", dry_digest))
+
+    # Send Reply (Section 9, Workflow 7): the same three kinds of change as
+    # every other variant, PLUS the Config send_url -- the "Send Reply" node
+    # has no credential of its own to swap (it is an unauthenticated internal
+    # HTTP POST), so the only way to keep it off the real smtp-send sidecar
+    # is to point Config at a sink instead. Asserted here so that remains the
+    # ONLY extra difference: a dry run that silently changed anything else
+    # about this lane would not be testing what ships.
+    #
+    # Deliberately NOT generated: a dry-run variant of the Reply Assistant
+    # itself (reply0001). _DRY_KEEPS leaves the Anthropic credential real on
+    # every dry variant (drafting and follow-ups measure real cost against
+    # it), so a reply0001 dry run would place a real, billed Claude call --
+    # and every scenario this harness proves (operator authentication, the
+    # one-time code, the reply send lane's skipped/kept guards) is provable
+    # without composing a single reply. Seeding `drafts` and `reply_approvals`
+    # directly, as reply_dryrun.py does, is the same principle dryrun.py's own
+    # `direct_claim` helper already uses for Claim Send.
+    sendreply_wf = SHIPPED[6][1]
+    dry_sendreply = dry_variant(sendreply_wf, "sendreply0001dry", "DRY RUN - Send Reply (scratch DB, HTTP sink)",
+                                {"now_override": DRYRUN_NOW, "send_url": SENDREPLY_SINK_URL},
+                                {SENDREPLY_TRIGGER})
+    got = _node_diff(sendreply_wf, dry_sendreply)
+    want = sorted([(SENDREPLY_TRIGGER, "removed"), ("Config", "config:now_override"),
+                   ("Config", "config:send_url"), ("Load Reply Send State", "credentials"),
+                   ("Claim Send", "credentials"), ("Confirm Send", "credentials"),
+                   ("Revert Claim", "credentials")])
+    assert sorted(got) == want, "the dry-run Send Reply variant drifted: %r" % sorted(got)
+    VARIANTS.append(("sendreply-dryrun.json", dry_sendreply))
 
     for _file, _wf in VARIANTS:
         _write(os.path.join(VARIANTS_OUT, _file), _wf)

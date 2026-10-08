@@ -1,0 +1,451 @@
+{
+  "id": "sendreply0001",
+  "name": "Send & Track - Send Reply",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      },
+      "name": "Every 10 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1100,
+        40
+      ],
+      "notes": "Every 10 minutes, like Send. There is no business-hours filter and no pacing here -- a reply goes out as soon as the operator has approved it (Section 9, Workflow 7) -- so this interval is just how long an approved reply may wait."
+    },
+    {
+      "parameters": {},
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1100,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "nowoverride",
+              "name": "now_override",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "sendurl",
+              "name": "send_url",
+              "value": "http://smtp-send:8766/send",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -880,
+        130
+      ],
+      "notes": "send_url: the smtp-send service in docker-compose.yml, which is the only sender in this project that can set In-Reply-To and References. now_override must stay empty (dry-run only)."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Load Reply Send State: every approved REPLY draft, with what each guard needs\n-- (Section 9, Workflow 7). One statement, one snapshot, one clock.\n--\n-- $1 now_override -- '' in the shipped workflow (checked at build time).\n--\n-- There is no warm-up history here and no business-hours input, because a reply\n-- is not cold outreach: it skips the ceiling, the recipient's business hours and\n-- the pacing floor (code_reply_decide.js says why for each). What it does not\n-- skip is in this query -- the blocklist on both domains, a used approval code\n-- with an approve-or-edit outcome, and the thread headers it must carry.\n--\n-- `d.variant LIKE 'reply/%' ` is the whole boundary between the two lanes: the\n-- cold Load Send State excludes exactly that, so no draft can be seen by both\n-- and the two lanes can never disagree about which rules apply to one.\nWITH clk AS (\n  SELECT coalesce(nullif($1, '')::timestamptz, now()) AS now\n),\ncand AS (\n  SELECT d.id AS draft_id,\n         d.lead_id AS lead_id,\n         d.channel AS channel,\n         d.status AS status,\n         d.variant AS variant,\n         d.subject AS subject,\n         coalesce(d.edited_body, d.body) AS body,\n         l.domain AS domain,\n         l.country AS country,\n         l.status AS lead_status,\n         a.code AS code,\n         a.used_at IS NOT NULL AS approval_used,\n         a.outcome AS approval_outcome,\n         i.from_addr AS to_addr,\n         i.message_id AS their_message_id,\n         i.references_raw AS references_raw,\n         i.thread_ids AS thread_ids,\n         i.message_id IS NOT NULL AS inbound_exists,\n         (SELECT coalesce(array_agg(o.message_id ORDER BY o.sent_at), '{}') FROM outreach_log o WHERE o.lead_id = d.lead_id AND o.channel = 'email' AND o.message_id IS NOT NULL) AS our_message_ids,\n         EXISTS (SELECT 1 FROM blocklist b WHERE lower(l.domain) = b.domain OR lower(l.domain) LIKE '%.' || b.domain) AS lead_domain_blocked,\n         EXISTS (SELECT 1 FROM blocklist b WHERE lower(split_part(i.from_addr, '@', 2)) = b.domain OR lower(split_part(i.from_addr, '@', 2)) LIKE '%.' || b.domain) AS recipient_domain_blocked\n    FROM drafts d\n    JOIN leads l ON l.id = d.lead_id\n    LEFT JOIN reply_approvals a   ON a.draft_id = d.id\n    LEFT JOIN inbound_messages i  ON i.message_id = a.inbound_message_id\n   WHERE d.channel = 'email'          -- Section 6: LinkedIn is sent by a human. Always.\n     AND d.status = 'approved'\n     AND coalesce(d.variant, '') LIKE 'reply/%'\n   ORDER BY d.id\n   LIMIT 50\n)\nSELECT to_char((SELECT now FROM clk) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS clock,\n       (SELECT coalesce(json_agg(row_to_json(cand)), '[]'::json) FROM cand) AS candidates,\n       (SELECT coalesce(json_object_agg(k, n), '{}'::json)\n          FROM (SELECT coalesce(status, '?') AS k, count(*) AS n\n                  FROM drafts WHERE coalesce(variant, '') LIKE 'reply/%' GROUP BY 1) s) AS replies_by_status;",
+        "options": {
+          "queryReplacement": "={{ [$json.now_override] }}"
+        }
+      },
+      "name": "Load Reply Send State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -660,
+        130
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Every approved `reply/` draft with what each guard needs: the used approval code and its outcome, the address that wrote to us, the thread headers, and both blocklist checks. No warm-up history and no clock table -- a reply skips the ceiling and business hours."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Decide Reply Send -- n8n Code node (Run Once for All Items).\n//\n// Section 9, Workflow 7: \"replies skip the cold ceiling and business hours; the\n// blocklist still applies.\" This is the whole of that sentence, and it is a\n// separate lane from Decide Send on purpose -- the cold path is untouched, and\n// the two can never argue about which rules apply to which draft, because\n// neither can see the other's drafts (Load Send State excludes `reply/`, Load\n// Reply Send State selects only `reply/`).\n//\n// WHAT A REPLY SKIPS, and why each one is right:\n//   * the warm-up ceiling (Section 5) -- it protects a cold domain's\n//     reputation. An answer to a message somebody sent US is the best mail this\n//     mailbox can send, and holding it back for a daily quota would mean not\n//     answering a prospect who asked a question.\n//   * the recipient's business hours -- they just wrote to us; a reply that\n//     waits for 09:00 local can wait sixteen hours to say \"here you go\".\n//   * the pacing floor and the random gate -- both exist so cold sends do not\n//     arrive as a synchronised burst. One reply is not a burst.\n//   * the \"first touch only to a lead never emailed\" rule, and `lead-replied`,\n//     which are exactly the conditions a reply requires.\n//\n// WHAT IT DOES NOT SKIP:\n//   * the blocklist, on the lead's domain AND on the address we would answer\n//     (Section 5: an opt-out is honoured instantly and permanently -- and a\n//     prospect who replied and then opted out is a real sequence);\n//   * the one-time approval: migration 018 refuses to mark a `reply/` draft\n//     approved without one, and the claim below re-checks that the code was\n//     really used to approve or edit THIS draft;\n//   * the signature, the one-URL cap and an unchanged body;\n//   * at-most-once: the draft flips to `sent` and an outreach_log claim is\n//     written BEFORE the SMTP call, exactly as on the cold path.\n//\n// A reply DOES still consume a warm-up slot after the fact, and that is worth\n// knowing rather than hiding: it is external mail, so when Mailbox Watch\n// mirrors it out of the Sent folder it counts in `mailbox_sent.external` like\n// any other send, and that day's cold ceiling has one fewer left. Skipping the\n// ceiling means a reply is never BLOCKED by it, not that the mailbox did not\n// send a message.\n\nconst REPLY_SIGNATURE = \"Abdullah Amir\\nFounder, Amitrix Labs\\n+923178485713\";\nconst REPLY_MAX_URLS = 1;\nconst REPLY_URL_RE = /\\b(?:https?:\\/\\/|www\\.)[^\\s<>()]+/gi;\nconst REPLY_EMAIL_RE = /^[^\\s@<>(),;:\"']+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$/;\nconst MESSAGE_ID_RE = /<[^<>\\s@]+@[^<>\\s]+>/g;\n\nfunction dStr(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\nfunction dMs(v) {\n  if (v === null || v === undefined || v === '') return null;\n  const t = new Date(v).getTime();\n  return isNaN(t) ? null : t;\n}\n\n// What gets checked is what gets sent -- Decide Send's own normalisation.\nfunction normaliseBody(v) {\n  return String(v === null || v === undefined ? '' : v)\n    .replace(/\\r\\n?/g, '\\n')\n    .replace(/[ \\t]+\\n/g, '\\n')\n    .trim();\n}\n\nfunction countUrls(v) {\n  const m = String(v).match(REPLY_URL_RE);\n  return m ? m.length : 0;\n}\n\nfunction idsIn(v) {\n  const found = String(v === null || v === undefined ? '' : v).match(MESSAGE_ID_RE) || [];\n  return found.filter(function (x, i) { return found.indexOf(x) === i; });\n}\n\n// RFC 5322 threading, from what the database really holds (migration 017).\n//\n// In-Reply-To is the message we are answering -- theirs. References is their\n// own References chain with their Message-ID appended, because that is what a\n// client that sees this message needs in order to place it. When their\n// References header was never stored (every inbound row from before migration\n// 017 except lead 26's), fall back to the parsed thread_ids, and failing that\n// to the Message-IDs of our own sends on this lead: correct for a two-message\n// thread, and honest about a longer one rather than inventing the middle.\nfunction threadHeaders(c) {\n  const theirs = idsIn(c.their_message_id)[0] || null;\n  let chain = idsIn(c.references_raw);\n  if (!chain.length) chain = (Array.isArray(c.thread_ids) ? c.thread_ids : []).map(dStr).filter(Boolean);\n  if (!chain.length) chain = (Array.isArray(c.our_message_ids) ? c.our_message_ids : []).map(dStr).filter(Boolean);\n  const refs = chain.slice();\n  if (theirs && refs.indexOf(theirs) === -1) refs.push(theirs);\n  return {\n    in_reply_to: theirs,\n    references: refs.filter(function (x, i) { return refs.indexOf(x) === i; }),\n  };\n}\n\n// Why this approved reply draft may not go out, or null if it may.\nfunction ineligibility(c) {\n  if (dStr(c.channel) !== 'email') {\n    // Section 6 is enforced three times on the cold path and three times here:\n    // the query never selects LinkedIn, migration 017's CHECK refuses a\n    // `reply/` variant on a LinkedIn draft, and this throws. Reaching this line\n    // means the SQL changed.\n    throw new Error('Section 6 violation: a ' + JSON.stringify(c.channel) +\n      ' draft reached the reply send path (draft ' + c.draft_id + ')');\n  }\n  if (!/^reply\\//.test(dStr(c.variant))) {\n    throw new Error('a non-reply draft reached the reply send path (draft ' + c.draft_id +\n      ', variant ' + JSON.stringify(c.variant) + ')');\n  }\n  if (dStr(c.status) !== 'approved') return 'not-approved';\n  // Migration 018 will not let a reply be approved without this; the claim\n  // re-checks it; and here it is for a third time, so a draft whose code was\n  // somehow cleared cannot go out on a stale approval.\n  if (!c.approval_used) return 'no-used-approval-code';\n  if (['approved', 'edited'].indexOf(dStr(c.approval_outcome)) === -1) {\n    return 'approval-outcome:' + (dStr(c.approval_outcome) || 'none');\n  }\n  if (dStr(c.lead_status) !== 'replied') return 'lead-status:' + dStr(c.lead_status);\n  if (!c.inbound_exists) return 'no-inbound-message';\n  if (c.lead_domain_blocked) return 'blocklisted-domain';\n  if (c.recipient_domain_blocked) return 'blocklisted-recipient-domain';\n  if (!REPLY_EMAIL_RE.test(dStr(c.to_addr))) return 'no-valid-address';\n\n  const body = normaliseBody(c.body);\n  if (!dStr(c.subject)) return 'no-subject';\n  // A reply carries no Section 5 opt-out line -- it answers a message they\n  // sent us, inside their own thread (code_reply_assemble.js says why). The\n  // signature is still checked, and for the same reason the cold path checks\n  // it: a body that does not carry the current one was drafted, or edited,\n  // under a different identity.\n  if (body.indexOf(REPLY_SIGNATURE) === -1) return 'stale-signature';\n  if (countUrls(body) > REPLY_MAX_URLS) return 'too-many-urls';\n  if (!threadHeaders(c).in_reply_to) return 'no-thread-headers';\n  return null;\n}\n\nfunction decide(state) {\n  const clock = dMs(state.clock);\n  if (clock === null) throw new Error('Load Reply Send State returned no clock');\n\n  const eligible = [];\n  const excluded = [];\n  const candidates = (state.candidates || []).slice().sort(function (a, b) {\n    return Number(a.draft_id) - Number(b.draft_id);\n  });\n  for (let i = 0; i < candidates.length; i++) {\n    const c = candidates[i];\n    const why = ineligibility(c);\n    if (why) {\n      excluded.push({ draft_id: c.draft_id, lead_id: c.lead_id, domain: c.domain, reason: why });\n      continue;\n    }\n    eligible.push({ draft_id: c.draft_id, lead_id: c.lead_id, domain: c.domain, to_addr: dStr(c.to_addr) });\n  }\n\n  const out = {\n    send: false,\n    reason: null,\n    detail: null,\n    clock: new Date(clock).toISOString(),\n    eligible: eligible,\n    excluded: excluded,\n    payload: null,\n  };\n  if (!eligible.length) {\n    out.reason = 'no-eligible-reply';\n    out.detail = 'No approved reply draft passes the reply send checks.';\n    return out;\n  }\n\n  // Oldest approved reply first -- Section 7's queue rule. One per tick: a\n  // reply is not paced, but there is no reason to open several SMTP\n  // conversations in one execution either.\n  const pick = eligible[0];\n  const c = candidates.filter(function (x) { return x.draft_id === pick.draft_id; })[0];\n  const headers = threadHeaders(c);\n  out.send = true;\n  out.reason = 'send';\n  out.detail = 'Sending reply draft ' + c.draft_id + ' to ' + dStr(c.to_addr) + ' (' + dStr(c.domain) +\n    ', ' + dStr(c.country) + '), in reply to ' + headers.in_reply_to + '.';\n  out.payload = {\n    draft_id: c.draft_id,\n    lead_id: c.lead_id,\n    to_addr: dStr(c.to_addr),\n    subject: dStr(c.subject),\n    body: normaliseBody(c.body),\n    raw_body: c.body,\n    in_reply_to: headers.in_reply_to,\n    references: headers.references,\n    code: dStr(c.code),\n    clock: new Date(clock).toISOString(),\n  };\n  return out;\n}\n\n// ---------------------------------------------------------------------------\n// Node body\n// ---------------------------------------------------------------------------\n\nconst state = $input.first().json;\nreturn [{ json: decide(state) }];\n"
+      },
+      "name": "Decide Reply Send",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -440,
+        130
+      ],
+      "notes": "The per-draft checks, and the threading headers built from what the database really holds (migration 017), falling back to the Message-IDs it does have rather than inventing a chain. Emits exactly one item: send true with one payload, or send false with the reason."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "send",
+              "leftValue": "={{ $json.send }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Send Now?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -220,
+        130
+      ],
+      "notes": "False ends the tick. The reason is in Decide Reply Send's output for anyone reading the execution."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Claim Reply Send: the reply lane's last line of defence, in one statement.\n--\n-- Decide Reply Send chose this draft moments ago. Everything that makes the send\n-- permissible is re-checked HERE, because this is where the draft actually\n-- flips -- a bug in Decide can make the lane send less, never more:\n--   Section 6   channel = 'email', and the variant really is a reply\n--   Workflow 7  the one-time code was used, with outcome approved or edited,\n--               and it belongs to THIS draft (migration 017/018)\n--   Workflow 5  status = 'approved', and the body unchanged since Decide read it\n--   Section 5   neither the lead's domain nor the address being answered is\n--               blocklisted -- the one guard a reply never skips\n--               and the lead really did reply\n--\n-- No advisory lock and no ceiling recount, and that is the difference from Claim\n-- Send: the cold path's lock exists so two overlapping ticks cannot both read\n-- \"4 of 5\" and both send. A reply has no quota to race over. What it does share\n-- is at-most-once: the draft flips to 'sent' and the outreach_log claim row is\n-- written BEFORE the SMTP call, so a crash between sending and logging leaves a\n-- claim rather than an approved draft that goes out again next tick.\nWITH p AS (\n  SELECT $1::jsonb AS p\n),\nd AS (\n  UPDATE drafts d\n     SET status = 'sent'\n    FROM p, leads l, reply_approvals a, inbound_messages i\n   WHERE d.id = (p.p->>'draft_id')::bigint\n     AND d.channel = 'email'\n     AND coalesce(d.variant, '') LIKE 'reply/%'\n     AND d.status = 'approved'\n     AND coalesce(d.edited_body, d.body) = p.p->>'raw_body'\n     AND l.id = d.lead_id\n     AND l.status = 'replied'\n     AND a.draft_id = d.id\n     AND a.code = p.p->>'code'\n     AND a.used_at IS NOT NULL\n     AND a.outcome IN ('approved', 'edited')\n     AND i.message_id = a.inbound_message_id\n     AND lower(i.from_addr) = lower(p.p->>'to_addr')\n     AND NOT EXISTS (SELECT 1 FROM blocklist b WHERE lower(l.domain) = b.domain OR lower(l.domain) LIKE '%.' || b.domain)\n     AND NOT EXISTS (SELECT 1 FROM blocklist b WHERE lower(split_part(i.from_addr, '@', 2)) = b.domain OR lower(split_part(i.from_addr, '@', 2)) LIKE '%.' || b.domain)\n  RETURNING d.id, d.lead_id\n),\no AS (\n  INSERT INTO outreach_log (lead_id, draft_id, channel, sent_at, message_body)\n  SELECT d.lead_id, d.id, 'email', (p.p->>'clock')::timestamptz, p.p->>'body'\n    FROM d, p\n  RETURNING id\n)\nSELECT (SELECT count(*) FROM d) = 1       AS claimed,\n       (SELECT id FROM o)                  AS outreach_id,\n       (p.p->>'draft_id')::bigint          AS draft_id,\n       (p.p->>'lead_id')::bigint           AS lead_id,\n       p.p->>'to_addr'                     AS to_addr,\n       p.p->>'subject'                     AS subject,\n       p.p->>'body'                        AS body,\n       p.p->>'in_reply_to'                 AS in_reply_to,\n       p.p->'references'                   AS references,\n       p.p->>'clock'                       AS clock\n  FROM p;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.payload)] }}"
+        }
+      },
+      "name": "Claim Send",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        0,
+        40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "The last line of defence: the variant, the approval code and its outcome, the unchanged body, the replied lead, the address that wrote and both blocklists, re-checked in one statement -- and the draft flipped to 'sent' with a claim row BEFORE the SMTP call (at-most-once). Named as Send names it, because Check SMTP Result is the same file."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "claimed",
+              "leftValue": "={{ $json.claimed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Claimed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        220,
+        40
+      ],
+      "notes": "False means the draft, the code or the recipient changed between Decide and Claim. Nothing is sent."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.send_url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ to: $json.to_addr, subject: $json.subject, text: $json.body, in_reply_to: $json.in_reply_to, references: $json.references }) }}",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        -60
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "The smtp-send sidecar: one SMTP submission carrying In-Reply-To and References, which n8n's Send Email node cannot set. It answers in nodemailer's own shape, so Check SMTP Result classifies a failure exactly as it does on the cold path. No retry: a timeout after the server accepted would send twice."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Check SMTP Result -- n8n Code node (Run Once for Each Item).\n//\n// The Send Email node runs with \"continue on error\", so a failed send arrives\n// here as an ordinary item ({ error: \"...\" }) instead of stopping the\n// execution. That matters: Claim Send has already flipped the draft to 'sent'\n// and written a claim row, and a hard stop would strand both -- the draft would\n// read as sent when nothing went out.\n//\n// Three outcomes:\n//   ok        -- the server accepted the message for this recipient. Confirm.\n//   account   -- nothing went out, and not because of this draft: auth, TLS,\n//                DNS, a timeout, a 4xx deferral. The draft goes back to\n//                'approved' and the next tick retries.\n//   recipient -- the server permanently refused THIS address. Retrying cannot\n//                help and would stall every draft queued behind it, so the\n//                draft goes back to 'pending' -- the reviewer's queue -- tagged\n//                `+smtp-rejected`, where a human can see it and fix the contact.\n\nconst OWN_DOMAIN = \"amitrixlabs.com\";\n\nfunction str(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\nfunction domainOf(addr) {\n  const s = str(addr).toLowerCase();\n  const i = s.lastIndexOf('@');\n  return i === -1 ? '' : s.slice(i + 1).replace(/[>\\s]+$/, '');\n}\n\nfunction lowerList(v) {\n  return (Array.isArray(v) ? v : []).map(function (a) {\n    return str(a && typeof a === 'object' ? a.address : a).toLowerCase();\n  });\n}\n\n// Checked in this order. A sender, relay or auth problem is ours even when the\n// server phrases it as \"all recipients were rejected\"; only after that does a\n// recipient-shaped failure count as the address's fault.\nconst OURS = /sender address|mail from|relay|auth|login|credential|\\b53[0-8]\\b|\\b5\\.7\\.\\d+\\b/i;\nconst THE_ADDRESS = /recipient address rejected|user unknown|unknown user|no such user|mailbox (?:unavailable|not found|does not exist)|does not exist|invalid recipient|all recipients were rejected|\\b5\\.1\\.\\d+\\b/i;\nconst TRANSIENT = /tls|ssl|certificate|timeout|timed out|connect|econn|enotfound|eai_again|esocket|etimedout|greeting|\\b4\\d\\d\\b|\\b4\\.\\d+\\.\\d+\\b/i;\n\nfunction classifyFailure(text) {\n  const t = str(text);\n  if (OURS.test(t)) return 'account';\n  if (THE_ADDRESS.test(t)) return 'recipient';\n  if (TRANSIENT.test(t)) return 'account';\n  if (/\\b5\\d\\d\\b/.test(t)) return 'recipient';\n  // Unknown: assume it was not the address. A retry costs one tick; wrongly\n  // bouncing a good draft back to review costs a human's attention.\n  return 'account';\n}\n\nfunction checkResult(claim, resp) {\n  const to = str(claim.to_addr).toLowerCase();\n  const r = resp && typeof resp === 'object' ? resp : {};\n  const accepted = lowerList(r.accepted);\n  const rejected = lowerList(r.rejected);\n  const messageId = str(r.messageId);\n  let error = str(r.error);\n  if (!error) {\n    if (rejected.indexOf(to) !== -1) error = 'rejected by server: ' + str(r.response);\n    else if (accepted.indexOf(to) === -1) error = 'recipient not in the accepted list: ' + JSON.stringify(r.accepted || null);\n    else if (!messageId) error = 'server accepted the message but no Message-ID came back';\n  }\n  const ok = !error;\n  const failure = ok ? null : classifyFailure(error);\n  return {\n    ok: ok,\n    failure: failure,\n    payload: {\n      outreach_id: claim.outreach_id,\n      draft_id: claim.draft_id,\n      lead_id: claim.lead_id,\n      to_addr: to,\n      message_id: ok ? messageId : null,\n      external: domainOf(to) !== OWN_DOMAIN,\n      clock: claim.clock,\n      smtp_response: str(r.response).slice(0, 500) || null,\n      error: error ? error.slice(0, 500) : null,\n      failure: failure,\n    },\n  };\n}\n\n// ---------------------------------------------------------------------------\n// Node body\n// ---------------------------------------------------------------------------\n\nconst claim = $('Claim Send').item.json;\nreturn { json: checkResult(claim, $input.item.json) };\n"
+      },
+      "name": "Check SMTP Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        -60
+      ],
+      "notes": "The same file the cold path runs. ok -> confirm. account failure (auth, TLS, DNS, 4xx) -> back to approved, retried next tick. recipient failure (5xx on the address) -> back to pending, tagged +smtp-rejected, for a human."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ok",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Sent OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        -60
+      ],
+      "notes": "Accepted by the server, with a Message-ID."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Confirm Send: SMTP accepted the message. Record its Message-ID on the claim\n-- (replies thread on it), advance the lead, and put the send in mailbox_sent\n-- NOW -- so it counts toward the ceiling before the Sent-folder mirror notices\n-- it. When the mirror does, it only sets seen_in_sent_folder on this row.\nWITH p AS (\n  SELECT $1::jsonb AS p\n),\no AS (\n  UPDATE outreach_log o\n     SET message_id = p.p->>'message_id'\n    FROM p\n   WHERE o.id = (p.p->>'outreach_id')::bigint\n     AND o.message_id IS NULL\n  RETURNING o.id, o.lead_id, o.sent_at\n),\nl AS (\n  UPDATE leads l\n     SET status = 'sent', updated_at = now()\n    FROM o\n   WHERE l.id = o.lead_id\n     AND l.status IN ('drafted', 'approved')\n  RETURNING l.id\n),\nm AS (\n  INSERT INTO mailbox_sent (message_id, sent_at, recipients, external, lead_id, source)\n  SELECT p.p->>'message_id', o.sent_at, ARRAY[p.p->>'to_addr'], (p.p->>'external')::boolean, o.lead_id, 'workflow'\n    FROM o, p\n  ON CONFLICT (message_id) DO UPDATE SET lead_id = EXCLUDED.lead_id, source = 'workflow'\n  RETURNING message_id\n)\nSELECT (SELECT count(*) FROM o)::int AS confirmed,\n       (SELECT count(*) FROM l)::int AS lead_advanced,\n       (SELECT message_id FROM m)    AS message_id,\n       (p.p->>'draft_id')::bigint    AS draft_id\n  FROM p;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.payload)] }}"
+        }
+      },
+      "name": "Confirm Send",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1100,
+        -140
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "The same statement the cold path runs: Message-ID onto the claim and the send into mailbox_sent. The lead stays 'replied' -- that statement only advances a draft/approved lead -- and the reply does count in the Sent mirror afterwards, because it is external mail."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Revert Claim: SMTP did not accept the message, so nothing went out. Remove\n-- the claim (it would otherwise count toward the ceiling forever) and hand the\n-- draft back:\n--   account failure   -> 'approved'; the next tick retries\n--   recipient failure -> 'pending' + '+smtp-rejected', back to a human; retrying\n--                        a refused address would stall the whole queue behind it\nWITH p AS (\n  SELECT $1::jsonb AS p\n),\no AS (\n  DELETE FROM outreach_log o\n   USING p\n   WHERE o.id = (p.p->>'outreach_id')::bigint\n     AND o.message_id IS NULL\n  RETURNING o.id\n),\nd AS (\n  UPDATE drafts d\n     SET status  = CASE WHEN p.p->>'failure' = 'recipient' THEN 'pending' ELSE 'approved' END,\n         variant = CASE WHEN p.p->>'failure' = 'recipient' AND coalesce(d.variant, '') NOT LIKE '%smtp-rejected%'\n                        THEN coalesce(d.variant, '') || '+smtp-rejected'\n                        ELSE d.variant END\n    FROM p\n   WHERE d.id = (p.p->>'draft_id')::bigint\n     AND d.status = 'sent'\n  RETURNING d.status, d.variant\n)\nSELECT (SELECT count(*) FROM o)::int AS claim_removed,\n       (SELECT status FROM d)         AS draft_status,\n       (SELECT variant FROM d)        AS draft_variant,\n       p.p->>'failure'                AS failure,\n       p.p->>'error'                  AS error\n  FROM p;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.payload)] }}"
+        }
+      },
+      "name": "Revert Claim",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1100,
+        40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Nothing went out: the claim is removed and the draft handed back. A recipient refusal lands it pending with +smtp-rejected, where the operator can see it."
+    }
+  ],
+  "connections": {
+    "Every 10 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Load Reply Send State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Reply Send State": {
+      "main": [
+        [
+          {
+            "node": "Decide Reply Send",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Reply Send": {
+      "main": [
+        [
+          {
+            "node": "Send Now?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Now?": {
+      "main": [
+        [
+          {
+            "node": "Claim Send",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Claim Send": {
+      "main": [
+        [
+          {
+            "node": "Claimed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claimed?": {
+      "main": [
+        [
+          {
+            "node": "Send Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Send Reply": {
+      "main": [
+        [
+          {
+            "node": "Check SMTP Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check SMTP Result": {
+      "main": [
+        [
+          {
+            "node": "Sent OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sent OK?": {
+      "main": [
+        [
+          {
+            "node": "Confirm Send",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Revert Claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

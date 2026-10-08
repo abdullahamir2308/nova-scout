@@ -1,0 +1,629 @@
+{
+  "id": "reply0001",
+  "name": "Send & Track - Reply Assistant",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "name": "Every 30 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1100,
+        40
+      ],
+      "notes": "Every 30 minutes, queue-driven both ways: an unanswered prospect message and an unanswered code are both still there on the next tick (Section 7). Not an hours interval -- n8n gates those on the clock value of the last run and skips ticks on a host that sleeps (Follow-Ups, 2026-10-02; the build refuses one)."
+    },
+    {
+      "parameters": {},
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1100,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "nowoverride",
+              "name": "now_override",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "batch",
+              "name": "batch_size",
+              "value": 5,
+              "type": "number"
+            },
+            {
+              "id": "remind",
+              "name": "remind_hours",
+              "value": 4,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -880,
+        180
+      ],
+      "notes": "batch_size: prospect messages answered per run, each one a paid call. remind_hours: how long an unanswered one-time code waits before the operator is nudged, and between nudges (Section 9, Workflow 7). now_override must stay empty (dry-run only)."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Find Replies To Answer -- the Reply Assistant's queue (Section 9, Workflow 7).\n-- READ-ONLY, one row per prospect message that still needs an answer.\n--\n-- $1 now_override ('' in the shipped workflow), $2 batch_size\n--\n-- THE QUEUE IS inbound_messages, NOT leads, and that is the whole of its\n-- idempotency: one drafted reply per prospect MESSAGE, for ever, because a\n-- reply_approvals row keyed to that Message-ID is proof one was drafted --\n-- whatever became of it. So a rejected reply is never redrafted (delete its\n-- reply_approvals row to ask for another), an expired code does not cause a\n-- second draft, and a prospect who writes again gets a new answer because that\n-- is a new Message-ID. Section 7's rule holds too: a missed run just means the\n-- next one finds the same message waiting.\n--\n-- Only `reply` is queued. An auto-reply, a bounce and an opt-out are not a\n-- person asking something (Classify Inbound's precedence), and an opt-out most\n-- certainly does not get answered.\n--\n-- The blocklist is checked HERE as well as in the send lane, so a prospect who\n-- replied and then opted out costs no model call at all.\nWITH clk AS (\n  SELECT coalesce(nullif($1, '')::timestamptz, now()) AS now\n),\nq AS (\n  SELECT i.message_id, i.received_at, i.from_addr, i.subject, i.in_reply_to, i.references_raw,\n         i.thread_ids, i.body_excerpt, i.lead_id\n    FROM inbound_messages i\n    JOIN leads l ON l.id = i.lead_id\n   WHERE i.classification = 'reply'\n     AND i.lead_id IS NOT NULL\n     AND NOT EXISTS (SELECT 1 FROM reply_approvals a WHERE a.inbound_message_id = i.message_id)\n     AND NOT EXISTS (SELECT 1 FROM blocklist b WHERE lower(l.domain) = b.domain OR lower(l.domain) LIKE '%.' || b.domain)\n     AND NOT EXISTS (SELECT 1 FROM blocklist b WHERE lower(split_part(i.from_addr, '@', 2)) = b.domain OR lower(split_part(i.from_addr, '@', 2)) LIKE '%.' || b.domain)\n   ORDER BY i.received_at, i.message_id\n   LIMIT $2::int\n)\nSELECT q.message_id                                                     AS inbound_message_id,\n       to_char((q.received_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')                                               AS received_at,\n       q.from_addr                                                      AS from_addr,\n       q.subject                                                        AS subject,\n       q.in_reply_to                                                    AS in_reply_to,\n       q.references_raw                                                 AS references_raw,\n       q.thread_ids                                                     AS thread_ids,\n       -- What they wrote, above the quoted thread. outreach_log.reply_body has\n       -- it to 4,000 characters but holds the FIRST reply on that lead for\n       -- ever (Record Inbound coalesces), so it is used only when its\n       -- replied_at is this very message; otherwise the 600-character excerpt\n       -- in inbound_messages, which is per message and therefore always about\n       -- the right one.\n       coalesce((SELECT o.reply_body FROM outreach_log o\n                  WHERE o.lead_id = q.lead_id AND o.reply_body IS NOT NULL\n                    AND o.replied_at = q.received_at\n                  ORDER BY o.sent_at DESC LIMIT 1), q.body_excerpt)      AS reply_text,\n       l.id                                                             AS lead_id,\n       l.company_name                                                   AS company_name,\n       l.domain                                                         AS domain,\n       l.country                                                        AS country,\n       l.source                                                         AS source,\n       -- A name only when the person who wrote IS the contact on file; the\n       -- display name is not stored and a first name guessed out of a local\n       -- part would be an invented fact in the greeting.\n       (SELECT c.name FROM contacts c\n         WHERE c.lead_id = l.id AND lower(c.email) = lower(q.from_addr) AND coalesce(c.name, '') <> ''\n         LIMIT 1)                                                       AS their_name,\n       -- Our own side of the thread, oldest first, exactly as it was sent.\n       (SELECT coalesce(jsonb_agg(jsonb_build_object(\n                  'subject', d.subject, 'body', o.message_body,\n                  'sent_at', to_char((o.sent_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), 'message_id', o.message_id,\n                  'variant', d.variant) ORDER BY o.sent_at), '[]'::jsonb)\n          FROM outreach_log o\n          LEFT JOIN drafts d ON d.id = o.draft_id\n         WHERE o.lead_id = l.id AND o.channel = 'email' AND o.message_id IS NOT NULL)\n                                                                        AS thread,\n       (SELECT coalesce(jsonb_agg(jsonb_build_object(\n                  'code', k.code, 'slot', k.slot, 'body', btrim(k.body),\n                  'countries', to_jsonb(k.countries), 'measured', k.measured,\n                  'confirmed', k.confirmed, 'active', k.active,\n                  'capabilities', to_jsonb(k.capabilities)) ORDER BY k.code), '[]'::jsonb)\n          FROM claims_library k\n         WHERE k.active AND k.confirmed)                                AS library,\n       e.therapeutic_areas                                              AS therapeutic_areas,\n       e.phases                                                         AS phases,\n       e.raw_extraction->>'city'                                        AS city,\n       e.founder_name                                                   AS founder_name,\n       e.employee_estimate                                              AS employee_estimate\n  FROM q\n  JOIN leads l ON l.id = q.lead_id\n  LEFT JOIN enrichments e ON e.lead_id = l.id\n ORDER BY q.received_at, q.message_id;",
+        "options": {
+          "queryReplacement": "={{ [$json.now_override, $json.batch_size] }}"
+        }
+      },
+      "name": "Find Replies To Answer",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -660,
+        40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Read-only. Every inbound message classified 'reply', matched to a lead, with no reply_approvals row against its Message-ID -- so one drafted reply per prospect MESSAGE, for ever. A rejected reply is never redrafted (delete its row to ask for another); a prospect who writes again gets a new answer. Blocklisted either way is skipped before any model call."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Build Reply -- generated by n8n/sendtrack/build_workflow.py.\n// Part 1, verbatim: n8n/sendtrack/code_reply_topics.js. Part 2: n8n/sendtrack/code_reply.js.\n\n// ===========================================================================\n// The questions a reply may not answer -- shared by Build Reply and Assemble\n// Reply (Section 9, Workflow 7). build_workflow.py prepends this file to both\n// nodes, so the topic one node detects in the prospect's message is the same\n// topic the other checks the draft against; two copies would drift and the\n// drift would be invisible.\n// ===========================================================================\n//\n// WHAT A REPLY MAY SAY is exactly what a first touch may say: the confirmed\n// `claims_library` lines, and the facts in the lead's own enrichment record.\n// Migration 013 narrowed every claim to what the Nova Agent Kit code actually\n// does (`capabilities`), so \"what the claims support\" and \"what the code\n// supports\" are the same set by construction, and a sentence outside it is an\n// invention whether or not it happens to be true.\n//\n// A prospect's first reply, though, is usually a QUESTION, and the questions\n// that come back are mostly about things no claim covers: what it costs, what\n// it plugs into, which languages it speaks, where the data lives, how long it\n// takes. The first touch never raised any of them, so there is nothing to\n// widen -- which is precisely why a model will answer them from nowhere.\n//\n// So the answer is not \"tag it afterwards\", it is \"do not answer it\": the topic\n// is detected in THEIR text before the model is called, the model is told to\n// say we will confirm it, and the draft is flagged to the operator, who knows\n// the answer and can put it in with EDIT. The five topics are the operator's\n// list (2026-10-09).\n//\n// The patterns are deliberately broad. A false positive costs one hedged\n// sentence and one line in the review email; a false negative is a made-up\n// price or a made-up integration sent to a prospect over the operator's name.\nconst OPEN_TOPICS = [\n  {\n    topic: 'pricing',\n    label: 'what it costs',\n    re: /\\b(?:pric(?:e|es|ing)|cost|costs|costly|how much|fee|fees|budget|quote|quotation|licen[cs]\\w*|subscription|per (?:month|year|seat|user)|monthly|annual(?:ly)?|retainer|discount|invoice|payment terms)\\b/i,\n  },\n  {\n    topic: 'integrations',\n    label: 'what it connects to',\n    re: /\\b(?:integrat\\w*|API|APIs|webhook\\w*|CRM|salesforce|hubspot|zapier|SSO|single sign-?on|LDAP|CTMS|eTMV|eTMF|EDC|SharePoint|Teams|Slack|calendar|google workspace|office ?365|plug(?:s|ged)? into|connect(?:s|ed|ion|ions)? (?:to|with))\\b/i,\n  },\n  {\n    topic: 'languages',\n    label: 'which languages it speaks',\n    re: /\\b(?:language|languages|multi-?lingual|translat\\w*|english|turkish|spanish|arabic|german|french|portuguese|polish|romanian|hungarian|czech|hindi|urdu|mandarin|japanese)\\b/i,\n  },\n  {\n    topic: 'security',\n    label: 'security, hosting and data protection',\n    re: /\\b(?:secur\\w*|GDPR|KVKK|HIPAA|GxP|21 CFR|part 11|data protection|privacy|confidential\\w*|NDA|DPA|encrypt\\w*|anonymi[sz]\\w*|pseudonymi[sz]\\w*|hosted?|hosting|on-?prem\\w*|server location|where (?:is|are) (?:the )?data|data (?:residency|centre|center|retention|storage)|SOC ?2|ISO ?27001|penetration test|audit trail|validat\\w*)\\b/i,\n  },\n  {\n    topic: 'timelines',\n    label: 'how long it takes and when it can start',\n    re: /\\b(?:timeline|time-?line|how long|lead ?time|turn ?around|go[- ]live|deadline|availabilit\\w*|when (?:can|could|would|will)|start date|roll ?out|implementation (?:time|period)|SLA|uptime|support hours|response time|maintenance)\\b/i,\n  },\n];\n\n// A sentence that says we will come back with the answer, rather than giving\n// one. Assemble Reply requires one of these for every topic the prospect\n// raised: without it, a paragraph that mentions pricing is answering about\n// pricing.\nconst DEFERRAL_RE = /\\b(?:I(?:'| wi)?ll (?:confirm|check|find out|come back|get back|send you the detail)|let me (?:confirm|check|find out)|I (?:do not|don't) want to guess|rather than guess|confirm (?:that|this|these|the detail)|get back to you (?:on|with|about)|come back to you (?:on|with|about)|check (?:that|this) (?:and|then|with)|I will ask)\\b/i;\n\n// Which of the five the prospect actually raised, in the order above.\nfunction topicsIn(text) {\n  const t = String(text === null || text === undefined ? '' : text);\n  return OPEN_TOPICS.filter(function (o) { return o.re.test(t); }).map(function (o) { return o.topic; });\n}\n\nfunction topicLabel(topic) {\n  const hit = OPEN_TOPICS.filter(function (o) { return o.topic === topic; })[0];\n  return hit ? hit.label : topic;\n}\n\nfunction topicRe(topic) {\n  const hit = OPEN_TOPICS.filter(function (o) { return o.topic === topic; })[0];\n  return hit ? hit.re : null;\n}\n\nfunction deferralIn(text) {\n  return DEFERRAL_RE.test(String(text === null || text === undefined ? '' : text));\n}\n\n// Build Reply -- n8n Code node (Run Once for All Items).\n//\n// Section 9, Workflow 7. A prospect has answered a cold email; this builds the\n// request that drafts our answer. Claude Reply writes it, Assemble Reply checks\n// it against the first touch's own claim rules and frames it, and the operator\n// approves it by email with a one-time code. NOTHING a model writes here\n// reaches a prospect without that approval.\n//\n// FOUR SOURCES, AND NOTHING ELSE (the operator's rule, 2026-10-09):\n//   1. what they wrote -- the text above the quoted thread, as Classify Inbound\n//      cut it;\n//   2. the thread -- our first touch exactly as it was sent, and any follow-up\n//      that went out;\n//   3. the lead's enrichment record, worded with the same boundary sentences\n//      Workflow 4's fact sheet uses, so a fact cannot be joined to another one;\n//   4. the confirmed claims_library lines (migration 013 narrowed each to what\n//      the Nova Agent Kit code does), plus how we found them -- leads.source.\n//\n// A question none of those four can answer is not answered. The five topics\n// that come back in practice -- pricing, integrations, languages, security,\n// timelines -- are detected in THEIR text before the call (code_reply_topics.js,\n// prepended to this node), the model is told to say we will confirm them, and\n// the draft carries the flag so the review email can put the question in front\n// of the operator, who knows the answer.\n//\n// A reply is never auto-approved and never claim-checked: the operator reads\n// every one. That is why there is no Approval Gate in this workflow and why\n// migration 018 refuses an `approved_by = 'auto'` reply on the table as well.\n\n// Section 5 / Section 9, substituted at build time.\nconst REPLY_SYSTEM_PROMPT = \"You write one short email replying to a small contract research organisation (CRO) that has\\nanswered a cold email from Abdullah Amir. Abdullah Amir reads your draft and approves,\\nedits or rejects it before anything is sent. You are answering a real person who took the time\\nto write back.\\n\\nEVERY MESSAGE GIVES YOU FOUR SOURCES, and they are the only ones you have:\\n1. THEIR MESSAGE -- what they wrote above the quoted thread.\\n2. THE THREAD -- our own earlier messages, exactly as they were sent.\\n3. THEIR RECORD -- the facts we hold about their company, each with a sentence saying what it\\n   does not mean. Read those boundaries: two true facts joined into one sentence is the\\n   commonest way these drafts go wrong.\\n4. APPROVED CLAIMS -- the only things you may say about what we built, the problem it solves\\n   and who uses it. You may rephrase a line. You may never widen what it means.\\n\\nANYTHING ELSE YOU DO NOT ANSWER. Not vaguely, not approximately, not \\\"typically\\\". The\\nmessage lists the questions they asked that none of the four sources settles -- about pricing, integrations, languages, security or timelines -- and for each one you say, in a\\nnormal sentence, that you will confirm it and come back. Give no hint of the answer: not a\\nrange, not \\\"it depends\\\", not \\\"usually\\\". Name every one of them in `deferred` and say in\\n`flag` what has to be confirmed. Abdullah Amir knows those answers and will put them in.\\nA guessed price, integration, language, hosting detail or date is the one failure that cannot\\nbe taken back, because it reaches a prospect over a real person's name.\\n\\nANSWER WHAT THEY ACTUALLY SAID, in their own order, and nothing they did not raise:\\n- If they declined, accept it in one line, leave one door open, and stop. Never argue, never\\n  re-pitch, never ask them to reconsider, never suggest they have misunderstood.\\n- If they asked something the record or the thread answers, answer it plainly and briefly.\\n- If they asked how we found them, the record says; say exactly that and no more.\\n- If they asked for something we have (the one approved link), offer it once.\\nThen exactly ONE next step, from the approved list, sized to what they wrote: a declining\\nreply gets the lightest one, an interested reply the direct one.\\n\\nTHE PROSPECT: only the facts in their record and in the thread. Never describe them as\\nsponsoring anything -- in these emails \\\"sponsor\\\" means the biotech, pharma, device or\\nacademic company that hires a CRO, their client. Never invent a trial, a person, a city or a\\nnumber. Do not name their company back at them.\\n\\nTHE PRODUCT: the first email introduced it; refer back to it (\\\"the assistant\\\"). Never call it\\na chatbot or a Q&A bot. The word \\\"AI\\\" at most once. Never \\\"AI-powered\\\". Name it only as\\n\\\"(we call it Nova)\\\", at most once, and only if naming it helps.\\n\\nNO REPEATS: the lines you use must not repeat the same capability -- each one says what it is\\nabout -- and do not restate a capability the thread already covered.\\n\\nCLAIMS -- forbidden, all of them:\\n- guarantees (\\\"you'll never lose a sponsor\\\")\\n- any number, percentage or multiplier that is not in the approved claims, their record or\\n  the thread\\n- claiming to identify anonymous website visitors\\n- naming any CRM, tool or integration\\n- supported languages\\n- any count of clients beyond the deployments the proof line names, and never the phrase\\n  \\\"two CROs\\\"\\n- saying it books calls or fills a calendar -- it sends the sponsor your booking link, and the\\n  sponsor books\\n- saying it answers from SOPs or from documents -- it answers from their website\\nA stakes line is about the industry, not about us.\\n\\nTHE NEXT STEP: one question, from the list, rephrased to fit what they said. No scheduling\\nlink, no call length, no second question. The body before it asks for nothing.\\n\\nEVERYWHERE: plain text. No bullets, no headings, no placeholders, no merge tags. At most one\\nlink, and only the one offered. No greeting, no sign-off and no opt-out line -- all three are\\nadded afterwards. Never these words: revolutionary, cutting-edge, innovative, game-changing, seamless. No invented urgency, no\\nflattery, no exclamation marks, and never thank them twice.\\n\\nReturn JSON: body (everything before the next step, paragraphs separated by a blank line);\\nask (the one next step); claims (the code of every approved line the reply used, the next step\\nincluded); deferred (the topic names you did not answer); flag (one line saying what Abdullah Amir has to confirm, or \\\"\\\" if nothing).\";\nconst CLAUDE_REQUEST = {\"model\": \"claude-sonnet-5-5\", \"max_tokens\": 16000, \"output_config\": {\"effort\": \"high\", \"format\": {\"type\": \"json_schema\", \"schema\": {\"type\": \"object\", \"properties\": {\"body\": {\"type\": \"string\"}, \"ask\": {\"type\": \"string\"}, \"claims\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"deferred\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"flag\": {\"type\": \"string\"}}, \"required\": [\"body\", \"ask\", \"claims\", \"deferred\", \"flag\"], \"additionalProperties\": false}}}};\nconst CACHE_CONTROL = { type: 'ephemeral' };\nconst SENDER_NAME = \"Abdullah Amir\";\nconst THERAPEUTIC_AREAS = [\"Oncology\", \"Cardiovascular\", \"Central Nervous System\", \"Immunology\", \"Infectious Disease\", \"Endocrinology\", \"Metabolic Disorders\", \"Respiratory\", \"Rare Diseases\", \"Internal Medicine\", \"Anesthesiology\", \"Dermatology\", \"Rheumatology\", \"Ophthalmology\", \"Gastroenterology\", \"Nephrology\", \"Hematology\", \"Other\"];\n\n// A reply is an answer, not a pitch: long enough to answer what they asked and\n// name one next step, short enough to read on a phone. Assemble Reply tags\n// anything outside this.\nconst REPLY_MIN_WORDS = 40;\nconst REPLY_MAX_WORDS = 120;\n\n// Operator instruction, 2026-10-09: a reply never reuses the \"two CROs\" proof\n// line, and never calls Vertex Clinical Research a CRO -- it is a clinical\n// research centre. The rule is written against the TEXT of a claims_library\n// line rather than against a code, because the table is the library and a\n// reworded row must not escape it. A lead whose country the library can only\n// serve with that line is simply offered no proof, and the reply makes no proof\n// claim: a missing claim is not a defect in an answer to a question.\nconst REPLY_PROOF_REFUSED = [/\\btwo CROs?\\b/i, /\\bVertex\\b[^.]{0,40}\\bCRO\\b/i];\n\nfunction rStr(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\nfunction rFold(v) {\n  return rStr(v).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();\n}\n\nfunction rWords(v) {\n  const t = rStr(v);\n  return t ? t.split(/\\s+/).length : 0;\n}\n\n// --- the claims this reply may draw on ---------------------------------------\n\nfunction replyLibrary(raw) {\n  const out = [];\n  for (const row of Array.isArray(raw) ? raw : []) {\n    if (!row || typeof row !== 'object') continue;\n    out.push({\n      code: rStr(row.code),\n      slot: rStr(row.slot),\n      body: rStr(row.body),\n      countries: Array.isArray(row.countries) && row.countries.length ? row.countries.map(rFold) : null,\n      measured: row.measured === true,\n      confirmed: row.confirmed === true,\n      active: row.active === true,\n      capabilities: Array.isArray(row.capabilities) ? row.capabilities.map(rStr).filter(Boolean) : [],\n    });\n  }\n  return out;\n}\n\n// The proof for this lead's country, resolved exactly as Assess Grounding and\n// Build Follow-Up resolve it (a measured line wins; a row with no countries\n// serves everyone else) -- and then the refused wordings are dropped.\nfunction replyProof(rows, country) {\n  const key = rFold(country);\n  const serving = rows.filter(function (x) { return x.countries && x.countries.indexOf(key) !== -1; });\n  const pick = serving.length ? serving : rows.filter(function (x) { return !x.countries; });\n  const measured = pick.filter(function (x) { return x.measured; });\n  const chosen = measured.length ? measured : pick;\n  return chosen.filter(function (x) {\n    return !REPLY_PROOF_REFUSED.some(function (re) { return re.test(x.body); });\n  });\n}\n\nfunction replyLines(rows) {\n  return rows.map(function (x) {\n    return { code: x.code, body: x.body, confirmed: x.confirmed, capabilities: x.capabilities };\n  });\n}\n\n// Everything a reply may say about the product, and the one link it may carry.\n// Only active lines with text: an empty or retired row offers nothing.\nfunction replyPools(r) {\n  const lib = replyLibrary(r.library).filter(function (l) { return l.active && l.body; });\n  const bySlot = function (slot) { return lib.filter(function (l) { return l.slot === slot; }); };\n  return {\n    description: replyLines(bySlot('description')),\n    angle: replyLines(bySlot('angle')),\n    benefit: replyLines(bySlot('benefit')),\n    proof: replyLines(replyProof(bySlot('proof'), r.country)),\n    ask: replyLines(bySlot('ask')),\n    // Section 9, Workflow 4's link policy: the only URL allowed anywhere is the\n    // library's own `link` line, and it is offered only while it is active AND\n    // confirmed and actually holds a URL. L-NP is empty and inactive today, so\n    // a reply carries no link at all and Assemble Reply tags any URL in one.\n    link: replyLines(bySlot('link').filter(function (l) {\n      return l.confirmed && /\\bhttps?:\\/\\/\\S+/i.test(l.body);\n    })),\n  };\n}\n\n// --- the prospect, as a fact sheet with boundaries ---------------------------\n//\n// Workflow 4's wording, for Workflow 4's reason: a sentence can use no invented\n// word and still assert an untrue RELATIONSHIP between two true facts, so each\n// fact carries the sentence that says what it does not mean.\nfunction replyRecord(r) {\n  const facts = [];\n  const areas = Array.isArray(r.therapeutic_areas) ? r.therapeutic_areas.map(rStr).filter(Boolean) : [];\n  if (areas.length) {\n    facts.push('Therapeutic areas listed on their own website: ' + areas.join(', ') +\n      '. This says nothing about which area any particular trial belongs to.');\n  }\n  const phases = Array.isArray(r.phases) ? r.phases.map(rStr).filter(Boolean) : [];\n  if (phases.length) facts.push('Trial phases listed on their own website: ' + phases.join(', ') + '.');\n  if (rStr(r.city)) {\n    facts.push('The company is based in ' + rStr(r.city) +\n      '. This says nothing about where any trial runs or where any staff sit.');\n  }\n  if (rStr(r.founder_name)) {\n    facts.push('Named on their own site as founder or MD: ' + rStr(r.founder_name) +\n      '. This says nothing about which trials or clients this person personally handles.');\n  }\n  const n = Number(r.employee_estimate);\n  if (r.employee_estimate !== null && r.employee_estimate !== undefined && Number.isInteger(n) && n > 0) {\n    facts.push('Their own site states a team of ' + n + ' people. This says nothing about what they do.');\n  }\n  if (rStr(r.source)) {\n    facts.push('How we found them, and the only answer to \"where did you hear about us\": ' + rStr(r.source) +\n      '. Nothing else about how they came to our attention is on record.');\n  }\n  facts.push('No trial is part of this record. The first email may name one; nothing here confirms it.');\n  return ['Company: ' + rStr(r.company_name), 'Country: ' + rStr(r.country)]\n    .concat(facts.map(function (f, i) { return String(i + 1) + '. ' + f; })).join('\\n');\n}\n\n// Our side of the thread, as they read it: the first touch and any follow-up,\n// oldest first, without their signatures and quoted tails.\nfunction threadText(r) {\n  const out = [];\n  for (const m of Array.isArray(r.thread) ? r.thread : []) {\n    if (!m || !rStr(m.body)) continue;\n    const when = new Date(m.sent_at);\n    out.push('--- ' + (isNaN(when.getTime()) ? 'earlier' : when.toUTCString().slice(0, 16)) +\n      ', we wrote (subject \"' + rStr(m.subject) + '\"):');\n    out.push(rStr(m.body));\n  }\n  return out.join('\\n');\n}\n\nfunction sheet(heading, list, withCaps) {\n  if (!list.length) return heading + '\\n  (none)';\n  return [heading].concat(list.map(function (l) {\n    return '  [' + l.code + '] ' + l.body +\n      (withCaps && l.capabilities.length ? '  (about: ' + l.capabilities.join(', ') + ')' : '');\n  })).join('\\n');\n}\n\nfunction replyRequest(r, item) {\n  const theirs = rStr(r.reply_text);\n  if (!theirs) return null;          // nothing to answer; nothing is written\n  const pools = replyPools(r);\n  if (!pools.ask.length) return null; // the library cannot complete a reply\n\n  const record = replyRecord(r);\n  const thread = threadText(r);\n  const open = topicsIn(theirs);\n  const deferrals = open.map(function (t) { return '  - ' + t + ': ' + topicLabel(t); }).join('\\n');\n\n  const prompt = [\n    'THEIR MESSAGE, which arrived ' + rStr(r.received_at) + ' from ' + rStr(r.from_addr) +\n      ' with the subject \"' + rStr(r.subject) + '\". This is what you are answering:',\n    '---',\n    theirs,\n    '---',\n    '',\n    'THE THREAD SO FAR -- our own messages, exactly as they were sent:',\n    thread || '  (nothing on record)',\n    '',\n    'THEIR RECORD. Every fact you may state about them, and only what it says:',\n    record,\n    '',\n    'APPROVED CLAIMS. Everything you may say about what we built, the problem it solves and who',\n    'uses it comes from these lines. Rephrase freely; never widen what a line says.',\n    '',\n    sheet('WHAT IT IS:', pools.description, true),\n    '',\n    sheet('PAIN AND STAKES:', pools.angle, false),\n    '',\n    sheet('WHAT IT DOES:', pools.benefit, true),\n    '',\n    sheet('PROOF -- only if you name a deployment; it is matched to their country:', pools.proof, false),\n    '',\n    sheet('THE ONE LINK you may include, at most once, and only if it genuinely helps:', pools.link, false),\n    '',\n    sheet('NEXT STEP -- end with ONE of these, rephrased to fit what they said:', pools.ask, false),\n    '',\n  ].concat(open.length ? [\n    'QUESTIONS YOU MAY NOT ANSWER. They raised these, and nothing above settles any of them:',\n    deferrals,\n    'For each one, say in a few words that you will confirm it and come back -- a real sentence,',\n    'not a brush-off, and no hint of what the answer might be. Name every one of them in',\n    '`deferred`, and say in `flag` what the operator has to confirm. Never guess a price, a',\n    'product it connects to, a language, anything about hosting or data, or a date.',\n    '',\n  ] : []).concat([\n    'WRITE THE REPLY. Answer what they actually said, in their order, from the sources above.',\n    'If they declined, accept it in one line and leave one door open -- never push back.',\n    'If they asked something the record answers, answer it plainly.',\n    'Then exactly ONE next step, from the list above, sized to what they wrote.',\n    'The body plus the next step is ' + REPLY_MIN_WORDS + '-' + REPLY_MAX_WORDS + ' words.',\n    'Write no greeting, no sign-off and no opt-out line: all three are added afterwards.',\n    'In `claims`, list the code of every approved line the reply used, the next step included.',\n  ]).join('\\n');\n\n  // Every taxonomy area nothing in front of the model names: the reply may not\n  // name one either (Assemble Reply tags it `ungrounded-area`).\n  const corpus = [theirs, thread, record].concat(\n    ['description', 'angle', 'benefit', 'proof', 'ask', 'link'].map(function (s) {\n      return pools[s].map(function (l) { return l.body; }).join('\\n');\n    })).join('\\n');\n  const plain = ' ' + rFold(corpus).replace(/[^a-z0-9]+/g, ' ') + ' ';\n  const absent = THERAPEUTIC_AREAS.filter(function (a) {\n    return a !== 'Other' && plain.indexOf(' ' + rFold(a).replace(/[^a-z0-9]+/g, ' ') + ' ') === -1;\n  });\n\n  return {\n    json: {\n      lead_id: r.lead_id,\n      inbound_message_id: r.inbound_message_id,\n      country: r.country,\n      company_name: r.company_name,\n      domain: r.domain,\n      from_addr: r.from_addr,\n      their_subject: r.subject,\n      their_text: theirs,\n      received_at: r.received_at,\n      // The subject threads the conversation: theirs with one 'Re:' on it.\n      subject: 'Re: ' + rStr(r.subject).replace(/^(?:(?:re|fwd|fw|aw|sv|vs)\\s*:\\s*)+/i, ''),\n      greeting: rStr(r.their_name) ? 'Hello ' + rStr(r.their_name) + ',' : 'Hello,',\n      // The From display name is not stored, so the quoted header names the\n      // address that wrote. A name is used only in the greeting, and only when\n      // it is the contact on file (their_name) -- a first name guessed out of a\n      // local part would be an invented fact in the first line of the reply.\n      quote_attribution: rStr(r.their_name) ? rStr(r.their_name) + ' <' + rStr(r.from_addr) + '>'\n        : rStr(r.from_addr),\n      library_pools: pools,\n      open_topics: open,\n      absent_areas: absent,\n      corpus: corpus,\n      sender_name: SENDER_NAME,\n      prompt: prompt,\n      // Prompt caching (Section 3, on since 2026-10-08). The cached block is\n      // exactly the system prompt: build-substituted, so byte-identical for\n      // every reply and every run, and comfortably over Sonnet 5.5's 512-token\n      // minimum. Everything about this prospect is in the user message after\n      // it, where a cache entry would be read by nothing. The 5-minute TTL and\n      // why a run's own calls cannot read each other's write are recorded in\n      // drafting's code_assess.js.\n      request: Object.assign({}, CLAUDE_REQUEST, {\n        system: [{ type: 'text', text: REPLY_SYSTEM_PROMPT, cache_control: CACHE_CONTROL }],\n        messages: [{ role: 'user', content: prompt }],\n      }),\n    },\n    pairedItem: { item: item },\n  };\n}\n\n// ---------------------------------------------------------------------------\n// Node body (Run Once for All Items)\n// ---------------------------------------------------------------------------\n//\n// An empty queue can arrive as one { success: true } item: the Postgres node\n// emits that placeholder when it does not classify a statement as a SELECT, and\n// a WITH ... SELECT is exactly the shape its parser has to guess at. Keeping\n// only rows that carry a lead_id turns that into zero items, so nothing\n// downstream runs -- and no paid call is made.\nconst out = [];\n$input.all().forEach(function (it, i) {\n  if (!it.json || it.json.lead_id === undefined || it.json.lead_id === null) return;\n  const built = replyRequest(it.json, i);\n  if (built) out.push(built);\n});\nreturn out;\n"
+      },
+      "name": "Build Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -440,
+        40
+      ],
+      "notes": "The request: their message, the thread as sent, their enrichment record with its boundary sentences, the confirmed claims and how we found them -- and nothing else. The five topics nothing we have confirmed can settle (pricing, integrations, languages, security, timelines) are detected in THEIR text here, so the model is told to defer them rather than tagged afterwards for having guessed."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "anthropicApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "name": "Claude Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -220,
+        40
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": "novascoutAnthropic01",
+          "name": "Anthropic - Nova Scout drafting"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "notes": "claude-sonnet-5-5 through the Anthropic Messages API, effort high (Section 3) -- the drafting model, with the drafting node's request parameters and its prompt caching. The key is the n8n credential novascoutAnthropic01, never in this JSON. A failed call writes nothing and the message is queued again next run: no fallback to the local model (skill section 6). This is the ONLY model call in the reply path -- a reply is never claim-checked, because the operator reads every one."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Assemble Reply -- generated by n8n/sendtrack/build_workflow.py.\n// Part 1, verbatim: n8n/drafting/code_assemble.js above its 'Node body' marker -- the\n// first touch's claim rules. Part 2, verbatim: n8n/sendtrack/code_reply_topics.js.\n// Part 3: n8n/sendtrack/code_reply_assemble.js.\n\n// Assemble Drafts -- n8n Code node (Run Once for Each Item).\n//\n// Turns one Claude response into the two draft rows Section 9 asks for (\"email\n// variant + LinkedIn variant per lead into `drafts`\"), and enforces every rule\n// of NovaScout_DraftingSkill.md v3, section 3, that a string match can enforce.\n//\n// Skill v3 moved from verbatim line-picking to composition: Claude Sonnet 5.5\n// writes the whole email -- subject, body and one ask -- from one prospect fact\n// plus the approved claims Assess Grounding handed it. That makes this node the\n// only thing standing between the model's prose and the review queue, so every\n// rule the skill states as a rule is checked here, deterministically (build\n// rule 3), on what actually came back:\n//\n//   length        body 70-110 words is the target; above 125 is tagged `long`\n//   ask           exactly one: one question in the ask, no request in the body\n//   links         none in warm-up weeks 1-2, then only the library's link line\n//   product name  at most once, in brackets, never in the subject\n//   \"AI\"          at most once, never in the subject, never \"AI-powered\"\n//   sponsor       the prospect is never the one sponsoring (\"You're sponsoring\")\n//   claims        no guarantee, no number the library and facts do not hold, no\n//                 visitor identification, no named CRM or tool, no languages,\n//                 never \"chatbot\", never that Nova books a call, never SOPs or\n//                 client documents as its source; no two claim lines that\n//                 repeat a capability\n//   proof         the geography-matched deployment is named; no other one is\n//   grounding     no therapeutic area the lead lacks; no founder or city opener;\n//                 a trial is never credited to their website\n//\n// The opt-out sentence, the signature and the greeting are appended HERE, not\n// generated. Section 5 locks the opt-out verbatim and makes it the whole basis\n// for GDPR/KVKK legitimate interest.\n//\n// A violation tags the draft's `variant` rather than discarding it. The reviewer\n// sees the tag next to the text; a silently dropped draft teaches nobody\n// anything. Every draft still needs a human approval before Workflow 6 sends it.\n\n// ---------------------------------------------------------------------------\n// Locked constants. build_workflow.py parses each out of NovaScout_MasterRef.md\n// or NovaScout_DraftingSkill.md and refuses to build on drift.\n// ---------------------------------------------------------------------------\n\n// Section 5, \"Message rules -- LOCKED\". Verbatim, including the straight\n// apostrophes -- this string is the opt-out mechanism, not a paraphrase of it.\nconst OPT_OUT = \"If this isn't relevant, reply 'no' and I won't follow up.\";\n\n// Skill v3 section 3, Length: \"The body (everything above the opt-out line)\n// should be 70-110 words and never more than 125.\" Counted over the body and\n// the ask -- the greeting is the fixed frame, as in v2. Only the ceiling tags;\n// \"shorter is fine if nothing useful is lost\".\nconst BODY_TARGET_MIN = 70;\nconst BODY_TARGET_MAX = 110;\nconst BODY_CEILING = 125;\n\n// Section 5: \"Maximum one plain URL. No buttons.\"\nconst MAX_URLS = 1;\n\n// Master Ref Section 9, Workflow 4, Links: none in warm-up weeks 1-2. From week\n// 3 the one URL Section 5 allows may appear -- and only the library's link\n// line, appended here, never written by the model.\nconst LINK_FREE_WEEKS = 2;\n\n// Skill v3 section 3, Subject: \"30-55 characters ... Never the product name.\n// Never 'AI'. No 'Re:', no 'Fwd:', no capitals.\"\nconst SUBJECT_MIN_CHARS = 30;\nconst SUBJECT_MAX_CHARS = 55;\nconst SUBJECT_REPLY_PREFIXES = ['re', 'fwd'];\n\n// Skill v3 section 3, Naming the product: \"The name appears at most once, in\n// brackets\". \"The word 'AI' appears at most once\".\nconst PRODUCT_NAME = 'Nova';\nconst PRODUCT_NAME_MAX = 1;\nconst AI_MAX = 1;\n\n// Skill v3 section 3, Everywhere: \"No banned adjectives (revolutionary,\n// cutting-edge, innovative, game-changing, seamless).\" The rest are the same\n// register and fail the same way.\nconst BANNED_ADJECTIVES = [\n  'revolutionary',\n  'cutting-edge',\n  'cutting edge',\n  'innovative',\n  'game-changing',\n  'game changing',\n  'seamless',\n  'best-in-class',\n  'world-class',\n  'state-of-the-art',\n  'leverage',\n  'synergy',\n  'unlock',\n  'supercharge',\n];\n\n// The live deployments a proof line can name. Which of them this lead may hear\n// about is decided by its proof pool (Assess Grounding, by country).\nconst DEPLOYMENTS = ['NoblePath', 'Vertex'];\n\n// Skill v3 section 3, Claims, forbidden: \"naming a specific CRM, tool or\n// integration\". Generic words (\"your CRM\", \"a spreadsheet\") are fine. Only\n// names that are not also ordinary English words are listed, so a false\n// positive costs a review tag, not a wrong one.\nconst NAMED_TOOLS = [\n  'hubspot', 'salesforce', 'pipedrive', 'zoho', 'microsoft dynamics', 'dynamics 365', 'monday.com',\n  'freshsales', 'freshworks', 'zendesk', 'google sheets', 'google sheet', 'airtable', 'slack',\n  'microsoft teams', 'calendly', 'gmail', 'whatsapp', 'veeva', 'intercom', 'resend', 'mailchimp',\n];\n\n// Section 9, Workflow 4: \"no merge-tag phrasing tells\". The literal tags a\n// template would leave behind ([First Name], {{company}}, <domain>).\nconst MERGE_TAG = /(\\{\\{[^}]*\\}\\})|(\\[[A-Za-z][A-Za-z _-]{1,30}\\])|(<[A-Za-z][A-Za-z _-]{1,30}>)/;\n\nconst URL_RE = /\\b(?:https?:\\/\\/|www\\.)[^\\s<>()]+/gi;\n\n// Skill v3 section 3, Hook: \"Never describe the prospect as sponsoring anything\n// ('You're sponsoring...' is banned).\" Every way the v2 drafts and fact sheet\n// put it.\nconst PROSPECT_SPONSOR = [\n  /\\byou(?:['’]re| are)\\s+(?:also\\s+|currently\\s+|now\\s+|actively\\s+)?sponsor(?:ing|s)?\\b/i,\n  /\\byou(?:['’]re| are)\\s+(?:the|a|an)\\s+(?:\\w+\\s+)?sponsor\\b/i,\n  /\\byou\\s+sponsor(?:ed|s)?\\b/i,\n  /\\byou as (?:the |a )?sponsor\\b/i,\n  /\\bsponsored by you\\b/i,\n  /\\byour (?:own )?(?:sponsored|sponsorship)\\b/i,\n];\n\n// Skill v3 section 3, Claims, forbidden. Each is a pattern for one rule.\nconst GUARANTEE = /\\bguarantee\\w*|\\bnever (?:again )?(?:lose|miss)\\b|\\bno (?:lead|inquiry|inquiries|sponsor|sponsors) (?:is |are |gets |get |will be )?(?:ever )?(?:lost|missed)\\b|\\b100 ?%|\\bwill (?:win|double|triple|increase|grow|boost)\\b|\\byou(?:['’]ll| will) (?:never|always|win|get more)\\b|\\b(?:ensures?|makes? sure) (?:you|that you) never\\b/i;\nconst VISITOR_ID = /\\b(?:identif\\w*|reveal\\w*|unmask\\w*|de-?anonymi\\w*|track\\w*)\\b[^.?!]{0,60}\\b(?:visit\\w*|visitors?|anonymous|traffic|browse\\w*)\\b|\\banonymous (?:visitors?|traffic)\\b|\\b(?:see|know|tells? you|shows? you)\\s+(?:exactly\\s+)?(?:who|which \\w+)\\s+(?:visit\\w*|browse\\w*|land\\w* on|came to)\\b/i;\nconst LANGUAGES = /\\bmulti-?lingual\\b|\\blanguages?\\b|\\b(?:turkish|spanish|arabic|german|french|portuguese|english|polish|romanian|hungarian|czech|hindi|urdu)\\b/i;\nconst CHATBOT = /\\bchat ?bots?\\b|\\bQ ?& ?A bots?\\b/i;\nconst AI_POWERED = /\\bAI[- ]?(?:powered|driven|based)\\b/i;\n// Settled 2026-10-02 against the Nova Agent Kit code (migration 013): Nova does\n// not book -- it sends the booking link and the sponsor books through it -- and\n// it answers from the CRO's website, never from SOPs or documents a client\n// provides. \"So they can book a call\" is fine; Nova \"books the call\" is not.\nconst NOVA_BOOKS = /\\bbooks\\s+(?:the\\s+|a\\s+|qualified\\s+|sponsor\\s+)?(?:calls?|meetings?|demos?)\\b|\\b(?:into|onto|straight into)\\s+your\\s+(?:calendar|diary)\\b|\\bschedules\\s+(?:the\\s+|a\\s+)?(?:calls?|meetings?)\\b/i;\nconst SOP_SOURCE = /\\bSOPs?\\b|\\bstandard operating procedures?\\b|\\b(?:your|their)\\s+(?:own\\s+)?(?:documents|documentation)\\b/i;\n\n// Skill v3 section 3, Claims: \"any number, percentage or multiplier that is not\n// in section 4\". Digit tokens are checked against the library and the facts;\n// these are the spelled-out numbers and multipliers a model reaches for. \"one\"\n// is not here -- \"one word back\", \"one question\" are the skill's own words.\nconst NUMBER_WORDS = [\n  'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'twenty',\n  'thirty', 'fifty', 'hundred', 'hundreds', 'thousand', 'thousands', 'million', 'millions', 'billion',\n  'dozen', 'dozens', 'double', 'doubles', 'doubled', 'triple', 'triples', 'tripled', 'twice', 'half',\n  'percent', 'tenfold',\n];\n// A digit in the corpus licenses its word: the fact sheet says \"2 recruiting\n// trials\", the model may write \"two recruiting trials\".\nconst DIGIT_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',\n  'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen', 'twenty'];\n\n// Skill v3 section 3, Ask: \"Exactly one ask. The reply costs one word. No\n// links, no scheduling link, no '30-minute call'.\" The ask is its own field in\n// the model's schema, so exactly one ask means: one question there, and no\n// request anywhere in the body.\nconst REQUEST_IN_BODY = /\\b(?:would you|could you|are you open|worth a (?:look|chat|call|try|conversation)|let me know|reply (?:yes|no|with|to)|one word back|shall i|should i|want me to|happy to (?:set|send|show|share|walk)|interested in (?:a|seeing|trying|hearing)|open to a|up for a|free for a)\\b/i;\nconst ASK_SCHEDULING = /\\b\\d+[- ]?min(?:ute)?s?\\b|\\b(?:fifteen|twenty|thirty)[- ]minutes?\\b|\\bcalendly\\b|\\bschedul\\w*|\\bbook (?:a |some )?(?:time|slot|call|meeting)\\b|\\b(?:time|slot)s? (?:that )?works?\\b/i;\n\n// Skill v3 section 3, Hook: \"Never open on the founder's name or the city.\"\n// And the trial fact is on ClinicalTrials.gov, not on their site.\nconst HOOK_SOURCE_OPENING = /^\\s*(clinicaltrials\\.gov|according to)\\b/i;\nconst SITE_CLAIM = /\\b(your|their|the)\\s+(web\\s?)?site\\b/i;\nconst TRIAL_WORD = /\\b(trials?|stud(y|ies))\\b/i;\n\n// Acronyms a subject may carry in capitals.\nconst SUBJECT_ACRONYMS = ['CRO', 'CROS', 'BD'];\n\n// The order claim codes are recorded in `variant`.\nconst SLOT_ORDER = ['description', 'angle', 'benefit', 'proof', 'ask', 'link'];\n\n// ---------------------------------------------------------------------------\n// Helpers\n// ---------------------------------------------------------------------------\n\nfunction str(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\n// A word is a token with a letter or a digit in it. A dash between clauses is\n// punctuation, not a word.\nfunction words(v) {\n  const t = str(v);\n  return t ? t.split(/\\s+/).filter(function (w) { return /[\\p{L}\\p{N}]/u.test(w); }).length : 0;\n}\n\nfunction fold(v) {\n  return str(v).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();\n}\n\n// A model that ignores \"no greeting, no sign-off\" produces a duplicate greeting\n// once we prepend our own, and a sign-off that collides with the signature.\n// Both are deterministic to strip.\nconst SIGNOFFS = [\n  'best regards', 'kind regards', 'warm regards', 'best wishes', 'regards',\n  'best', 'thanks', 'thank you', 'cheers', 'sincerely', 'yours sincerely',\n];\n\nfunction stripGreeting(body, greeting) {\n  let out = str(body);\n  const g = str(greeting).replace(/[,\\s]+$/, '');\n  // The trailing comma or colon is REQUIRED: optional, this ate the start of any\n  // body that merely began with \"Hi\" or \"Hello\".\n  out = out.replace(/^\\s*(hi|hello|hey|dear|greetings)\\b[^\\n,]{0,40}[,:]\\s*\\n?/i, '');\n  if (g && out.toLowerCase().indexOf(g.toLowerCase()) === 0) {\n    out = out.slice(g.length).replace(/^[,\\s]+/, '');\n  }\n  return out.trim();\n}\n\nfunction stripSignoff(body) {\n  const lines = str(body).split('\\n');\n  while (lines.length) {\n    const last = lines[lines.length - 1].trim().toLowerCase().replace(/[,.!]+$/, '');\n    if (!last) { lines.pop(); continue; }\n    if (SIGNOFFS.indexOf(last) !== -1 || (lines.length > 1 && /^[a-z]{2,20}$/.test(last))) {\n      lines.pop();\n      continue;\n    }\n    break;\n  }\n  return lines.join('\\n').trim();\n}\n\n// Paragraphs as the model wrote them, blank-line separated, inner whitespace\n// tidied; never more than one blank line in a row.\nfunction cleanText(raw, greeting) {\n  return stripSignoff(stripGreeting(raw, greeting))\n    .split(/\\n\\s*\\n/)\n    .map(function (p) { return p.replace(/\\s*\\n\\s*/g, ' ').trim(); })\n    .filter(Boolean)\n    .join('\\n\\n');\n}\n\nfunction urlsIn(v) {\n  return str(v).match(URL_RE) || [];\n}\n\nfunction bannedAdjectivesIn(v) {\n  const t = ' ' + str(v).toLowerCase() + ' ';\n  return BANNED_ADJECTIVES.filter(function (a) { return t.indexOf(a) !== -1; });\n}\n\n// Trial titles are quoted from ClinicalTrials.gov and can hold anything -- a\n// digit, a question mark, a therapeutic area. The checks judge what the model\n// wrote around a title, not the title it was given.\nfunction withoutTitles(text, titles) {\n  let out = str(text);\n  for (const t of titles || []) {\n    const title = str(t);\n    if (!title) continue;\n    let at = out.toLowerCase().indexOf(title.toLowerCase());\n    while (at !== -1) {\n      out = out.slice(0, at) + ' ' + out.slice(at + title.length);\n      at = out.toLowerCase().indexOf(title.toLowerCase());\n    }\n  }\n  return out;\n}\n\nfunction digitTokens(v) {\n  return (str(v).match(/[\\p{L}\\p{N}]*\\p{N}[\\p{L}\\p{N}]*/gu) || []).map(function (t) { return t.toLowerCase(); });\n}\n\n// Numbers the text states that the corpus (this lead's facts plus every claim it\n// was offered) does not: a digit token, a spelled-out number or multiplier, or a\n// percent sign.\nfunction unlicensedNumbers(text, corpus) {\n  const haveDigits = {};\n  digitTokens(corpus).forEach(function (t) { haveDigits[t] = true; });\n  const bad = digitTokens(text).filter(function (t) { return !haveDigits[t]; });\n  let corpusWords = ' ' + fold(corpus).replace(/[^a-z0-9]+/g, ' ') + ' ';\n  Object.keys(haveDigits).forEach(function (t) {\n    if (/^\\d+$/.test(t) && Number(t) < DIGIT_WORDS.length) corpusWords += DIGIT_WORDS[Number(t)] + ' ';\n  });\n  const textWords = fold(text).replace(/[^a-z0-9]+/g, ' ').split(' ').filter(Boolean);\n  textWords.forEach(function (w) {\n    if (NUMBER_WORDS.indexOf(w) !== -1 && corpusWords.indexOf(' ' + w + ' ') === -1) bad.push(w);\n  });\n  if (str(text).indexOf('%') !== -1 && str(corpus).indexOf('%') === -1) bad.push('%');\n  return bad;\n}\n\nfunction absentAreasNamed(text, absentAreas) {\n  const plain = ' ' + fold(text).replace(/[^a-z0-9]+/g, ' ') + ' ';\n  return (absentAreas || []).filter(function (a) {\n    return plain.indexOf(' ' + fold(a).replace(/[^a-z0-9]+/g, ' ') + ' ') !== -1;\n  });\n}\n\n// Does the text open on this name (or its first word)? Plain string compare.\nfunction startsWithName(text, name) {\n  const t = fold(text);\n  const n = fold(name);\n  if (!n) return false;\n  const first = n.split(/\\s+/)[0];\n  const opensOn = function (w) {\n    return t.indexOf(w) === 0 && (t.length === w.length || !/[a-z0-9]/.test(t.charAt(w.length)));\n  };\n  return opensOn(n) || (first.length >= 3 && opensOn(first));\n}\n\nfunction firstSentence(text) {\n  const m = str(text).match(/^[\\s\\S]*?[.!?](?=\\s|$)/);\n  return m ? m[0] : str(text);\n}\n\nfunction countOf(re, text) {\n  return (str(text).match(new RegExp(re.source, re.flags.indexOf('g') === -1 ? re.flags + 'g' : re.flags)) || []).length;\n}\n\n// ---------------------------------------------------------------------------\n// The rule checks. Each returns the tags it found; checkMessage runs them all.\n// ---------------------------------------------------------------------------\n\n// \"Exactly one ask.\"\nfunction askFlags(body, ask) {\n  const flags = [];\n  const q = countOf(/\\?/, ask);\n  if (!str(ask) || q === 0) flags.push('ask-none');\n  if (q > 1 || REQUEST_IN_BODY.test(body)) flags.push('ask-multiple');\n  if (ASK_SCHEDULING.test(ask)) flags.push('ask-scheduling');\n  return flags;\n}\n\n// \"The name appears at most once, in brackets.\" Stripping every bracketed\n// segment leaves nothing that may still say the name.\nfunction productFlags(text) {\n  const flags = [];\n  const name = new RegExp('\\\\b' + PRODUCT_NAME + '\\\\b', 'gi');\n  const n = countOf(name, text);\n  if (n > PRODUCT_NAME_MAX) flags.push('product-name-repeat');\n  const unbracketed = str(text).replace(/\\([^()]*\\)/g, ' ');\n  if (new RegExp('\\\\b' + PRODUCT_NAME + '\\\\b', 'i').test(unbracketed)) flags.push('product-name-unbracketed');\n  return flags;\n}\n\n// \"The word 'AI' appears at most once ... Never 'AI-powered'.\"\nfunction aiFlags(text) {\n  const flags = [];\n  if (countOf(/\\bA\\.?I\\b\\.?/, text) > AI_MAX) flags.push('ai-repeat');\n  if (AI_POWERED.test(text)) flags.push('ai-powered');\n  return flags;\n}\n\nfunction prospectSponsor(text) {\n  return PROSPECT_SPONSOR.some(function (re) { return re.test(text); });\n}\n\n// Skill v3 section 3, Claims, forbidden.\nfunction claimFlags(text, corpus) {\n  const flags = [];\n  if (GUARANTEE.test(text)) flags.push('claim-guarantee');\n  if (unlicensedNumbers(text, corpus).length) flags.push('claim-number');\n  if (VISITOR_ID.test(text)) flags.push('claim-visitor-id');\n  const t = ' ' + fold(text) + ' ';\n  if (NAMED_TOOLS.some(function (n) { return new RegExp('(^|[^a-z0-9])' + n.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&') + '([^a-z0-9]|$)').test(t); })) {\n    flags.push('claim-named-tool');\n  }\n  if (LANGUAGES.test(text)) flags.push('claim-language');\n  if (CHATBOT.test(text)) flags.push('claim-chatbot');\n  if (NOVA_BOOKS.test(text)) flags.push('claim-books');\n  if (SOP_SOURCE.test(text)) flags.push('claim-sop');\n  return flags;\n}\n\n// Skill v3 section 3, No repeats: \"The description and the benefits must not\n// repeat the same capability.\" Each description and benefit line names its\n// capabilities (claims_library.capabilities, migration 013); two codes one\n// message used that share one say the same thing twice. `capsOf(code)` returns\n// a code's capabilities (none for an angle, proof or ask).\nfunction repeatFlags(codes, capsOf) {\n  const flags = [];\n  const seen = {};\n  let repeated = false;\n  for (const code of codes || []) {\n    for (const cap of capsOf(code) || []) {\n      if (seen[cap] && seen[cap] !== code) repeated = true;\n      seen[cap] = code;\n    }\n  }\n  if (repeated) flags.push('claim-repeat');\n  return flags;\n}\n\n// \"Proof: one named live deployment, matched to the lead's geography.\"\nfunction proofFlags(text, proofPool) {\n  const flags = [];\n  const pool = proofPool || [];\n  const allowed = DEPLOYMENTS.filter(function (d) {\n    return pool.some(function (p) { return fold(p.body).indexOf(fold(d)) !== -1; });\n  });\n  const both = pool.some(function (p) { return /\\btwo CROs\\b/i.test(p.body); });\n  const named = DEPLOYMENTS.filter(function (d) { return fold(text).indexOf(fold(d)) !== -1; });\n  if (named.some(function (d) { return allowed.indexOf(d) === -1; })) flags.push('proof-geo');\n  const present = named.some(function (d) { return allowed.indexOf(d) !== -1; }) ||\n    (both && /\\btwo (?:CROs|CRO clients|clients)\\b/i.test(text));\n  if (!present) flags.push('proof-missing');\n  return flags;\n}\n\n// The first sentence opens on the prospect fact. Section 9 Workflow 4:\n// founder_name and city never open a message; a trial is never credited to\n// their website.\nfunction hookFlags(hook, src, titles) {\n  const flags = [];\n  if (startsWithName(hook, src.founder_name) || startsWithName(hook, src.city)) flags.push('hook-opener');\n  const own = withoutTitles(hook, titles);\n  const titlesNamed = (titles || []).filter(function (t) {\n    return str(t) && hook.toLowerCase().indexOf(str(t).toLowerCase()) !== -1;\n  }).length;\n  const trialOnSite = SITE_CLAIM.test(own) && (titlesNamed > 0 || TRIAL_WORD.test(own));\n  if (HOOK_SOURCE_OPENING.test(hook) || trialOnSite) flags.push('hook-source');\n  return flags;\n}\n\nfunction linkFlags(text, week, approvedLink) {\n  const flags = [];\n  const urls = urlsIn(text);\n  if (urls.length > MAX_URLS) flags.push('urls');\n  if (urls.length && week <= LINK_FREE_WEEKS) flags.push('link-in-warmup');\n  const approved = approvedLink ? urlsIn(approvedLink.body) : [];\n  if (urls.some(function (u) { return approved.indexOf(u) === -1; })) flags.push('unapproved-link');\n  if (urls.some(function (u) { return /linkedin\\.com/i.test(u); })) flags.push('linkedin-link');\n  if (urls.some(function (u) { return /\\.pdf\\b/i.test(u); })) flags.push('pdf-link');\n  return flags;\n}\n\nfunction subjectFlags(subject, factCorpus, headcount, titles, absentAreas) {\n  const flags = [];\n  const chars = Array.from(subject).length;\n  if (!subject || chars < SUBJECT_MIN_CHARS || chars > SUBJECT_MAX_CHARS) flags.push('subject');\n  if (new RegExp('\\\\b' + PRODUCT_NAME + '\\\\b', 'i').test(subject)) flags.push('subject-product');\n  if (/\\bA\\.?I\\b/i.test(subject)) flags.push('subject-ai');\n  const prefix = new RegExp('\\\\b(' + SUBJECT_REPLY_PREFIXES.join('|') + ')\\\\s*:', 'i');\n  if (prefix.test(subject)) flags.push('subject-reply');\n  // \"No capitals\": sentence case. A capitalised word after the first is allowed\n  // only when the facts spell it that way (a trial code, a city) or it is an\n  // acronym a CRO uses.\n  const corpusWords = {};\n  (factCorpus.match(/[\\p{L}\\p{N}-]+/gu) || []).forEach(function (t) { corpusWords[t] = true; });\n  const tokens = subject.match(/[\\p{L}\\p{N}-]+/gu) || [];\n  const capped = tokens.filter(function (t, i) {\n    if (!/\\p{Lu}/u.test(t)) return false;\n    if (i === 0 && !/^\\p{Lu}{2,}$/u.test(t)) return false;\n    return !corpusWords[t] && SUBJECT_ACRONYMS.indexOf(t.toUpperCase()) === -1;\n  });\n  if (capped.length) flags.push('subject-caps');\n  const corpus = factCorpus + (headcount ? ' ' + headcount : '');\n  const bare = withoutTitles(subject, titles);\n  if (digitTokens(bare).some(function (t) { return digitTokens(corpus).indexOf(t) === -1; }) ||\n      absentAreasNamed(bare, absentAreas).length) {\n    flags.push('subject-ungrounded');\n  }\n  return flags;\n}\n\n// Every rule that applies to a message body, either channel.\nfunction checkMessage(m) {\n  let flags = [];\n  if (!str(m.body)) flags.push('empty');\n  if (words(m.core) > BODY_CEILING) flags.push('long');\n  if (bannedAdjectivesIn(m.core).length) flags.push('adjective');\n  if (MERGE_TAG.test(m.core)) flags.push('merge-tag');\n  flags = flags.concat(askFlags(m.body, m.ask));\n  flags = flags.concat(productFlags(m.core));\n  flags = flags.concat(aiFlags(m.core));\n  if (prospectSponsor(m.core)) flags.push('prospect-sponsor');\n  const own = withoutTitles(m.core, m.titles);\n  flags = flags.concat(claimFlags(own, m.corpus));\n  if (absentAreasNamed(own, m.absentAreas).length) flags.push('ungrounded-area');\n  if (str(m.body)) flags = flags.concat(hookFlags(firstSentence(m.body), m.src, m.titles));\n  flags = flags.concat(proofFlags(m.core, m.proofPool));\n  return flags;\n}\n\nfunction unique(list) {\n  return list.filter(function (v, i) { return list.indexOf(v) === i; });\n}\n\n// Word-set overlap, for attributing an ask the model did not code to the library\n// line it paraphrased. Also used by the follow-ups (Workflow 6), which embed\n// everything above \"Node body\" verbatim.\nfunction wordSet(v) {\n  const set = {};\n  fold(v).replace(/[^a-z0-9]+/g, ' ').split(' ').filter(Boolean).forEach(function (w) { set[w] = true; });\n  return set;\n}\nfunction jaccard(a, b) {\n  const A = wordSet(a);\n  const B = wordSet(b);\n  const keys = unique(Object.keys(A).concat(Object.keys(B)));\n  const both = keys.filter(function (k) { return A[k] && B[k]; }).length;\n  return keys.length ? both / keys.length : 0;\n}\n\n// ---------------------------------------------------------------------------\n\n// ===========================================================================\n// The questions a reply may not answer -- shared by Build Reply and Assemble\n// Reply (Section 9, Workflow 7). build_workflow.py prepends this file to both\n// nodes, so the topic one node detects in the prospect's message is the same\n// topic the other checks the draft against; two copies would drift and the\n// drift would be invisible.\n// ===========================================================================\n//\n// WHAT A REPLY MAY SAY is exactly what a first touch may say: the confirmed\n// `claims_library` lines, and the facts in the lead's own enrichment record.\n// Migration 013 narrowed every claim to what the Nova Agent Kit code actually\n// does (`capabilities`), so \"what the claims support\" and \"what the code\n// supports\" are the same set by construction, and a sentence outside it is an\n// invention whether or not it happens to be true.\n//\n// A prospect's first reply, though, is usually a QUESTION, and the questions\n// that come back are mostly about things no claim covers: what it costs, what\n// it plugs into, which languages it speaks, where the data lives, how long it\n// takes. The first touch never raised any of them, so there is nothing to\n// widen -- which is precisely why a model will answer them from nowhere.\n//\n// So the answer is not \"tag it afterwards\", it is \"do not answer it\": the topic\n// is detected in THEIR text before the model is called, the model is told to\n// say we will confirm it, and the draft is flagged to the operator, who knows\n// the answer and can put it in with EDIT. The five topics are the operator's\n// list (2026-10-09).\n//\n// The patterns are deliberately broad. A false positive costs one hedged\n// sentence and one line in the review email; a false negative is a made-up\n// price or a made-up integration sent to a prospect over the operator's name.\nconst OPEN_TOPICS = [\n  {\n    topic: 'pricing',\n    label: 'what it costs',\n    re: /\\b(?:pric(?:e|es|ing)|cost|costs|costly|how much|fee|fees|budget|quote|quotation|licen[cs]\\w*|subscription|per (?:month|year|seat|user)|monthly|annual(?:ly)?|retainer|discount|invoice|payment terms)\\b/i,\n  },\n  {\n    topic: 'integrations',\n    label: 'what it connects to',\n    re: /\\b(?:integrat\\w*|API|APIs|webhook\\w*|CRM|salesforce|hubspot|zapier|SSO|single sign-?on|LDAP|CTMS|eTMV|eTMF|EDC|SharePoint|Teams|Slack|calendar|google workspace|office ?365|plug(?:s|ged)? into|connect(?:s|ed|ion|ions)? (?:to|with))\\b/i,\n  },\n  {\n    topic: 'languages',\n    label: 'which languages it speaks',\n    re: /\\b(?:language|languages|multi-?lingual|translat\\w*|english|turkish|spanish|arabic|german|french|portuguese|polish|romanian|hungarian|czech|hindi|urdu|mandarin|japanese)\\b/i,\n  },\n  {\n    topic: 'security',\n    label: 'security, hosting and data protection',\n    re: /\\b(?:secur\\w*|GDPR|KVKK|HIPAA|GxP|21 CFR|part 11|data protection|privacy|confidential\\w*|NDA|DPA|encrypt\\w*|anonymi[sz]\\w*|pseudonymi[sz]\\w*|hosted?|hosting|on-?prem\\w*|server location|where (?:is|are) (?:the )?data|data (?:residency|centre|center|retention|storage)|SOC ?2|ISO ?27001|penetration test|audit trail|validat\\w*)\\b/i,\n  },\n  {\n    topic: 'timelines',\n    label: 'how long it takes and when it can start',\n    re: /\\b(?:timeline|time-?line|how long|lead ?time|turn ?around|go[- ]live|deadline|availabilit\\w*|when (?:can|could|would|will)|start date|roll ?out|implementation (?:time|period)|SLA|uptime|support hours|response time|maintenance)\\b/i,\n  },\n];\n\n// A sentence that says we will come back with the answer, rather than giving\n// one. Assemble Reply requires one of these for every topic the prospect\n// raised: without it, a paragraph that mentions pricing is answering about\n// pricing.\nconst DEFERRAL_RE = /\\b(?:I(?:'| wi)?ll (?:confirm|check|find out|come back|get back|send you the detail)|let me (?:confirm|check|find out)|I (?:do not|don't) want to guess|rather than guess|confirm (?:that|this|these|the detail)|get back to you (?:on|with|about)|come back to you (?:on|with|about)|check (?:that|this) (?:and|then|with)|I will ask)\\b/i;\n\n// Which of the five the prospect actually raised, in the order above.\nfunction topicsIn(text) {\n  const t = String(text === null || text === undefined ? '' : text);\n  return OPEN_TOPICS.filter(function (o) { return o.re.test(t); }).map(function (o) { return o.topic; });\n}\n\nfunction topicLabel(topic) {\n  const hit = OPEN_TOPICS.filter(function (o) { return o.topic === topic; })[0];\n  return hit ? hit.label : topic;\n}\n\nfunction topicRe(topic) {\n  const hit = OPEN_TOPICS.filter(function (o) { return o.topic === topic; })[0];\n  return hit ? hit.re : null;\n}\n\nfunction deferralIn(text) {\n  return DEFERRAL_RE.test(String(text === null || text === undefined ? '' : text));\n}\n\n// ===========================================================================\n// Assemble Reply -- n8n Code node (Run Once for Each Item).\n//\n// build_workflow.py ships this node as three parts: drafting's code_assemble.js\n// above its \"Node body\" marker (verbatim -- the first touch's own claim rules),\n// then code_reply_topics.js (the five questions a reply may not answer), then\n// this file. So a reply is judged by askFlags, claimFlags, productFlags,\n// aiFlags, proofFlags, linkFlags and the rest exactly as a first touch and a\n// follow-up are, rather than by a copy of them that could drift.\n//\n// What this adds is the reply's own rules:\n//\n//   length    body plus next step, 40-120 words (`short`, `long`)\n//   proof     the \"two CROs\" wording is never reused and Vertex Clinical\n//             Research is never called a CRO -- it is a clinical research\n//             centre (operator instruction, 2026-10-09): `proof-refused`\n//   deferral  every topic they raised that no claim and no record fact can\n//             settle must be named in `deferred` (`deferral-missing`) and must\n//             be answered with \"we will confirm\", not with an answer\n//             (`answered-open`)\n//   frame     greeting, signature and their quoted message are appended here,\n//             never generated\n//\n// NO OPT-OUT LINE, and that is deliberate. Section 5's \"reply 'no' and I won't\n// follow up\" is the opt-out mechanism for a message the prospect did not ask\n// for. This is an answer to a message they sent us, inside their own thread,\n// and the opt-out sentence in it would read as a form letter; replying is\n// already the trivial opt-out the GDPR/KVKK position requires. The send path\n// checks a reply for the SIGNATURE rather than for the opt-out tail\n// (code_reply_decide.js), and nothing else about the frame changes.\n//\n// A violation tags `variant` rather than discarding the draft, as everywhere\n// else in Workflow 4: the operator reads the tag next to the text in the\n// review email. A failed call writes nothing and the reply is queued again on\n// the next run (no fallback model -- skill section 6).\n// ===========================================================================\n\nconst REPLY_MIN_WORDS = 40;\nconst REPLY_MAX_WORDS = 120;\nconst SIGNATURE = \"Abdullah Amir\\nFounder, Amitrix Labs\\n+923178485713\";\n\n// Operator instruction, 2026-10-09, checked on the TEXT and not on a code, so a\n// reworded library row cannot escape it. The same list Build Reply filters the\n// offered proof with -- a reply may still name a deployment the library offers\n// for this country, just never in these words.\nconst REPLY_PROOF_REFUSED = [/\\btwo CROs?\\b/i, /\\bVertex\\b[^.]{0,40}\\bCRO\\b/i];\n\nconst src = $('Build Reply').item.json;\nconst resp = $input.item.json;\n\nfunction failed(detail) {\n  return {\n    json: {\n      lead_id: src.lead_id,\n      inbound_message_id: src.inbound_message_id,\n      write: false,\n      skip_reason: 'Claude reply call did not answer usably: ' + detail,\n      usage: resp && resp.usage ? resp.usage : null,\n    },\n  };\n}\n\nif (!resp || typeof resp !== 'object') return failed('no response item');\nif (resp.error) {\n  const e = resp.error;\n  return failed((typeof e === 'string' ? e : JSON.stringify(e)).slice(0, 300));\n}\nif (resp.stop_reason !== 'end_turn') {\n  const why = resp.stop_details && resp.stop_details.category ? ' (' + resp.stop_details.category + ')' : '';\n  return failed('stop_reason ' + JSON.stringify(resp.stop_reason) + why);\n}\nconst text = (Array.isArray(resp.content) ? resp.content : [])\n  .filter(function (b) { return b && b.type === 'text'; })\n  .map(function (b) { return b.text; })\n  .join('');\nlet parsed = null;\ntry {\n  parsed = JSON.parse(text);\n} catch (e) {\n  parsed = null;\n}\nconst REPLY_FIELDS = ['body', 'ask', 'flag'];\nconst REPLY_LISTS = ['claims', 'deferred'];\nif (!parsed || typeof parsed !== 'object' ||\n    REPLY_FIELDS.some(function (f) { return typeof parsed[f] !== 'string'; }) ||\n    REPLY_LISTS.some(function (f) { return !Array.isArray(parsed[f]); })) {\n  return failed('response text was not the reply schema: ' + text.slice(0, 200));\n}\n\n// --- the claims this reply used ----------------------------------------------\n\nconst pools = src.library_pools || {};\nconst offered = {};\nSLOT_ORDER.forEach(function (slot) {\n  (pools[slot] || []).forEach(function (l) {\n    offered[l.code] = { slot: slot, confirmed: l.confirmed, capabilities: l.capabilities || [] };\n  });\n});\nconst approvedLink = (pools.link || [])[0] || null;\n\nconst body = cleanText(parsed.body, src.greeting);\nconst ask = cleanText(parsed.ask, src.greeting);\nconst core = [body, ask].filter(Boolean).join('\\n\\n');\n\n// Reported codes against what this reply was offered. As in Workflow 4 and the\n// follow-ups, an ask or a proof the model left uncoded is attributed from the\n// text: the model is never trusted to copy an identifier.\nconst reported = unique(parsed.claims.map(str).filter(Boolean));\nconst unknown = reported.filter(function (c) { return !offered[c]; });\nlet used = reported.filter(function (c) { return offered[c]; });\nif (!used.some(function (c) { return offered[c].slot === 'ask'; })) {\n  let best = null;\n  (pools.ask || []).forEach(function (l) {\n    const j = jaccard(ask, l.body);\n    if (j >= 0.5 && (!best || j > best.j)) best = { code: l.code, j: j };\n  });\n  if (best) used.push(best.code);\n}\nif (!used.some(function (c) { return offered[c].slot === 'proof'; })) {\n  (pools.proof || []).forEach(function (l) {\n    const names = DEPLOYMENTS.filter(function (d) { return fold(l.body).indexOf(fold(d)) !== -1; });\n    if (names.some(function (d) { return fold(core).indexOf(fold(d)) !== -1; }) && used.indexOf(l.code) === -1) {\n      used.push(l.code);\n    }\n  });\n}\nused = unique(used).sort(function (a, b) {\n  return SLOT_ORDER.indexOf(offered[a].slot) - SLOT_ORDER.indexOf(offered[b].slot);\n});\n\nconst deferred = unique(parsed.deferred.map(str).filter(Boolean).map(function (d) { return d.toLowerCase(); }));\nconst openTopics = Array.isArray(src.open_topics) ? src.open_topics : [];\nconst flag = str(parsed.flag);\n\n// --- the checks ---------------------------------------------------------------\n\nfunction replyFlags() {\n  let flags = [];\n  const wc = words(core);\n  if (!body) flags.push('empty');\n  if (wc > REPLY_MAX_WORDS) flags.push('long');\n  if (wc && wc < REPLY_MIN_WORDS) flags.push('short');\n  if (bannedAdjectivesIn(core).length) flags.push('adjective');\n  if (MERGE_TAG.test(core)) flags.push('merge-tag');\n  flags = flags.concat(askFlags(body, ask));\n  flags = flags.concat(productFlags(core));\n  flags = flags.concat(aiFlags(core));\n  if (prospectSponsor(core)) flags.push('prospect-sponsor');\n  flags = flags.concat(claimFlags(core, src.corpus));\n  if (absentAreasNamed(core, src.absent_areas).length) flags.push('ungrounded-area');\n  // A reply need not name a deployment at all; one it DOES name must be this\n  // lead's, so only proof-geo applies (the follow-ups make the same cut).\n  flags = flags.concat(proofFlags(core, pools.proof).filter(function (f) { return f === 'proof-geo'; }));\n  if (REPLY_PROOF_REFUSED.some(function (re) { return re.test(core); })) flags.push('proof-refused');\n  // The link policy, with the warm-up week deliberately out of range: a reply\n  // is not cold outreach, so the week-1-2 link ban does not apply to it. What\n  // does apply is the cap -- at most one URL, and only the library's own\n  // confirmed `link` line (none is confirmed today, so any URL is tagged).\n  flags = flags.concat(linkFlags(core, LINK_FREE_WEEKS + 1, approvedLink));\n  if (unknown.length || !reported.length) flags.push('claim-code');\n  flags = flags.concat(repeatFlags(used, function (c) { return offered[c].capabilities; }));\n  if (used.some(function (c) { return !offered[c].confirmed; })) flags.push('unconfirmed-claim');\n  // Every topic they raised has to be named as deferred...\n  if (openTopics.some(function (t) { return deferred.indexOf(t) === -1; })) flags.push('deferral-missing');\n  // ... and deferred means \"we will confirm\", not an answer. A reply that talks\n  // about one of those topics with no such sentence anywhere has answered it.\n  if (openTopics.length && !deferralIn(core)) flags.push('answered-open');\n  else if (openTopics.some(function (t) {\n    const re = topicRe(t);\n    return re && re.test(core) && !deferralIn(core);\n  })) {\n    flags.push('answered-open');\n  }\n  return unique(flags);\n}\n\nconst flags = replyFlags();\n\n// --- the sendable text --------------------------------------------------------\n//\n// Greeting / reply / next step / signature, then THEIR message quoted. An EDIT\n// from the operator replaces only the middle and keeps this frame\n// (code_operator_command.js's framedEdit), which is why the signature is the\n// marker it splits on.\n\nconst theirs = String(src.their_text || '').replace(/\\r\\n?/g, '\\n').trim();\nconst when = new Date(src.received_at);\nconst whenText = isNaN(when.getTime()) ? 'earlier' : when.toUTCString().slice(0, 16);\nconst quoted = theirs.split('\\n').map(function (ln) { return ln ? '> ' + ln : '>'; }).join('\\n');\nconst full = [\n  src.greeting,\n  '',\n  core,\n  '',\n  SIGNATURE,\n  '',\n  'On ' + whenText + ', ' + str(src.quote_attribution) + ' wrote:',\n  quoted,\n].join('\\n');\n\nconst variant = 'reply/' + used.join('.') + (flags.length ? '+' + flags.join(',') : '');\n\nreturn {\n  json: {\n    lead_id: src.lead_id,\n    inbound_message_id: src.inbound_message_id,\n    write: true,\n    flags: flags,\n    words: words(core),\n    claims: used,\n    deferred: deferred,\n    open_topics: openTopics,\n    flag: flag,\n    model: resp.model,\n    usage: resp.usage || null,\n    composition: parsed,\n    // What the review email shows the operator, alongside the draft itself.\n    review: {\n      company_name: src.company_name,\n      domain: src.domain,\n      country: src.country,\n      from_addr: src.from_addr,\n      their_subject: src.their_subject,\n      their_text: theirs,\n      received_at: src.received_at,\n      deferred: deferred.map(function (t) { return topicLabel(t); }),\n      flag: flag,\n      flags: flags,\n      words: words(core),\n      claims: used,\n    },\n    payload: {\n      lead_id: src.lead_id,\n      inbound_message_id: src.inbound_message_id,\n      draft: {\n        channel: 'email',\n        variant: variant,\n        subject: src.subject,\n        body: full,\n      },\n    },\n  },\n};\n"
+      },
+      "name": "Assemble Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        40
+      ],
+      "notes": "Drafting's own claim rules (code_assemble.js above its 'Node body' marker, embedded verbatim) plus the reply's: 40-120 words, one next step, the one-URL cap, no \"two CROs\" line and never Vertex Clinical Research as a CRO, and a deferral sentence for every topic they raised. Violations tag the variant; the operator reads the tags in the review email. The greeting, the signature and their quoted message are appended here, never generated."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "writable",
+              "leftValue": "={{ $json.write }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Drop Failed Generations",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [
+        220,
+        40
+      ],
+      "notes": "A failed Claude call writes nothing; the message is queued again on the next run."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Write Reply Draft & Issue Code: the drafted reply into `drafts` as PENDING,\n-- and its one-time code into reply_approvals (Section 9, Workflow 7).\n--\n-- $1 Assemble Reply's payload, with the `review` block the email shows\n--\n-- A REPLY IS ALWAYS PENDING. Nothing here can approve it: no claim check runs\n-- on a reply, the operator reads every one, and migration 018 puts that on the\n-- table as well -- a `reply/` draft cannot become `approved` without a\n-- one-time code, and `approved_by = 'auto'` on one is refused by name.\n--\n-- The code comes from reply_approval_issue() (migration 018), which is the only\n-- definition of how a code is minted, reused and reaped. Writing one here by\n-- hand would have to know that 017's partial unique index allows exactly one\n-- unused code per draft, and that an expired unused one blocks its own\n-- replacement until it is reaped.\n--\n-- The NOT EXISTS is the same idempotency the queue uses, re-checked at the\n-- write: two runs overlapping on one prospect message write one draft.\n--\n-- `hold_reason` is set to the waiting command on purpose: the Daily Digest's\n-- HELD FOR A PERSON section reads that column, so a drafted reply nobody has\n-- answered shows up there with its code, next to everything else waiting.\nWITH p AS (\n  SELECT $1::jsonb AS p\n),\nins AS (\n  INSERT INTO drafts (lead_id, channel, variant, subject, body, status)\n  SELECT (p.p->>'lead_id')::bigint, p.p->'draft'->>'channel', p.p->'draft'->>'variant',\n         p.p->'draft'->>'subject', p.p->'draft'->>'body', 'pending'\n    FROM p\n   WHERE NOT EXISTS (SELECT 1 FROM reply_approvals a\n                      WHERE a.inbound_message_id = p.p->>'inbound_message_id')\n  RETURNING id, lead_id, subject, body\n),\ncode AS (\n  SELECT ins.id AS draft_id,\n         reply_approval_issue('reply', ins.id, ins.lead_id, p.p->>'inbound_message_id') AS code\n    FROM ins, p\n),\nheld AS (\n  UPDATE drafts d\n     SET hold_reason = 'reply: waiting for your APPROVE / REJECT / EDIT ' || code.code\n    FROM code\n   WHERE d.id = code.draft_id\n  RETURNING d.id, d.hold_reason\n),\na AS (\n  SELECT r.code, r.kind, r.draft_id, r.lead_id, r.issued_at, r.expires_at\n    FROM reply_approvals r\n   WHERE r.code = (SELECT code FROM code)\n)\nSELECT (SELECT count(*) FROM ins) = 1        AS written,\n       (SELECT id FROM ins)                  AS draft_id,\n       (p.p->>'lead_id')::bigint             AS lead_id,\n       (SELECT code FROM code)               AS code,\n       to_char((a.issued_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')                      AS issued_at,\n       to_char((a.expires_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')                     AS expires_at,\n       (SELECT subject FROM ins)             AS subject,\n       (SELECT body FROM ins)                AS body,\n       (SELECT hold_reason FROM held)        AS hold_reason,\n       p.p->'review'                         AS review,\n       p.p->>'inbound_message_id'            AS inbound_message_id,\n       (SELECT value FROM settings WHERE key = 'operator_email') AS operator_email\n  FROM p\n  LEFT JOIN a ON true;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.payload)] }}"
+        }
+      },
+      "name": "Write Reply Draft & Issue Code",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        440,
+        40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "The draft into `drafts` as PENDING -- a reply is never auto-approved, and migration 018 refuses one on the table too -- and its one-time code from reply_approval_issue(), the only thing that knows to reuse an open code and reap a dead one. hold_reason names the waiting command, so the daily digest lists it like any other held draft."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Build Review Email -- n8n Code node (Run Once for Each Item).\n//\n// Section 9, Workflow 7: \"Save it as a pending draft and email me the reply, the\n// proposal and a one-time code.\" This is that email.\n//\n// Built from the row \"Write Reply Draft & Issue Code\" returned, so everything in\n// it is what the database actually holds: the draft is `pending`, the code is\n// the one `reply_approvals` stores, and the expiry is the one its CHECK bounded\n// to 48 hours. The operator's address comes on the same row, read at runtime\n// from `settings` (migration 008), so no address is baked into this workflow.\n//\n// It shows four things, in this order:\n//   1. WHAT THEY WROTE -- the text above the quoted thread, verbatim.\n//   2. THE PROPOSED REPLY -- the exact bytes that would be sent, frame and all,\n//      so there is nothing to imagine.\n//   3. WHAT IT DOES NOT ANSWER -- every topic they raised that no confirmed\n//      claim and no record fact can settle (pricing, integrations, languages,\n//      security, timelines), plus whatever the drafter flagged. This is the half\n//      of the email the operator is the only one who can act on.\n//   4. THE THREE COMMANDS, each with the code, and what each one does.\n//\n// Like a reply notification and the daily digest it goes only to the operator's\n// own inbox, so it uses no warm-up slot.\n\n// One bare address -- the build's rule, and migration 008's CHECK.\nconst REVIEW_ADDRESS = /^[^\\s@<>(),;:\"']+@[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)+$/;\n\nfunction vStr(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\nfunction vList(v) {\n  return Array.isArray(v) ? v.map(vStr).filter(Boolean) : [];\n}\n\nfunction reviewAddress(r) {\n  const a = vStr(r.operator_email).toLowerCase();\n  return REVIEW_ADDRESS.test(a) ? a : '';\n}\n\nfunction reviewEmail(r) {\n  const to = reviewAddress(r);\n  const v = (r.review && typeof r.review === 'object') ? r.review : {};\n  const code = vStr(r.code);\n  const who = vStr(v.company_name) || vStr(v.domain) || ('lead ' + vStr(r.lead_id));\n  const flags = vList(v.flags);\n  const deferred = vList(v.deferred);\n  const flag = vStr(v.flag);\n\n  const lines = [\n    who + ' (' + vStr(v.domain) + ', ' + vStr(v.country) + ') replied, and this is the answer I drafted.',\n    'Nothing is sent until you say so.',\n    '',\n    'Draft:     ' + vStr(r.draft_id) + ' (pending, channel email, variant reply)',\n    'Lead:      ' + vStr(r.lead_id),\n    'Reply to:  ' + vStr(v.from_addr) + '   (the address that wrote, not the contact on file)',\n    'Received:  ' + vStr(v.received_at),\n    'Length:    ' + vStr(v.words) + ' words' + (v.claims && v.claims.length ? ', claims ' + vList(v.claims).join('.') : ''),\n    'Code:      ' + code + '   (expires ' + vStr(r.expires_at) + ', works once)',\n    '',\n    '================================================================',\n    'WHAT THEY WROTE',\n    '================================================================',\n    '',\n    vStr(v.their_text) || '(no text above the quoted thread)',\n    '',\n    '================================================================',\n    'THE PROPOSED REPLY -- exactly what would be sent',\n    '================================================================',\n    '',\n    'Subject: ' + vStr(r.subject),\n    '',\n    vStr(r.body),\n    '',\n    '================================================================',\n    'WHAT IT DOES NOT ANSWER, AND WHAT TO LOOK AT',\n    '================================================================',\n    '',\n  ];\n\n  if (deferred.length) {\n    lines.push('They asked about this, and nothing we have confirmed covers it, so the draft says');\n    lines.push('we will confirm and comes to you instead:');\n    deferred.forEach(function (d) { lines.push('  - ' + d); });\n    lines.push('');\n    lines.push('You know these answers. EDIT is how they get in.');\n    lines.push('');\n  } else {\n    lines.push('Nothing they asked falls outside the confirmed claims and their own record.');\n    lines.push('');\n  }\n  if (flag) {\n    lines.push('Flagged by the drafter: ' + flag);\n    lines.push('');\n  }\n  if (flags.length) {\n    lines.push('Rule tags on this draft (Workflow 4\\'s own rules, run over the reply):');\n    flags.forEach(function (f) { lines.push('  - ' + f); });\n    lines.push('');\n  } else {\n    lines.push('No rule tags: it passed every check Workflow 4 runs on a first touch.');\n    lines.push('');\n  }\n\n  lines.push('================================================================');\n  lines.push('WHAT TO SEND BACK');\n  lines.push('================================================================');\n  lines.push('');\n  lines.push('Reply to this email with one of these as the first line:');\n  lines.push('');\n  lines.push('  APPROVE ' + code);\n  lines.push('      Sends it as it stands, on the next send tick. A reply skips the warm-up');\n  lines.push('      ceiling and business hours; it never skips the blocklist.');\n  lines.push('');\n  lines.push('  REJECT ' + code);\n  lines.push('      Sends nothing. Their message stays on the lead.');\n  lines.push('');\n  lines.push('  EDIT ' + code);\n  lines.push('      ...then your own text, on the rest of that line and the lines after it.');\n  lines.push('      Your words replace the draft\\'s, under the same greeting and signature,');\n  lines.push('      and it is approved. This is the one to use for the questions above.');\n  lines.push('');\n  lines.push('The code works once and expires ' + vStr(r.expires_at) + '. Only this address can use');\n  lines.push('it, and only with SPF and DKIM passing -- anything else is logged and ignored.');\n  lines.push('I will remind you in 4 hours if I have not heard back.');\n  lines.push('');\n  lines.push('-- Nova Scout (Workflow 7, Reply Assistant). Sent only to this address; it uses no');\n  lines.push('   warm-up slot.');\n\n  return {\n    notify: Boolean(r.written) && to !== '' && code !== '',\n    notify_to: to,\n    subject: ('[Nova Scout] REPLY DRAFTED for ' + who + ' -- ' + code).slice(0, 200),\n    text: lines.join('\\n'),\n    record: {\n      code: code,\n      draft_id: r.draft_id,\n    },\n  };\n}\n\n// ---------------------------------------------------------------------------\n// Node body\n// ---------------------------------------------------------------------------\n\nreturn { json: reviewEmail($input.item.json) };\n"
+      },
+      "name": "Build Review Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        40
+      ],
+      "notes": "What they wrote, the exact bytes that would be sent, what the reply does NOT answer and why, the rule tags, and the three commands with the code. Built from what the database holds, not from what the drafter proposed."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "review",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Review Email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        40
+      ],
+      "notes": "Only with a draft written, a code issued and an operator address in `settings`. No address, no review email -- and the draft stays pending, which is the safe end of that."
+    },
+    {
+      "parameters": {
+        "fromEmail": "\"Abdullah Amir\" <abdullah@amitrixlabs.com>",
+        "toEmail": "={{ $json.notify_to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "name": "Send Review Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1100,
+        -60
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "novascoutSmtp01",
+          "name": "SMTP - outreach mailbox"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "To the operator's own inbox, never the outreach mailbox. Sent only to that address, so it counts toward no warm-up ceiling (Section 9)."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Record Review Sent / Record Reminder -- one statement for both, so \"the\n-- operator has been told about this code\" can only mean one thing.\n--\n-- Stamps reminded_at, and only once SMTP accepted the message, so one that could\n-- not go out is sent again on the next tick -- the rule the Daily Digest and the\n-- IMAP health alert already follow. An unstamped code reads as \"nobody has been\n-- told\", which Find Due Reminders treats as due at once.\n--\n-- $1 the sender's `record` ({code}); $2 the email node's output (nodemailer's\n--    info, or {error} -- the node continues on error)\nWITH p AS (\n  SELECT $1::jsonb AS d, $2::jsonb AS r\n),\nupd AS (\n  UPDATE reply_approvals a\n     SET reminded_at = now()\n    FROM p\n   WHERE a.code = p.d->>'code'\n     AND a.used_at IS NULL\n     AND p.r->>'error' IS NULL\n     AND jsonb_typeof(p.r->'accepted') = 'array'\n     AND jsonb_array_length(p.r->'accepted') > 0\n  RETURNING a.code, a.reminded_at\n)\nSELECT p.d->>'code'                   AS code,\n       (SELECT count(*) FROM upd)::int AS recorded,\n       p.r->>'error'                  AS error\n  FROM p;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($('Build Review Email').item.json.record), JSON.stringify($json)] }}"
+        }
+      },
+      "name": "Record Review Sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1320,
+        -60
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Stamps reply_approvals.reminded_at -- 'the operator has been told' -- and only once SMTP accepted it. A review email that could not go out leaves it NULL, which the reminder lane reads as due at once rather than in four hours."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Find Due Reminders -- Section 9, Workflow 7: \"Remind me after 4 hours.\"\n-- READ-ONLY. One row per open code the operator has not answered.\n--\n-- $1 now_override ('' in the shipped workflow), $2 remind_hours\n--\n-- `reminded_at` means \"when the operator was last TOLD about this code, by any\n-- email\" -- the reply-review email stamps it through the same statement a\n-- reminder does (Record Review Sent / Record Reminder), and so does the digest\n-- for the codes it carried. So NULL means nobody has been told at all, which is\n-- due at once: that is the self-heal for a review email or a digest SMTP\n-- refused, and it is why this is not simply `coalesce(reminded_at, issued_at)`.\n-- Otherwise each reminder lands remind_hours after the last -- the shape of the\n-- IMAP health check's 6-hourly reminder while a problem lasts.\n--\n-- Nothing is due once the code has expired: at that point there is nothing the\n-- operator could do with it, and the next digest or the next reply mints a\n-- fresh one.\n--\n-- BOTH KINDS, because both are the operator holding the same kind of decision:\n-- a `reply` drafted for a prospect who wrote to us, and an `email-hold` -- a\n-- first touch or follow-up the claim check held after its repairs, which the\n-- digest listed with a code of its own.\n--\n-- The draft must still be pending: one rejected or approved in the NocoDB grid\n-- needs no nudge, even if its code is technically still open.\nWITH clk AS (\n  SELECT coalesce(nullif($1, '')::timestamptz, now()) AS now\n)\nSELECT a.code                                 AS code,\n       a.kind                                 AS kind,\n       a.draft_id                             AS draft_id,\n       a.lead_id                              AS lead_id,\n       to_char((a.issued_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')                       AS issued_at,\n       to_char((a.expires_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')                      AS expires_at,\n       to_char((a.reminded_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')                     AS reminded_at,\n       to_char((clk.now) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')                           AS now,\n       d.channel                              AS channel,\n       d.variant                              AS variant,\n       d.subject                              AS subject,\n       coalesce(d.edited_body, d.body)        AS body,\n       d.hold_reason                          AS hold_reason,\n       l.company_name                         AS company_name,\n       l.domain                               AS domain,\n       l.country                              AS country,\n       i.body_excerpt                         AS their_text,\n       (SELECT value FROM settings WHERE key = 'operator_email') AS operator_email\n  FROM reply_approvals a\n  JOIN drafts d ON d.id = a.draft_id\n  JOIN leads l  ON l.id = a.lead_id\n  LEFT JOIN inbound_messages i ON i.message_id = a.inbound_message_id\n  CROSS JOIN clk\n WHERE a.used_at IS NULL\n   AND a.expires_at > clk.now\n   AND d.status = 'pending'\n   AND (a.reminded_at IS NULL OR a.reminded_at <= clk.now - make_interval(hours => $2::int))\n ORDER BY a.issued_at, a.code\n LIMIT 20;",
+        "options": {
+          "queryReplacement": "={{ [$json.now_override, $json.remind_hours] }}"
+        }
+      },
+      "name": "Find Due Reminders",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -660,
+        420
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Read-only. Every unused, unexpired code whose draft is still pending and whose operator has not been told in remind_hours -- or at all, which is the self-heal for a review email or a digest SMTP refused. Both kinds: a drafted reply, and an email the claim check held after its repairs."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Build Reminder -- n8n Code node (Run Once for Each Item).\n//\n// Section 9, Workflow 7: \"Remind me after 4 hours.\" A one-time code sits in the\n// mailbox for at most 48 hours (migration 017's CHECK) and then stops working,\n// so a drafted reply nobody answered is a prospect left waiting and a code that\n// quietly dies. This nudges, and keeps nudging every REMIND_HOURS while the\n// code is still open -- the same shape as the IMAP health check's reminder,\n// which repeats every 6 hours while a problem lasts.\n//\n// \"Find Due Reminders\" decides what is due, in SQL, from\n// `coalesce(reminded_at, issued_at)` -- so the first reminder lands 4 hours\n// after the code was issued and each later one 4 hours after the last. The last\n// one before the window closes says how little time is left.\n//\n// It covers BOTH kinds of code, because both are the operator waiting on the\n// same decision: a `reply` drafted for a prospect who wrote to us, and an\n// `email-hold` -- a first touch or follow-up the claim check held after its\n// repairs, which the daily digest listed with a code of its own.\n//\n// Recorded only once SMTP accepted it (\"Record Reminder\"), so a reminder that\n// could not go out is sent on the next tick instead of being lost.\n\nconst REMIND_ADDRESS = /^[^\\s@<>(),;:\"']+@[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)+$/;\n\nconst KIND_LABEL = {\n  'reply': 'a reply to a prospect who wrote to us',\n  'email-hold': 'an email the claim check held for a person',\n};\n\nfunction mStr(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\nfunction remindAddress(r) {\n  const a = mStr(r.operator_email).toLowerCase();\n  return REMIND_ADDRESS.test(a) ? a : '';\n}\n\nfunction hoursBetween(from, to) {\n  const a = new Date(from).getTime();\n  const b = new Date(to).getTime();\n  if (isNaN(a) || isNaN(b)) return null;\n  return Math.round((b - a) / 3600000);\n}\n\nfunction reminder(r) {\n  const to = remindAddress(r);\n  const code = mStr(r.code);\n  const who = mStr(r.company_name) || mStr(r.domain) || ('lead ' + mStr(r.lead_id));\n  const open = hoursBetween(r.issued_at, r.now);\n  const left = hoursBetween(r.now, r.expires_at);\n  const kind = mStr(r.kind);\n\n  const lines = [\n    'Still waiting on you: ' + (KIND_LABEL[kind] || kind) + '.',\n    '',\n    'Company:   ' + who + ' (' + mStr(r.domain) + ', ' + mStr(r.country) + ')',\n    'Draft:     ' + mStr(r.draft_id) + ' (' + mStr(r.channel) + ', ' + mStr(r.variant) + ', still pending)',\n    'Code:      ' + code,\n    'Issued:    ' + mStr(r.issued_at) + (open === null ? '' : '  (' + open + ' h ago)'),\n    'Expires:   ' + mStr(r.expires_at) +\n      (left === null ? '' : (left <= 0 ? '  (expired)' : '  (' + left + ' h left)')),\n    '',\n  ];\n\n  if (kind === 'reply') {\n    lines.push('WHAT THEY WROTE');\n    lines.push('');\n    lines.push(mStr(r.their_text) || '(no text above the quoted thread)');\n    lines.push('');\n  } else if (mStr(r.hold_reason)) {\n    lines.push('Why it was held:');\n    lines.push('  ' + mStr(r.hold_reason));\n    lines.push('');\n  }\n\n  lines.push('THE DRAFT');\n  lines.push('');\n  if (mStr(r.subject)) lines.push('Subject: ' + mStr(r.subject));\n  lines.push('');\n  lines.push(mStr(r.body));\n  lines.push('');\n  lines.push('Reply with one of these as the first line:');\n  lines.push('');\n  lines.push('  APPROVE ' + code);\n  lines.push('  REJECT ' + code);\n  lines.push('  EDIT ' + code + '   ...then your own text');\n  lines.push('');\n  lines.push('When the code expires nothing is sent and the draft stays pending; the next');\n  lines.push('reminder carries a fresh code.');\n  lines.push('');\n  lines.push('-- Nova Scout (Workflow 7). Sent only to this address; it uses no warm-up slot.');\n\n  return {\n    notify: to !== '' && code !== '',\n    notify_to: to,\n    subject: ('[Nova Scout] still waiting: ' + who + ' -- ' + code).slice(0, 200),\n    text: lines.join('\\n'),\n    record: { code: code },\n  };\n}\n\n// ---------------------------------------------------------------------------\n// Node body\n// ---------------------------------------------------------------------------\n\nreturn { json: reminder($input.item.json) };\n"
+      },
+      "name": "Build Reminder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -440,
+        420
+      ],
+      "notes": "Short: what is waiting, how long the code has left, the draft itself, and the three commands."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "remind",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Remind?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -220,
+        420
+      ],
+      "notes": "Only with an operator address in `settings`."
+    },
+    {
+      "parameters": {
+        "fromEmail": "\"Abdullah Amir\" <abdullah@amitrixlabs.com>",
+        "toEmail": "={{ $json.notify_to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "name": "Send Reminder",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        420
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "novascoutSmtp01",
+          "name": "SMTP - outreach mailbox"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "To the operator's own inbox. Sent only to that address, so it uses no warm-up slot."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Record Review Sent / Record Reminder -- one statement for both, so \"the\n-- operator has been told about this code\" can only mean one thing.\n--\n-- Stamps reminded_at, and only once SMTP accepted the message, so one that could\n-- not go out is sent again on the next tick -- the rule the Daily Digest and the\n-- IMAP health alert already follow. An unstamped code reads as \"nobody has been\n-- told\", which Find Due Reminders treats as due at once.\n--\n-- $1 the sender's `record` ({code}); $2 the email node's output (nodemailer's\n--    info, or {error} -- the node continues on error)\nWITH p AS (\n  SELECT $1::jsonb AS d, $2::jsonb AS r\n),\nupd AS (\n  UPDATE reply_approvals a\n     SET reminded_at = now()\n    FROM p\n   WHERE a.code = p.d->>'code'\n     AND a.used_at IS NULL\n     AND p.r->>'error' IS NULL\n     AND jsonb_typeof(p.r->'accepted') = 'array'\n     AND jsonb_array_length(p.r->'accepted') > 0\n  RETURNING a.code, a.reminded_at\n)\nSELECT p.d->>'code'                   AS code,\n       (SELECT count(*) FROM upd)::int AS recorded,\n       p.r->>'error'                  AS error\n  FROM p;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($('Build Reminder').item.json.record), JSON.stringify($json)] }}"
+        }
+      },
+      "name": "Record Reminder",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        220,
+        420
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "The same statement Record Review Sent runs, so 'the operator has been told about this code' can only mean one thing. Stamped only once SMTP accepted the reminder."
+    }
+  ],
+  "connections": {
+    "Every 30 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Find Replies To Answer",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Find Due Reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Replies To Answer": {
+      "main": [
+        [
+          {
+            "node": "Build Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Reply": {
+      "main": [
+        [
+          {
+            "node": "Claude Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Reply": {
+      "main": [
+        [
+          {
+            "node": "Assemble Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Reply": {
+      "main": [
+        [
+          {
+            "node": "Drop Failed Generations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drop Failed Generations": {
+      "main": [
+        [
+          {
+            "node": "Write Reply Draft & Issue Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Reply Draft & Issue Code": {
+      "main": [
+        [
+          {
+            "node": "Build Review Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Review Email": {
+      "main": [
+        [
+          {
+            "node": "Review Email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Review Email?": {
+      "main": [
+        [
+          {
+            "node": "Send Review Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Send Review Email": {
+      "main": [
+        [
+          {
+            "node": "Record Review Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Due Reminders": {
+      "main": [
+        [
+          {
+            "node": "Build Reminder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Reminder": {
+      "main": [
+        [
+          {
+            "node": "Remind?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Remind?": {
+      "main": [
+        [
+          {
+            "node": "Send Reminder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Send Reminder": {
+      "main": [
+        [
+          {
+            "node": "Record Reminder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
