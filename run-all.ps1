@@ -204,6 +204,17 @@ function Invoke-ClaudeTask {
     $psi.StandardOutputEncoding = $Utf8NoBom
     $psi.StandardErrorEncoding = $Utf8NoBom
 
+    # Strip ANTHROPIC_API_KEY for the child: when it's set, claude takes it
+    # over the claude.ai login unconditionally (confirmed via claude's own
+    # stderr warning), which makes a task session depend on that key's
+    # credit balance instead of the login's usage window. Task sessions
+    # should never depend on API billing. .EnvironmentVariables lazily
+    # inherits the current process's environment on first access, so
+    # removing the key here only affects this child, not the parent script.
+    if ($psi.EnvironmentVariables.ContainsKey('ANTHROPIC_API_KEY')) {
+        $psi.EnvironmentVariables.Remove('ANTHROPIC_API_KEY')
+    }
+
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     $proc.Start() | Out-Null
