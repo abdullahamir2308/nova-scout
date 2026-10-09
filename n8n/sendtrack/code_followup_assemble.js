@@ -126,6 +126,9 @@ function followUpFlags() {
   flags = flags.concat(productFlags(core));
   flags = flags.concat(aiFlags(core));
   if (prospectSponsor(core)) flags.push('prospect-sponsor');
+  // Sites and SMOs (2026-10-09): never "CRO websites", "two CROs" or the
+  // prospect called a CRO; Vertex never called a CRO for anyone.
+  flags = flags.concat(siteFlags(core, src.company_type));
   flags = flags.concat(claimFlags(core, src.corpus));
   if (absentAreasNamed(core, src.absent_areas).length) flags.push('ungrounded-area');
   // A follow-up need not name a deployment, but one it names must be this

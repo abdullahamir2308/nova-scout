@@ -206,6 +206,27 @@ assert not _overlap, (
 )
 
 
+def load_trialsites_bands(doc=None):
+    """Section 9, Workflow 3, 'Active trials for a Trialsites lead' -- the bands
+    table, highest band first per component."""
+    doc = doc or _doc()
+    t = re.search(r"\n\| Trialsites component \| At least \| Points \|\r?\n\|[-|:]+\|\r?\n(.*?)(?:\r?\n\r?\n|\Z)",
+                  doc, re.S)
+    assert t, "the 'Trialsites component | At least | Points' table is missing from %s" % MASTER_REF
+    out = {"recent_trials_3yr": [], "trial_count": [], "site_tier": {}}
+    for line in t.group(1).splitlines():
+        comp, least, pts = [c.strip() for c in line.strip().strip("|").split("|")]
+        if comp == "site_tier":
+            out["site_tier"][least] = int(pts)
+        elif comp in out:
+            out[comp].append([int(least), int(pts)])
+        else:
+            raise AssertionError("unknown Trialsites component %r in %s" % (comp, MASTER_REF))
+    for comp in ("recent_trials_3yr", "trial_count"):
+        assert out[comp] == sorted(out[comp], reverse=True), "%s bands must be listed highest first" % comp
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Drift guards against code_evaluate.js
 # ---------------------------------------------------------------------------
@@ -276,6 +297,26 @@ def _assert_evaluate_matches_spec():
         "trials weight drifted: doc says %d, code_score.js says %s"
         % (WEIGHTS["trials"], m.group(1))
     )
+
+    # Section 9, "Active trials for a Trialsites lead": the bands in the doc and
+    # in code_evaluate.js must be the same, and the top bands must add up to the
+    # trials weight -- a site lead can never be worth more than 20 here.
+    ts_doc = load_trialsites_bands(doc=_doc())
+    tm = re.search(r"const TRIALSITES_TRIALS = \{(.*?)\n\};", src, re.S)
+    assert tm, "TRIALSITES_TRIALS not found in code_evaluate.js"
+    ts_js = {
+        "recent_trials_3yr": [[int(a), int(b)] for a, b in re.findall(
+            r"\[(\d+), (\d+)\]", re.search(r"recent_trials_3yr: \[(.*?)\],\n", tm.group(1)).group(1))],
+        "trial_count": [[int(a), int(b)] for a, b in re.findall(
+            r"\[(\d+), (\d+)\]", re.search(r"trial_count: \[(.*?)\],\n", tm.group(1)).group(1))],
+        "site_tier": {k: int(v) for k, v in re.findall(r"([AB]): (\d+)", re.search(r"site_tier: \{(.*?)\}", tm.group(1)).group(1))},
+    }
+    assert ts_js == ts_doc, (
+        "Trialsites trial bands drifted between the Master Ref and code_evaluate.js:\n  doc: %r\n  js:  %r"
+        % (ts_doc, ts_js))
+    top = ts_doc["recent_trials_3yr"][0][1] + ts_doc["trial_count"][0][1] + max(ts_doc["site_tier"].values())
+    assert top == WEIGHTS["trials"], (
+        "the Trialsites bands' maximum is %d, but the trials weight is %d" % (top, WEIGHTS["trials"]))
 
     # Section 12 locks the employee band and Section 9 the enterprise cutoff.
     m = re.search(r"const EMPLOYEE_BAND = \{ min: (\d+), max: (\d+) \};", src)
@@ -350,11 +391,27 @@ SELECT l.id AS lead_id,
        e.chatbot_vendor,
        e.site_quality_notes,
        e.raw_extraction,
+       l.source,
        (b.domain IS NOT NULL) AS blocklisted,
-       b.reason              AS blocklist_reason
+       b.reason              AS blocklist_reason,
+       ts.location_id        AS ts_location_id,
+       ts.site_tier          AS ts_site_tier,
+       ts.trial_count        AS ts_trial_count,
+       ts.recent_trials_3yr  AS ts_recent_trials_3yr,
+       ts.active_recruiting  AS ts_active_recruiting
   FROM leads l
   JOIN enrichments e ON e.lead_id = l.id
   LEFT JOIN blocklist b ON b.domain = l.domain
+  -- A Trialsites lead's strongest location (migration 019; Section 9, Workflow 3,
+  -- "Active trials for a Trialsites lead"). One row at most, so the join cannot
+  -- fan out; a network's locations are never summed.
+  LEFT JOIN LATERAL (
+    SELECT c.location_id, c.site_tier, c.trial_count, c.recent_trials_3yr, c.active_recruiting
+      FROM site_candidates c
+     WHERE c.lead_id = l.id
+     ORDER BY c.recent_trials_3yr DESC, c.site_tier, c.trial_count DESC, c.location_id
+     LIMIT 1
+  ) ts ON true
  WHERE l.status = 'enriched'
  ORDER BY l.id
  LIMIT $1;"""

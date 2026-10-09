@@ -71,11 +71,17 @@ function codesOf(variant) {
   return slash === -1 ? [] : v.slice(slash + 1).split('+')[0].split('.').filter(Boolean);
 }
 
-// The active claims-library rows, as Find Due Follow-Ups aggregated them.
-function libraryRows(raw) {
+// The active claims-library rows, as Find Due Follow-Ups aggregated them, that
+// are written for this lead's kind -- CRO, site or SMO (2026-10-09, migration
+// 019). A row with no company_types predates them and is a CRO line; a lead
+// with no company_type is a CRO, the way Drafting's batch query decides it.
+function libraryRows(raw, companyType) {
+  const kind = ['CRO', 'site', 'SMO'].indexOf(str(companyType)) !== -1 ? str(companyType) : 'CRO';
   const out = [];
   for (const row of Array.isArray(raw) ? raw : []) {
     if (!row || typeof row !== 'object' || !str(row.body)) continue;
+    const types = Array.isArray(row.company_types) && row.company_types.length ? row.company_types.map(str) : ['CRO'];
+    if (types.indexOf(kind) === -1) continue;
     out.push({
       code: str(row.code),
       slot: str(row.slot),
@@ -112,7 +118,7 @@ function lines(rows) {
 // after D2 would say "it answers sponsors" a second time). #2 adds no claim, so
 // it is offered only the asks, and the proof in case it names a deployment.
 function poolsFor(r, n) {
-  const lib = libraryRows(r.library);
+  const lib = libraryRows(r.library, r.company_type);
   const known = lib.map(function (l) { return l.code; });
   const recorded = codesOf(r.first_variant);
   const firstCodes = recorded.filter(function (c) { return known.indexOf(c) !== -1; });
@@ -182,7 +188,7 @@ function prospectRecord(r) {
 // follow-up opens by referring to the first email's angle, which its own pool
 // leaves out, so the checker gets the whole set.
 function checkClaims(r) {
-  const lib = libraryRows(r.library);
+  const lib = libraryRows(r.library, r.company_type);
   const proof = forCountry(lib.filter(function (l) { return l.slot === 'proof'; }), r.country);
   return lib.filter(function (l) { return ['description', 'angle', 'benefit', 'ask'].indexOf(l.slot) !== -1; })
     .concat(proof)
@@ -252,7 +258,13 @@ function followUpRequest(r, item) {
        'Say this is the last note, and restate the offer as the one ask. Add no new claim: added_claim is "".',
        'The body plus the ask is at most ' + FOLLOW_UP_2_MAX + ' words.'];
 
+  const kind = str(r.company_type) || 'CRO';
   const prompt = [
+    kind === 'CRO'
+      ? 'THE PROSPECT is a contract research organisation (CRO).'
+      : 'THE PROSPECT is ' + (kind === 'SMO' ? 'a site management organisation (SMO)' : 'an independent clinical research site') +
+        ', NOT a CRO: its inquiries come from sponsors and from CROs choosing sites. Call its web pages' +
+        ' "your website", never "your site" -- to a research site, "your site" means the clinic.',
     'Country: ' + str(r.country),
     '',
     'THE FIRST EMAIL, sent ' + when + ' with the subject "' + str(r.first_subject) + '". The prospect has not',
@@ -291,6 +303,9 @@ function followUpRequest(r, item) {
       needs_model: true,
       follow_up: n,
       country: r.country,
+      // CRO, site or SMO: which claims were offered, and which wording
+      // Assemble Follow-Up refuses (siteFlags, embedded from code_assemble.js).
+      company_type: r.company_type || 'CRO',
       first_subject: r.first_subject,
       first_body: firstBody,
       first_sent_at: r.first_sent_at,

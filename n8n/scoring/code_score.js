@@ -29,7 +29,13 @@ const totalCount =
     ? resp.totalCount
     : null;
 
-if (totalCount === null) {
+// A lead found through Trialsites (Workflow 1b) takes the trials factor from
+// Trialsites' per-location counts instead (Section 9, Workflow 3, "Active trials
+// for a Trialsites lead"), so the ClinicalTrials.gov answer -- and its failure
+// -- does not decide its score.
+const tsTrials = ev.trialsites_trials || null;
+
+if (totalCount === null && !tsTrials) {
   return {
     json: {
       write: false,
@@ -42,7 +48,7 @@ if (totalCount === null) {
   };
 }
 
-const trials = {
+const trials = tsTrials ? tsTrials : {
   points: totalCount > 0 ? WEIGHT_TRIALS : 0,
   max: WEIGHT_TRIALS,
   basis: totalCount > 0 ? 'confirmed' : 'miss',
@@ -147,14 +153,21 @@ factLines.push(
     ? 'about ' + f.employee_estimate
     : 'not stated')
 );
-factLines.push('Recruiting trials on ClinicalTrials.gov as sponsor: ' + totalCount);
+if (tsTrials) {
+  factLines.push('Trial activity at this site (Trialsites registry aggregate): ' + tsTrials.recent_trials_3yr +
+    ' trials in the last 3 years, ' + tsTrials.trial_count + ' in all, ' + tsTrials.active_recruiting +
+    ' recruiting now, quality tier ' + (tsTrials.site_tier || 'unknown'));
+} else {
+  factLines.push('Recruiting trials on ClinicalTrials.gov as sponsor: ' + totalCount);
+}
 if (f.site_quality_notes) factLines.push('Site notes from extraction: ' + f.site_quality_notes);
 factLines.push('Fit score: ' + fitScore + '/100');
 factLines.push('Score breakdown: ' + breakdown.join(' | '));
 
 const system_prompt = [
   'You write one-paragraph briefing notes for a B2B sales review queue.',
-  'The product being sold is a custom AI chatbot for clinical research organisations:',
+  'The product being sold is a custom AI chatbot for clinical research organisations,',
+  'independent research sites and site management organisations (SMOs):',
   'a $500-1,000 build plus $300/month, with a 48-hour custom demo on the prospect\'s own',
   'knowledge base.',
   '',
@@ -163,7 +176,7 @@ const system_prompt = [
   '- Use ONLY the facts given. Never add a fact that is not listed, including trial names,',
   '  client names, headcounts, or specialisms.',
   '- Name at least two specific facts from the list. A paragraph that would read the same',
-  '  for any CRO is a failure.',
+  '  for any company is a failure.',
   '- If something is unknown, you may say so plainly. Do not guess it.',
   '- State the main reservation as well as the case in favour.',
   '- No greeting, no sign-off, no bullet points, no markdown.',

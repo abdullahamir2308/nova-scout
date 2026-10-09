@@ -440,4 +440,18 @@ t.check('a re-delivered command is not acknowledged twice (recorded false -> not
 t.check('no operator address, no acknowledgement',
   commandAck(Object.assign({}, APPLIED, { notify_to: null })).notify, false);
 
+// --- a site's reply uses site claims only (2026-10-09, migration 019) -------
+const SITE_LIB = LIB.concat([
+  { code: 'D-SITE2', slot: 'description', body: 'an AI assistant for your website that turns study inquiries from sponsors and CROs into qualified leads', countries: null, measured: false, confirmed: true, active: true, capabilities: ['qualifies', 'captures-lead'], company_types: ['site', 'SMO'] },
+  { code: 'PR-SITE', slot: 'proof', body: "It's live at Vertex Clinical Research, a research center in Mexico.", countries: null, measured: false, confirmed: true, active: true, capabilities: [], company_types: ['site', 'SMO'] },
+  { code: 'A-SITE1', slot: 'ask', body: 'Would a 48-hour demo built on your own material be worth a look? One word back is enough.', countries: null, measured: false, confirmed: true, active: true, capabilities: [], company_types: ['site', 'SMO'] },
+]);
+const poolCodes = (b) => Object.keys(b.library_pools).reduce((a, s) => a.concat(b.library_pools[s].map((l) => l.code)), []);
+const croReply = runOnceForAll(REPLY, [{ json: row({ library: SITE_LIB }) }], {}, bakeReply)[0].json;
+t.check('a CRO reply is offered no site line', poolCodes(croReply).filter((c) => /SITE/.test(c)), []);
+const siteReply = runOnceForAll(REPLY, [{ json: row({ library: SITE_LIB, company_type: 'site', country: 'Mexico' }) }], {}, bakeReply)[0].json;
+t.check('a site reply is offered only site lines, and PR-SITE even in Mexico', [poolCodes(siteReply).sort(), siteReply.company_type],
+  [['A-SITE1', 'D-SITE2', 'PR-SITE'], 'site']);
+t.check('the site reply prompt says they are a site, not a CRO', /THEY ARE an independent clinical research site, NOT a CRO/.test(siteReply.prompt), true);
+
 t.done();

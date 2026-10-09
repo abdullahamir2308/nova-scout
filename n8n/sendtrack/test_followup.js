@@ -336,4 +336,24 @@ G = gateOf(assemble({}, UNCONFIRMED));
 t.check('a follow-up using an unconfirmed line is held (the tag and the gate both say so)',
   [G.needs_check, G.payload.draft.hold_reason], [false, 'rule-tags: unconfirmed-claim; unconfirmed-claim: BEN-DECK']);
 
+// --- claims by company type (2026-10-09, migration 019) ---------------------
+const SITE_ROWS = [
+  row('ANG-SITE-SPEED', 'angle', 'CROs choosing sites notice how quickly you respond.', null, { company_types: ['site', 'SMO'] }),
+  row('BEN-SITE-DECK', 'benefit', 'It sends your capabilities deck the moment a sponsor or CRO asks for it.', ['deck'], { company_types: ['site', 'SMO'] }),
+  row('PR-SITE', 'proof', "It's live at Vertex Clinical Research, a research center in Mexico.", null, { company_types: ['site', 'SMO'] }),
+  row('A-SITE1', 'ask', 'Would a 48-hour demo built on your own material be worth a look? One word back is enough.', null, { company_types: ['site', 'SMO'] }),
+];
+const MIXED = LIBRARY.concat(SITE_ROWS);
+const allCodes = (b) => Object.keys(b.json.library_pools).reduce((a, s) => a.concat(codes(b.json.library_pools[s])), []);
+const croFu = build([due({ library: MIXED })])[0];
+t.check('a CRO lead\'s follow-up is offered no site line', allCodes(croFu).filter((c) => /SITE/.test(c)), []);
+const siteFu = build([due({ library: MIXED, company_type: 'site', country: 'India',
+  first_variant: 'role-inbox/ANG-SITE-SPEED.PR-SITE.A-SITE1' })])[0];
+t.check('a site lead\'s follow-up is offered only site lines', allCodes(siteFu).every((c) => /SITE/.test(c)), true);
+t.check('... carries its company type to Assemble Follow-Up', siteFu.json.company_type, 'site');
+t.check('... and tells the model it is a site, not a CRO', /THE PROSPECT is an independent clinical research site, NOT a CRO/.test(siteFu.json.prompt), true);
+t.check('... whose web pages are "your website", never "your site"', /"your website", never "your site"/.test(siteFu.json.prompt), true);
+t.check('the checker sees the site proof, never PR-BOTH, for a site',
+  codes(siteFu.json.check_claims).filter((c) => /^PR-/.test(c)), ['PR-SITE']);
+
 t.done();

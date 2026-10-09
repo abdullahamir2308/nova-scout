@@ -699,6 +699,49 @@ t.check('an empty library holds back a groundable lead', assess(withLib({}, []),
 t.check('but not a low-context one -- its note needs no library', assess(lead({ city: 'Warsaw', library: [] }), ctgov(0, [])).ok, true);
 t.check('a complete library lets the lead through', assess(withLib(), ctgov(0, [])).ok, true);
 
+// --- claims by company type: CRO, site, SMO (2026-10-09, migration 019) ------
+
+const SITE = ['site', 'SMO'];
+const SITE_LIB = LIB.map(function (r) { return Object.assign({}, r, { company_types: ['CRO'] }); }).concat([
+  row('A-SITE1', 'ask', 'Would a 48-hour demo built on your own material be worth a look? One word back is enough.', { company_types: SITE }),
+  row('ANG-SITE-SPEED', 'angle', 'CROs choosing sites notice how quickly you respond.', { company_types: SITE }),
+  row('BEN-SITE-247', 'benefit', 'It answers sponsors and CROs from your own website, in real time, at any hour.', { capabilities: ['answers'], company_types: SITE }),
+  row('BEN-SMO-NETWORK', 'benefit', 'Investigators who want to join your site network are captured.', { capabilities: ['captures-lead'], company_types: ['SMO'] }),
+  row('D-SITE2', 'description', 'an AI assistant for your website that turns study inquiries from sponsors and CROs into qualified leads',
+    { capabilities: ['qualifies', 'captures-lead'], company_types: SITE }),
+  row('PR-SITE', 'proof', 'It\'s live at Vertex Clinical Research, a research center in Mexico.', { company_types: SITE }),
+]);
+function codesFor(type, country, library) {
+  const a = assess(withLib({ company_type: type, country: country || 'Poland' }, library || SITE_LIB), ctgov(0, []));
+  return Object.keys(a.library_pools).sort().map(function (s) { return s + ':' + a.library_pools[s].map(function (l) { return l.code; }).join(','); });
+}
+t.check('a CRO lead is offered only CRO lines', codesFor('CRO'),
+  ['angle:ANG-HOURS', 'ask:A1', 'benefit:BEN-247', 'description:D1', 'proof:PR-TR']);
+t.check('a site lead is offered only site lines, and the site proof wherever it is',
+  codesFor('site', 'India'), ['angle:ANG-SITE-SPEED', 'ask:A-SITE1', 'benefit:BEN-SITE-247', 'description:D-SITE2', 'proof:PR-SITE']);
+t.check('a site lead in Mexico still gets PR-SITE, never PR-MX or the "two CROs" PR-BOTH',
+  codesFor('site', 'Mexico').filter(function (s) { return s.indexOf('proof:') === 0; }), ['proof:PR-SITE']);
+t.check('an SMO lead also gets the SMO-only network benefit', codesFor('SMO').filter(function (s) { return s.indexOf('benefit:') === 0; }),
+  ['benefit:BEN-SITE-247,BEN-SMO-NETWORK']);
+t.check('a row with no company_types (written before migration 019) is a CRO line', codesFor('CRO', 'Poland', LIB),
+  ['angle:ANG-HOURS', 'ask:A1', 'benefit:BEN-247', 'description:D1', 'proof:PR-TR']);
+t.check('an unknown company type is treated as a CRO', assess(withLib({ company_type: 'hospital' }, SITE_LIB), ctgov(0, [])).company_type, 'CRO');
+const SITE_HELD = assess(withLib({ company_type: 'site' }, LIB), ctgov(0, []));
+t.check('a site lead with no site lines active is held back (the batch query normally skips it first)',
+  [SITE_HELD.ok, /no active description, angle, benefit, proof, ask line/.test(SITE_HELD.skip_reason)], [false, true]);
+const SITE_PROMPT = assess(withLib({ company_type: 'site' }, SITE_LIB), ctgov(0, [])).prompt;
+t.check('the site prompt says what the prospect is, and what never to call it',
+  [/THE PROSPECT is an independent clinical research site, NOT a CRO/.test(SITE_PROMPT), /never write "CRO websites"/.test(SITE_PROMPT)], [true, true]);
+t.check('the CRO prompt says CRO', /THE PROSPECT is a contract research organisation/.test(assess(withLib({ company_type: 'CRO' }, SITE_LIB), ctgov(0, [])).prompt), true);
+// 2026-10-09 dry run: "Your site lists ..." to a research site reads as the clinic.
+t.check('a site or SMO is told its web pages are "your website", never "your site"',
+  ['site', 'SMO'].map(function (k) { return /"your website", never "your site"/.test(assess(withLib({ company_type: k }, SITE_LIB), ctgov(0, [])).prompt); }),
+  [true, true]);
+t.check('... and a CRO is not (its prompt is unchanged)',
+  /"your website", never "your site"/.test(assess(withLib({ company_type: 'CRO' }, SITE_LIB), ctgov(0, [])).prompt), false);
+t.check('the per-type note is in the user message, never the cached system prompt',
+  assess(withLib({ company_type: 'site' }, SITE_LIB), ctgov(0, [])).request.system[0].text, SYSTEM_PROMPT);
+
 // --- the prompt and the request ------------------------------------------------
 
 const P = assess(withLib({ country: 'Poland' }), ctgov(0, []));

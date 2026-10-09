@@ -18,10 +18,28 @@ const F = extractFunctions(
     'WEIGHTS', 'TARGET_GEOGRAPHIES', 'EXTENDED_GEOGRAPHY_POINTS', 'EXCLUDED_JURISDICTIONS',
     'EXCLUDED_ALIASES', 'excludedJurisdiction', 'canonicalAreas', 'inTargetGeography',
     'scoreGeography', 'scoreFounder', 'scoreOncology', 'scoreEmployees', 'scoreSite',
+    'scoreTrialsites', 'TRIALSITES_TRIALS',
   ]
 );
 
 const t = runner('Workflow 3 weighted factors');
+
+// --- active trials for a Trialsites lead (2026-10-09) ---------------------
+const ts = (over) => Object.assign({ ts_location_id: 1, ts_site_tier: 'A', ts_trial_count: 48, ts_recent_trials_3yr: 20, ts_active_recruiting: 9 }, over || {});
+t.check('no Trialsites record -> null (the ClinicalTrials.gov lookup decides, as before)',
+  F.scoreTrialsites({ ts_location_id: null }), null);
+t.check('a busy tier-A site: 10 recent + 4 volume (48) + 5 tier = 19', F.scoreTrialsites(ts()).points, 19);
+t.check('the top of every band is exactly the trials weight (20)',
+  F.scoreTrialsites(ts({ ts_trial_count: 50, ts_recent_trials_3yr: 10 })).points, F.WEIGHTS.trials);
+t.check('the floor: tier B, one trial ever, nothing in 3 years = 4',
+  F.scoreTrialsites(ts({ ts_site_tier: 'B', ts_trial_count: 1, ts_recent_trials_3yr: 0 })).points, 4);
+t.check('band edges: 9 recent -> 7, 4 recent -> 4, 1 recent -> 2',
+  [9, 4, 1].map((r) => F.scoreTrialsites(ts({ ts_recent_trials_3yr: r, ts_trial_count: 0, ts_site_tier: 'X' })).points), [7, 4, 2]);
+t.check('a Trialsites factor is confirmed, sourced and explains itself',
+  (() => { const f = F.scoreTrialsites(ts()); return [f.basis, f.source, /20 trials in the last 3 years/.test(f.detail)]; })(),
+  ['confirmed', 'trialsites', true]);
+t.check('the bands never exceed the weight even if the table grew',
+  F.TRIALSITES_TRIALS.recent_trials_3yr[0][1] + F.TRIALSITES_TRIALS.trial_count[0][1] + F.TRIALSITES_TRIALS.site_tier.A, F.WEIGHTS.trials);
 
 // --- the weights themselves ----------------------------------------------
 const WEIGHT_TRIALS = 20; // lives in code_score.js; build_workflow.py guards both

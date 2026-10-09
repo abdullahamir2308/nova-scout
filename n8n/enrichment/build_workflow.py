@@ -68,6 +68,17 @@ def load_therapeutic_areas(path=None):
 
 THERAPEUTIC_AREAS = load_therapeutic_areas()
 
+# Section 9, Workflow 3's disqualifier "Not a CRO, site or SMO" names the closed
+# list; parse it so the schema, the normaliser and the doc cannot drift apart.
+_ct = re.search(r"classifies `company_type` as exactly one of ((?:`[A-Za-z]+`(?:, | or )?)+)",
+                io.open(MASTER_REF, encoding="utf-8").read())
+assert _ct, "Section 9's 'classifies `company_type` as exactly one of ...' sentence not found"
+COMPANY_TYPES = re.findall(r"`([A-Za-z]+)`", _ct.group(1))
+assert COMPANY_TYPES == ["CRO", "site", "SMO", "other", "unclear"], COMPANY_TYPES
+_norm_ct = re.search(r"const COMPANY_TYPES = \[(.*?)\];", js("code_normalise.js"), re.S)
+assert _norm_ct and re.findall(r"'([^']*)'", _norm_ct.group(1)) == COMPANY_TYPES, \
+    "code_normalise.js COMPANY_TYPES differs from Section 9's list"
+
 # The extraction schema. Passed to Ollama as `format`, which constrains
 # generation with a grammar -- this is what makes the output parseable, not
 # prompt discipline. Section 3: "always use Ollama's format: json with an
@@ -75,8 +86,10 @@ THERAPEUTIC_AREAS = load_therapeutic_areas()
 SCHEMA = {
     "type": "object",
     "properties": {
-        "is_cro": {"type": "boolean"},
-        "company_type": {"type": "string"},
+        # Since 2026-10-09 a closed enum (Section 9, Workflow 3: "not a CRO, site
+        # or SMO"), so the grammar enforces it the way it does the taxonomy. It
+        # replaces the old `is_cro` boolean, which could not say "research site".
+        "company_type": {"type": "string", "enum": COMPANY_TYPES},
         "therapeutic_areas": {
             "type": "array",
             "items": {"type": "string", "enum": THERAPEUTIC_AREAS},
@@ -89,7 +102,7 @@ SCHEMA = {
         "site_quality_notes": {"type": "string"},
     },
     "required": [
-        "is_cro", "company_type", "therapeutic_areas", "phases",
+        "company_type", "therapeutic_areas", "phases",
         "founder_name", "founder_title", "employee_estimate", "city",
         "site_quality_notes",
     ],

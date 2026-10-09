@@ -48,6 +48,18 @@ function cleanStr(v, max) {
   return s.slice(0, max || 500);
 }
 
+// company_type, a closed list since 2026-10-09 (Master Ref Section 9, Workflow 3:
+// "Not a CRO, site or SMO"). The schema enum constrains generation; this is the
+// second line of defence for the fenced-block rescue path, exactly as for the
+// taxonomy below. Anything else is null -- and null is never evidence, so it
+// can never disqualify a lead.
+const COMPANY_TYPES = ['CRO', 'site', 'SMO', 'other', 'unclear'];
+function companyType(v) {
+  const s = v === null || v === undefined ? '' : String(v).trim();
+  for (const t of COMPANY_TYPES) if (t.toLowerCase() === s.toLowerCase()) return t;
+  return null;
+}
+
 // The LOCKED therapeutic-area taxonomy (Master Ref Section 9, Workflow 3).
 // NovaScout_MasterRef.md is the source of truth; build_workflow.py parses the
 // list out of the spec, ships it as an `enum` in the Ollama JSON schema, and
@@ -229,8 +241,10 @@ return {
         domain: src.domain,
         // Fields with no column of their own in Section 8, kept here because
         // Workflow 3 disqualifiers and Workflow 4 grounding need them.
-        is_cro: typeof llm.is_cro === 'boolean' ? llm.is_cro : null,
-        company_type: cleanStr(llm.company_type, 120),
+        // is_cro is no longer asked for (2026-10-09); company_type replaces it.
+        // Rows enriched before then keep their is_cro, and Scoring reads it for
+        // them alone (Section 9, Workflow 3).
+        company_type: companyType(llm.company_type),
         founder_title: cleanStr(llm.founder_title, 200),
         city: cleanStr(llm.city, 120),
         // Non-empty means something got past the schema enum -- expected to be

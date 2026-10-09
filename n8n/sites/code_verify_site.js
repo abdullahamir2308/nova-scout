@@ -1,4 +1,4 @@
-// Verify Website -- n8n Code node (Run Once for Each Item).
+// Verify Website -- n8n Code node (Run Once for All Items).
 //
 // Workflow 1b, website lookup. Claude (with web search) has proposed a website
 // for one Trialsites candidate, or said it found none. This node decides,
@@ -8,9 +8,10 @@
 // guess a domain."
 //
 //   1. The answer must be the schema's JSON and name a URL.
-//   2. The URL's host must be one the web search actually returned. A model
-//      that writes a plausible domain from memory is guessing, and this is the
-//      one check that catches it without fetching anything.
+//   2. Whether the URL's host appeared in the web search results is RECORDED
+//      (`from_search`), not enforced: the fetch in 4 is the confirmation, and a
+//      site that names this organisation in this city is the right site however
+//      the model learned its address (see hostRejection).
 //   3. Not a directory, a social network or a registry, not an institutional
 //      domain (.edu, .gov, .ac.xx, .nhs.uk, ...) -- the brief excludes
 //      hospitals, universities and government bodies -- and not a sanctioned
@@ -81,7 +82,12 @@ const EXONYMS = {
   'washington d c': ['washington dc', 'washington'], 'sao paulo': ['sao paulo'],
 };
 
-const FETCH_TIMEOUT_MS = 15000;
+// Each fetch gives up after 10 s, and at most CONCURRENCY candidates are read
+// at once (Section 3's parallelization principle: I/O concurrent, bounded).
+// Worst case per candidate is five homepage rungs plus four further pages,
+// ~90 s, so a batch of 10 finishes well inside the task runner's 300 s.
+const FETCH_TIMEOUT_MS = 10000;
+const CONCURRENCY = 4;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -259,12 +265,11 @@ function htmlToText(html) {
 }
 
 // ---------------------------------------------------------------------------
-// Node body
+// The decision for one candidate. `helpers` is n8n's this.helpers, passed in
+// because a nested function cannot reach `this`.
 // ---------------------------------------------------------------------------
 
-const helpers = this.helpers;
-
-async function fetchText(url) {
+async function fetchText(helpers, url) {
   for (const insecure of [false, true]) {
     try {
       const res = await helpers.httpRequest({
@@ -283,78 +288,118 @@ async function fetchText(url) {
   return { ok: false, detail: 'unreachable' };
 }
 
-const cand = $('Build Lookup Request').item.json;
-const resp = $input.item.json;
-const spend = cost(resp && resp.usage);
-const base = {
-  location_id: cand.location_id,
-  canonical_name: cand.canonical_name,
-  city: cand.city,
-  country: cand.country,
-  model: PRICES.model,
-};
-
-function out(outcome, detail, extra) {
-  return { json: Object.assign({}, base, spend, { outcome: outcome, detail: str(detail).slice(0, 500) }, extra || {}) };
-}
-
-const read = readResponse(resp);
-if (!read.ok) return out('call-failed', read.detail);
-
-const proposed = str(read.answer.url);
-const host = hostOf(proposed);
-const early = hostRejection(host);
-const fromSearch = read.result_hosts.some(function (h) { return sameSite(host, h); });
-if (early) return out(early.outcome, early.detail, { proposed_url: proposed || null, from_search: fromSearch });
-
-// The homepage, through the same rungs Workflow 2 uses (the URL as proposed,
-// then https and http, with and without www.), then the model's evidence page
-// and up to three contact or location pages linked from the homepage on the
-// same site -- the city is usually on one of those, not on the homepage.
+// Contact and location pages linked from the homepage -- the city is usually
+// on one of those, not on the homepage itself.
 const CONTACT_LINK = /(contact|contacto|contato|kontakt|kapcsolat|iletisim|location|locations|ubicacion|localizacao|sedes|unidades|about|nosotros|quienes|sobre|o-nas|impressum|find-us|visit)/i;
-let text = ' ';
-const fetched = [];
-const tried = [];
-let homeHtml = null;
-for (const u of [proposed, 'https://' + host + '/', 'https://www.' + host + '/', 'http://' + host + '/', 'http://www.' + host + '/']) {
-  if (!u || tried.indexOf(u) !== -1) continue;
-  tried.push(u);
-  const f = await fetchText(u);
-  fetched.push(u + (f.ok ? ' ok' : ' ' + f.detail));
-  if (f.ok) { homeHtml = f.html; text += words(f.text) + ' '; break; }
+
+async function verify(helpers, cand, resp) {
+  const spend = cost(resp && resp.usage);
+  const base = {
+    location_id: cand.location_id,
+    canonical_name: cand.canonical_name,
+    city: cand.city,
+    country: cand.country,
+    model: PRICES.model,
+  };
+  function out(outcome, detail, extra) {
+    return Object.assign({}, base, spend, { outcome: outcome, detail: str(detail).slice(0, 500) }, extra || {});
+  }
+
+  const read = readResponse(resp);
+  if (!read.ok) return out('call-failed', read.detail);
+
+  const proposed = str(read.answer.url);
+  const host = hostOf(proposed);
+  const fromSearch = read.result_hosts.some(function (h) { return sameSite(host, h); });
+  const early = hostRejection(host);
+  if (early) return out(early.outcome, early.detail, { proposed_url: proposed || null, from_search: fromSearch });
+
+  // The homepage, through the same rungs Workflow 2 uses (the URL as proposed,
+  // then https and http, with and without www.), then the model's evidence page
+  // and up to three contact or location pages on the same site.
+  let text = ' ';
+  const fetched = [];
+  const tried = [];
+  let homeHtml = null;
+  for (const u of [proposed, 'https://' + host + '/', 'https://www.' + host + '/', 'http://' + host + '/', 'http://www.' + host + '/']) {
+    if (!u || tried.indexOf(u) !== -1) continue;
+    tried.push(u);
+    const f = await fetchText(helpers, u);
+    fetched.push(u + (f.ok ? ' ok' : ' ' + f.detail));
+    if (f.ok) { homeHtml = f.html; text += words(f.text) + ' '; break; }
+  }
+  if (homeHtml === null) {
+    return out('not-confirmed', 'could not read the site: ' + fetched.join('; '), { proposed_url: proposed, from_search: fromSearch });
+  }
+  const extra = [];
+  const evidence = str(read.answer.evidence_url);
+  if (evidence && sameSite(hostOf(evidence), host) && tried.indexOf(evidence) === -1) extra.push(evidence);
+  const linkRe = /href\s*=\s*["']([^"'#]+)["']/gi;
+  let m;
+  while ((m = linkRe.exec(homeHtml)) && extra.length < 4) {
+    let href = m[1].trim();
+    if (/^(mailto|tel|javascript):/i.test(href)) continue;
+    if (href.indexOf('//') === 0) href = 'https:' + href;
+    else if (href.charAt(0) === '/') href = 'https://' + host + href;
+    else if (!/^https?:/i.test(href)) continue;
+    if (!sameSite(hostOf(href), host) || !CONTACT_LINK.test(href.replace(/^https?:\/\/[^/]+/i, ''))) continue;
+    if (extra.indexOf(href) === -1 && tried.indexOf(href) === -1) extra.push(href);
+  }
+  for (const u of extra) {
+    const f = await fetchText(helpers, u);
+    fetched.push(u + (f.ok ? ' ok' : ' ' + f.detail));
+    if (f.ok) text += words(f.text) + ' ';
+  }
+  const nameOk = nameAppears(cand.canonical_name, cand.city, text);
+  const cityOk = cityAppears(cand.city, text);
+  if (!nameOk || !cityOk) {
+    return out('not-confirmed',
+      (nameOk ? '' : 'name not on the site; ') + (cityOk ? '' : 'city "' + str(cand.city) + '" not on the site; ') +
+      'read ' + fetched.join('; '), { proposed_url: proposed, from_search: fromSearch });
+  }
+  return out('resolved', 'name and city found on ' + fetched.join('; '), {
+    proposed_url: proposed,
+    from_search: fromSearch,
+    domain: host,
+    website_url: 'https://' + host + '/',
+  });
 }
-if (homeHtml === null) {
-  return out('not-confirmed', 'could not read the site: ' + fetched.join('; '), { proposed_url: proposed, from_search: fromSearch });
+
+// Run `work` over `list` with at most `n` in flight; results keep list order.
+async function pool(list, n, work) {
+  const results = new Array(list.length);
+  let next = 0;
+  async function lane() {
+    while (next < list.length) {
+      const k = next++;
+      results[k] = await work(list[k], k);
+    }
+  }
+  const lanes = [];
+  for (let i = 0; i < Math.min(n, list.length); i++) lanes.push(lane());
+  await Promise.all(lanes);
+  return results;
 }
-const extra = [];
-const evidence = str(read.answer.evidence_url);
-if (evidence && sameSite(hostOf(evidence), host) && tried.indexOf(evidence) === -1) extra.push(evidence);
-const linkRe = /href\s*=\s*["']([^"'#]+)["']/gi;
-let m;
-while ((m = linkRe.exec(homeHtml)) && extra.length < 4) {
-  let href = m[1].trim();
-  if (/^(mailto|tel|javascript):/i.test(href)) continue;
-  if (href.indexOf('//') === 0) href = 'https:' + href;
-  else if (href.charAt(0) === '/') href = 'https://' + host + href;
-  else if (!/^https?:/i.test(href)) continue;
-  if (!sameSite(hostOf(href), host) || !CONTACT_LINK.test(href.replace(/^https?:\/\/[^/]+/i, ''))) continue;
-  if (extra.indexOf(href) === -1 && tried.indexOf(href) === -1) extra.push(href);
+
+// ---------------------------------------------------------------------------
+// Node body
+// ---------------------------------------------------------------------------
+
+const nodeHelpers = this.helpers;
+const responses = $input.all();
+const requests = $('Build Lookup Request').all();
+
+// The HTTP node emits exactly one item per request, in order (onError:
+// continueRegularOutput turns a failed call into an item too). If the counts
+// ever differ, pairing by position would attach one candidate's answer to
+// another candidate's name -- so stop rather than guess.
+if (responses.length !== requests.length) {
+  throw new Error('Verify Website: ' + responses.length + ' responses for ' + requests.length + ' lookups; refusing to pair them');
 }
-for (const u of extra) {
-  const f = await fetchText(u);
-  fetched.push(u + (f.ok ? ' ok' : ' ' + f.detail));
-  if (f.ok) text += words(f.text) + ' ';
-}
-const nameOk = nameAppears(cand.canonical_name, cand.city, text);
-const cityOk = cityAppears(cand.city, text);
-if (!nameOk || !cityOk) {
-  return out('not-confirmed',
-    (nameOk ? '' : 'name not on the site; ') + (cityOk ? '' : 'city "' + str(cand.city) + '" not on the site; ') +
-    'read ' + fetched.join('; '), { proposed_url: proposed, from_search: fromSearch });
-}
-return out('resolved', 'name and city found on ' + fetched.join('; '), {
-  proposed_url: proposed,
-  from_search: fromSearch,
-  domain: host,
-  website_url: 'https://' + host + '/',
+const pairs = responses.map(function (r, k) {
+  const p = r.pairedItem;
+  const idx = p && typeof p === 'object' && Number.isInteger(p.item) ? p.item : (Number.isInteger(p) ? p : k);
+  return { cand: requests[idx].json, resp: r.json };
 });
+const results = await pool(pairs, CONCURRENCY, function (pr) { return verify(nodeHelpers, pr.cand, pr.resp); });
+return results.map(function (j, k) { return { json: j, pairedItem: { item: k } }; });

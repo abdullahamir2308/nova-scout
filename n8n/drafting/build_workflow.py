@@ -791,9 +791,10 @@ def _assert_emitted_upstream(js_src, fields, node_name):
 _adjectives = ", ".join(SKILL_BANNED)
 
 SYSTEM_PROMPT = "\n".join([
-    "You write one cold first-touch email and one LinkedIn DM to a small contract",
-    "research organisation (CRO), sent by " + SENDER_NAME + ". A person reviews both before",
-    "anything is sent.",
+    "You write one cold first-touch email and one LinkedIn DM to a small clinical research",
+    "business -- a contract research organisation (CRO), an independent research site or a",
+    "site management organisation (SMO); each message says which -- sent by " + SENDER_NAME + ".",
+    "A person reviews both before anything is sent.",
     "",
     "Each message gives you two lists. VERIFIED FACTS are the only facts about the",
     "prospect that exist. APPROVED CLAIMS are the only things you may say about what we",
@@ -810,7 +811,8 @@ SYSTEM_PROMPT = "\n".join([
     "- Everything not in the facts does not exist: no headcount, no clients, no growth,",
     "  no plans, no praise of their website, no trial you were not given.",
     "- Never describe them as sponsoring anything. In these emails \"sponsor\" means the",
-    "  biotech, pharma, device or academic company that hires a CRO -- their client.",
+    "  biotech, pharma, device or academic company that runs a trial and hires a CRO or a",
+    "  research site -- their client.",
     "  Say \"running\", \"recruiting\" or \"your trial\".",
     "- A trial is on ClinicalTrials.gov, not on their site: never write \"your site",
     "  lists\" about a trial. Name one trial at most. Their site is where the",
@@ -853,7 +855,8 @@ SYSTEM_PROMPT = "\n".join([
     "- claiming to identify anonymous website visitors",
     "- naming any CRM, tool or integration",
     "- supported languages",
-    "- any count of clients beyond the two named deployments",
+    "- any count of clients beyond the deployments the proof line names",
+    "- calling Vertex Clinical Research a CRO -- it is a clinical research center",
     "- saying it books calls or fills a calendar -- it sends the sponsor your booking",
     "  link, and the sponsor books",
     "- saying it answers from SOPs or from documents -- it answers from their website",
@@ -940,10 +943,12 @@ SELECT l.id            AS lead_id,
        e.site_quality_notes,
        e.raw_extraction->>'city'          AS city,
        e.raw_extraction->>'founder_title' AS founder_title,
+       ct.company_type,
        (SELECT coalesce(jsonb_agg(jsonb_build_object(
                   'code', k.code, 'slot', k.slot, 'body', btrim(k.body),
                   'countries', to_jsonb(k.countries), 'measured', k.measured,
-                  'confirmed', k.confirmed, 'capabilities', to_jsonb(k.capabilities))
+                  'confirmed', k.confirmed, 'capabilities', to_jsonb(k.capabilities),
+                  'company_types', to_jsonb(k.company_types))
                   ORDER BY k.code), '[]'::jsonb)
           FROM claims_library k
          WHERE k.active)                  AS library,
@@ -955,7 +960,18 @@ SELECT l.id            AS lead_id,
   JOIN scores      s ON s.lead_id = l.id
   JOIN contacts    c ON c.lead_id = l.id
   JOIN enrichments e ON e.lead_id = l.id
+  -- CRO, site or SMO (2026-10-09, Workflow 1b): lead_company_type() (migration
+  -- 019) is the one definition -- enrichment's company_type when it is one of
+  -- the three, otherwise the source. Assess Grounding, the claims and Assemble
+  -- Drafts' site rules all read it from here.
+  CROSS JOIN LATERAL (SELECT lead_company_type(e.raw_extraction, l.source) AS company_type) ct
  WHERE l.status = 'contact_found'
+   -- A lead whose kind has no active description line cannot be composed
+   -- (the site and SMO lines start inactive, migration 019). It is skipped
+   -- HERE, so it waits at contact_found without taking a place in the batch --
+   -- ten such leads would otherwise starve every CRO lead behind them.
+   AND EXISTS (SELECT 1 FROM claims_library k
+                WHERE k.active AND k.slot = 'description' AND ct.company_type = ANY (k.company_types))
  ORDER BY l.id
  LIMIT $1;"""
 

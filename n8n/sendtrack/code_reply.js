@@ -64,10 +64,16 @@ function rWords(v) {
 
 // --- the claims this reply may draw on ---------------------------------------
 
-function replyLibrary(raw) {
+// Only the lines written for this lead's kind -- CRO, site or SMO (2026-10-09,
+// migration 019): a site's reply never borrows a CRO line. A row with no
+// company_types predates them and is a CRO line.
+function replyLibrary(raw, companyType) {
+  const kind = ['CRO', 'site', 'SMO'].indexOf(rStr(companyType)) !== -1 ? rStr(companyType) : 'CRO';
   const out = [];
   for (const row of Array.isArray(raw) ? raw : []) {
     if (!row || typeof row !== 'object') continue;
+    const types = Array.isArray(row.company_types) && row.company_types.length ? row.company_types.map(rStr) : ['CRO'];
+    if (types.indexOf(kind) === -1) continue;
     out.push({
       code: rStr(row.code),
       slot: rStr(row.slot),
@@ -105,7 +111,7 @@ function replyLines(rows) {
 // Everything a reply may say about the product, and the one link it may carry.
 // Only active lines with text: an empty or retired row offers nothing.
 function replyPools(r) {
-  const lib = replyLibrary(r.library).filter(function (l) { return l.active && l.body; });
+  const lib = replyLibrary(r.library, r.company_type).filter(function (l) { return l.active && l.body; });
   const bySlot = function (slot) { return lib.filter(function (l) { return l.slot === slot; }); };
   return {
     description: replyLines(bySlot('description')),
@@ -191,7 +197,13 @@ function replyRequest(r, item) {
   const open = topicsIn(theirs);
   const deferrals = open.map(function (t) { return '  - ' + t + ': ' + topicLabel(t); }).join('\n');
 
+  const kind = rStr(r.company_type) || 'CRO';
   const prompt = [
+    kind === 'CRO'
+      ? 'THEY ARE a contract research organisation (CRO).'
+      : 'THEY ARE ' + (kind === 'SMO' ? 'a site management organisation (SMO)' : 'an independent clinical research site') +
+        ', NOT a CRO: their inquiries come from sponsors and from CROs choosing sites.',
+    '',
     'THEIR MESSAGE, which arrived ' + rStr(r.received_at) + ' from ' + rStr(r.from_addr) +
       ' with the subject "' + rStr(r.subject) + '". This is what you are answering:',
     '---',
@@ -253,6 +265,9 @@ function replyRequest(r, item) {
       lead_id: r.lead_id,
       inbound_message_id: r.inbound_message_id,
       country: r.country,
+      // CRO, site or SMO: which claims were offered, and which wording
+      // Assemble Reply refuses (2026-10-09).
+      company_type: r.company_type || 'CRO',
       company_name: r.company_name,
       domain: r.domain,
       from_addr: r.from_addr,

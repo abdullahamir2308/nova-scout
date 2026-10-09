@@ -30,9 +30,19 @@ const ADDRESS = /^[^\s@<>(),;:"']+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
 const LABEL = { 'reply': 'REPLY', 'opt-out': 'OPT-OUT', 'bounce': 'BOUNCE' };
 const SIGNAL_LABEL = { 'positive': 'POSITIVE', 'neutral': 'NEUTRAL' };
 
-const ASSETS = [
-  { label: 'One-pager', url: 'https://raw.githubusercontent.com/abdullahamir2308/nova-scout/main/nova-one-pager.docx' },
-];
+// Which one-pager depends on who replied (2026-10-09): a CRO gets the CRO
+// one-pager, a research site or an SMO the site version -- both hosted the same
+// way, from the repo's main branch. Record Inbound supplies company_type (the
+// same CRO / site / SMO definition Drafting uses); anything else is a CRO.
+const ONE_PAGER_BASE = 'https://raw.githubusercontent.com/abdullahamir2308/nova-scout/main/';
+const ASSETS_BY_TYPE = {
+  CRO: [{ label: 'One-pager', url: ONE_PAGER_BASE + 'nova-one-pager.docx' }],
+  site: [{ label: 'One-pager (research sites)', url: ONE_PAGER_BASE + 'nova-one-pager-sites.docx' }],
+  SMO: [{ label: 'One-pager (research sites)', url: ONE_PAGER_BASE + 'nova-one-pager-sites.docx' }],
+};
+function assetsFor(r) {
+  return ASSETS_BY_TYPE[str(r.company_type)] || ASSETS_BY_TYPE.CRO;
+}
 
 function str(v) {
   return v === null || v === undefined ? '' : String(v).trim();
@@ -76,7 +86,7 @@ function notification(r) {
   lines.push(str(r.body_excerpt) || '(no text above the quoted thread)');
   lines.push('');
   lines.push('Assets:');
-  ASSETS.forEach(function (a) { lines.push('  ' + a.label + ': ' + a.url); });
+  assetsFor(r).forEach(function (a) { lines.push('  ' + a.label + ': ' + a.url); });
   return {
     notify: Boolean(r.notify) && to !== '',
     notify_to: to,

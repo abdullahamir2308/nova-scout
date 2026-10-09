@@ -152,6 +152,11 @@ function replyFlags() {
   // lead's, so only proof-geo applies (the follow-ups make the same cut).
   flags = flags.concat(proofFlags(core, pools.proof).filter(function (f) { return f === 'proof-geo'; }));
   if (REPLY_PROOF_REFUSED.some(function (re) { return re.test(core); })) flags.push('proof-refused');
+  // Sites and SMOs (2026-10-09): a site's reply never says "CRO websites" or
+  // calls them a CRO. ("Two CROs" and Vertex-as-CRO are proof-refused above.)
+  flags = flags.concat(siteFlags(core, src.company_type).filter(function (f) {
+    return f === 'cro-website' || f === 'prospect-cro';
+  }));
   // The link policy, with the warm-up week deliberately out of range: a reply
   // is not cold outreach, so the week-1-2 link ban does not apply to it. What
   // does apply is the cap -- at most one URL, and only the library's own

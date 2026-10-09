@@ -82,6 +82,14 @@ const WEIGHTS = {
   site: 10,
 };
 
+// Section 9, Workflow 3, "Active trials for a Trialsites lead" (2026-10-09).
+// Highest band reached per component; the top bands sum to WEIGHTS.trials.
+const TRIALSITES_TRIALS = {
+  recent_trials_3yr: [[10, 10], [5, 7], [2, 4], [1, 2]],
+  trial_count: [[50, 5], [20, 4], [10, 3], [5, 2], [1, 1]],
+  site_tier: { A: 5, B: 3 },
+};
+
 // Section 9, Workflow 3, "Therapeutic area taxonomy". Only 'Oncology' is
 // actually scored, but canonicalising against the whole locked list is what
 // makes the match reliable: the live store holds pre-enum rows in lowercase
@@ -187,8 +195,21 @@ function siteEvidence(fetchInfo) {
 //
 // Null is never evidence. Section 9 is explicit: employee_estimate is null on
 // 85% of leads because extraction correctly refuses to guess, and the same
-// applies to is_cro on leads whose site never yielded text. `> 500` fires only
-// on a confirmed number; `not a CRO` fires only on an explicit false.
+// applies to company_type on leads whose site never yielded text. `> 500` fires
+// only on a confirmed number; `not a CRO, site or SMO` only on an explicit
+// 'other' (or, for a lead enriched before 2026-10-09, an explicit is_cro false).
+//
+// company_type, as enrichment classifies it since 2026-10-09: one of the closed
+// enum CRO / site / SMO / other / unclear. Anything else (a pre-enum free-text
+// label, or nothing) is null here, and the legacy is_cro rule speaks instead.
+const COMPANY_TYPES = ['CRO', 'site', 'SMO', 'other', 'unclear'];
+function companyType(raw) {
+  const v = raw && typeof raw.company_type === 'string' ? raw.company_type.trim() : '';
+  return COMPANY_TYPES.indexOf(v) !== -1 ? v : null;
+}
+// A pre-enum label that itself says site or SMO is not evidence of "not one".
+const LEGACY_SITE_LABEL = /\b(smo|site management|research (site|centre|center|clinic)|clinical (research )?sites?|investigational site)\b/i;
+
 function hardDisqualifiers(lead) {
   const raw = lead.raw_extraction || {};
   const reasons = [];
@@ -202,14 +223,20 @@ function hardDisqualifiers(lead) {
     });
   }
 
-  if (raw.is_cro === false) {
+  const ct = companyType(raw);
+  const legacyNotOne = ct === null && raw.is_cro === false &&
+    !LEGACY_SITE_LABEL.test(typeof raw.company_type === 'string' ? raw.company_type : '');
+  if (ct === 'other' || legacyNotOne) {
+    const label = ct === null && raw.company_type ? '"' + raw.company_type + '"' : 'another kind of organisation';
     reasons.push({
-      code: 'not_a_cro',
+      code: 'not_cro_site_smo',
       text:
-        'Not a CRO — enrichment read the site as ' +
-        (raw.company_type ? '"' + raw.company_type + '"' : 'a different kind of company') +
-        '. Sourced from the ICH GCP CRO directory, so this is a directory listing that has ' +
-        'drifted (rebrand, vendor miscategorised, or defunct) rather than a scraping error.',
+        'Not a CRO, site or SMO — enrichment read the site as ' + label +
+        ' (a hospital, university, government body, agency, consultancy, vendor or supplier). ' +
+        (lead.source === 'trialsites'
+          ? 'Found through Trialsites, whose registry rows include institutions the selection rules did not catch by name.'
+          : 'Sourced from the ICH GCP CRO directory, so this is a directory listing that has ' +
+            'drifted (rebrand, vendor miscategorised, or defunct) rather than a scraping error.'),
     });
   }
 
@@ -465,6 +492,41 @@ function scoreSite(lead) {
   };
 }
 
+// Active trials for a lead Workflow 1b found through Trialsites (Section 9,
+// Workflow 3, 2026-10-09). Trialsites counts trials per LOCATION across 14
+// registries, so for a site this measures something real -- unlike the
+// ClinicalTrials.gov sponsor match, which a CRO or a site rarely is. Returns
+// null when the lead has no Trialsites record; Compute Fit Score then uses the
+// ClinicalTrials.gov lookup exactly as before.
+function band(value, bands) {
+  const v = Number(value);
+  if (!Number.isFinite(v)) return 0;
+  for (let i = 0; i < bands.length; i++) if (v >= bands[i][0]) return bands[i][1];
+  return 0;
+}
+
+function scoreTrialsites(lead) {
+  if (lead.ts_location_id === null || lead.ts_location_id === undefined) return null;
+  const recent = Number(lead.ts_recent_trials_3yr) || 0;
+  const total = Number(lead.ts_trial_count) || 0;
+  const tier = String(lead.ts_site_tier || '').toUpperCase();
+  const pRecent = band(recent, TRIALSITES_TRIALS.recent_trials_3yr);
+  const pTotal = band(total, TRIALSITES_TRIALS.trial_count);
+  const pTier = TRIALSITES_TRIALS.site_tier[tier] || 0;
+  return {
+    points: Math.min(WEIGHTS.trials, pRecent + pTotal + pTier),
+    max: WEIGHTS.trials,
+    basis: 'confirmed',
+    detail: 'Trialsites: ' + recent + ' trial' + (recent === 1 ? '' : 's') + ' in the last 3 years (' + pRecent +
+      '), ' + total + ' in all (' + pTotal + '), tier ' + (tier || '?') + ' (' + pTier + ')',
+    source: 'trialsites',
+    recent_trials_3yr: recent,
+    trial_count: total,
+    active_recruiting: Number(lead.ts_active_recruiting) || 0,
+    site_tier: tier || null,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Node body
 // ---------------------------------------------------------------------------
@@ -527,6 +589,7 @@ return {
       founder_linkedin: lead.founder_linkedin || null,
       city: rawEx.city || null,
       company_type: rawEx.company_type || null,
+      source: lead.source || null,
       phases: Array.isArray(lead.phases) ? lead.phases : [],
       areas: factors.oncology.areas,
       employee_estimate: typeof lead.employee_estimate === 'number' ? lead.employee_estimate : null,
@@ -539,5 +602,8 @@ return {
     // ClinicalTrials.gov is a per-candidate lookup keyed on a name we already
     // have (Section 9), so it runs only for leads that got this far.
     ctgov_sponsor: lead.company_name || lead.domain,
+    // Set only for a Trialsites lead; Compute Fit Score then uses it for the
+    // trials factor and ignores the ClinicalTrials.gov answer (and its failure).
+    trialsites_trials: scoreTrialsites(lead),
   },
 };

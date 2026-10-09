@@ -456,6 +456,27 @@ function subjectFlags(subject, factCorpus, headcount, titles, absentAreas) {
   return flags;
 }
 
+// Sites and SMOs, 2026-10-09 (Section 9, Workflow 4; operator instruction).
+// Vertex Clinical Research is a clinical research center and is never called a
+// CRO, whoever the email is to (`vertex-cro`). And a research site or an SMO is
+// never told about "CRO websites" (`cro-website`), never given the "two CROs"
+// proof (`proof-two-cros`), and never called a CRO itself (`prospect-cro`) --
+// "CROs choosing sites" is how a site hears from a CRO, so naming CROs as the
+// site's visitors is allowed and is not tagged.
+const VERTEX_AS_CRO = /\bVertex\b[^.?!]{0,60}\bCROs?\b|\bCROs?\b[^.?!]{0,30}\bVertex\b/i;
+const CRO_WEBSITE = /\bCROs?(?:['’]s?)?\s+(?:web\s?)?sites?\b|\bCRO[- ]websites?\b/i;
+const TWO_CROS = /\btwo CROs?\b/i;
+const PROSPECT_CRO = /\b(?:you(?:['’]re| are)(?: a| an)?|your(?: own)?|as an?)\s+(?:small\s+|mid-sized\s+|independent\s+|local\s+)?CROs?\b/i;
+function siteFlags(text, companyType) {
+  const flags = [];
+  if (VERTEX_AS_CRO.test(text)) flags.push('vertex-cro');
+  if (companyType !== 'site' && companyType !== 'SMO') return flags;
+  if (CRO_WEBSITE.test(text)) flags.push('cro-website');
+  if (TWO_CROS.test(text)) flags.push('proof-two-cros');
+  if (PROSPECT_CRO.test(text)) flags.push('prospect-cro');
+  return flags;
+}
+
 // Every rule that applies to a message body, either channel.
 function checkMessage(m) {
   let flags = [];
@@ -472,6 +493,7 @@ function checkMessage(m) {
   if (absentAreasNamed(own, m.absentAreas).length) flags.push('ungrounded-area');
   if (str(m.body)) flags = flags.concat(hookFlags(firstSentence(m.body), m.src, m.titles));
   flags = flags.concat(proofFlags(m.core, m.proofPool));
+  flags = flags.concat(siteFlags(m.core, m.companyType));
   return flags;
 }
 
@@ -660,7 +682,7 @@ const corpus = factCorpus.replace(/^\d+\.\s/gm, '') + '\n' + claimCorpus + (link
 function message(body, ask, core) {
   return {
     body: body, ask: ask, core: core, titles: titles, corpus: corpus, src: src,
-    absentAreas: src.absent_areas, proofPool: pools.proof,
+    absentAreas: src.absent_areas, proofPool: pools.proof, companyType: src.company_type,
   };
 }
 
@@ -679,6 +701,7 @@ function checkEmail() {
   flags = flags.concat(linkFlags(emailCore + '\n' + emailSubject, week, link));
   flags = flags.concat(subjectFlags(emailSubject, factCorpus, src.headcount, titles, src.absent_areas));
   if (prospectSponsor(emailSubject)) flags.push('prospect-sponsor');
+  flags = flags.concat(siteFlags(emailSubject, src.company_type));
   // A contact written from the site's own founder LinkedIn (Workflow 3b) has no
   // email address. The LinkedIn DM is the draft that matters; this email has
   // nowhere to go (Send refuses it as no-valid-address), so it is tagged to be

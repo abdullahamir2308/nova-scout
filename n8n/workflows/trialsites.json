@@ -1,0 +1,571 @@
+{
+  "id": "trialsites0001",
+  "name": "Ingestion - Trialsites (sites and SMOs)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "name": "Every 30 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1200,
+        200
+      ],
+      "notes": "Two lanes every tick. Harvest: weekly, decided by site_harvest_log, so a host that was off on harvest day harvests at its next tick (Section 7). Lookup: a bounded batch of candidates, sized by the monthly cap.\n\nMinutes, not hours or days: n8n 2.35.7 gates an hours rule (N > 1) on the clock hour of the last run -- the bug that cost three follow-ups on 2026-10-02."
+    },
+    {
+      "parameters": {},
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1200,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One row, always: is a harvest due, which locations are already known, and\n-- what the monthly cap still allows (migration 019).\n--\n-- \"Due\" is a question about site_harvest_log, not about a clock: a host that is\n-- off on harvest day harvests at its next tick (Section 7).\nSELECT (SELECT max(harvested_at) FROM site_harvest_log)                         AS last_harvest_at,\n       coalesce((SELECT max(harvested_at) FROM site_harvest_log)\n                  < now() - make_interval(days => $1::int), true)               AS harvest_due,\n       (SELECT coalesce(jsonb_agg(location_id), '[]'::jsonb) FROM site_candidates) AS known_ids,\n       site_lookup_budget_left()                                                AS budget_left;",
+        "options": {
+          "queryReplacement": "={{ [7] }}"
+        }
+      },
+      "name": "Load Site State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -980,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "One row whatever the answer, so Harvest Due? always has something to read."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "due",
+              "leftValue": "={{ $json.harvest_due }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Harvest Due?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -760,
+        100
+      ],
+      "notes": "true: no harvest in the last 7 days. false: the normal outcome of most ticks."
+    },
+    {
+      "parameters": {
+        "url": "https://api.aimronline.org/api/v1/countries",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "NovaScoutBot/1.0 (+https://github.com/abdullahamir2308/nova-scout)"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "name": "Fetch Trialsites Countries",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -540,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "notes": "Read live, because Trialsites files some countries under two spellings (\"Czech Republic\" and \"Czechia\"), and a request for one misses the other's rows."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Trialsites country mapping -- shared by Build Harvest Requests and Select\n// Candidates. build_workflow.py prepends this file, verbatim, to both nodes'\n// sources, so the two can never disagree about which countries are harvested.\n// It must never read another node or its own input: it is not a node of its own.\n//\n// \"Only countries the CRO scraper already includes\" (the operator's brief) is\n// Section 12's clock table: every country the ICH GCP scraper takes has a row\n// there, and Send can reach no other. Both lists are substituted at build time\n// from NovaScout_MasterRef.md by n8n/sites/build_workflow.py.\n\nconst INCLUDED_COUNTRIES = [\"Argentina\", \"Brazil\", \"Czech Republic\", \"Egypt\", \"Hungary\", \"India\", \"Mexico\", \"Pakistan\", \"Poland\", \"Romania\", \"South Africa\", \"Turkey\", \"UAE\", \"Albania\", \"Algeria\", \"Angola\", \"Armenia\", \"Australia\", \"Austria\", \"Azerbaijan\", \"Bahamas\", \"Bahrain\", \"Bangladesh\", \"Belgium\", \"Benin\", \"Bosnia and Herzegovina\", \"Bulgaria\", \"Burkina Faso\", \"Burundi\", \"Cambodia\", \"Cameroon\", \"Canada\", \"Chile\", \"China\", \"Colombia\", \"Congo\", \"Costa Rica\", \"Cote d'Ivoire\", \"Croatia\", \"Cyprus\", \"DR Congo\", \"Denmark\", \"Djibouti\", \"Dominican Republic\", \"Ecuador\", \"El Salvador\", \"Equatorial Guinea\", \"Estonia\", \"Ethiopia\", \"Finland\", \"France\", \"Gabon\", \"Gambia\", \"Georgia\", \"Germany\", \"Ghana\", \"Greece\", \"Guatemala\", \"Guinea\", \"Hong Kong\", \"Indonesia\", \"Ireland\", \"Israel\", \"Italy\", \"Jamaica\", \"Japan\", \"Jordan\", \"Kazakhstan\", \"Kenya\", \"Kosovo\", \"Kuwait\", \"Kyrgyzstan\", \"Latvia\", \"Lebanon\", \"Liberia\", \"Lithuania\", \"Luxembourg\", \"Macedonia\", \"Madagascar\", \"Malawi\", \"Malaysia\", \"Mali\", \"Malta\", \"Mauritania\", \"Mauritius\", \"Moldova\", \"Mongolia\", \"Montenegro\", \"Morocco\", \"Mozambique\", \"Nepal\", \"Netherlands\", \"New Zealand\", \"Nigeria\", \"Norway\", \"Oman\", \"Panama\", \"Papua New Guinea\", \"Paraguay\", \"Peru\", \"Philippines\", \"Portugal\", \"Qatar\", \"Rwanda\", \"Saint Lucia\", \"Saudi Arabia\", \"Senegal\", \"Serbia\", \"Singapore\", \"Slovakia\", \"Slovenia\", \"South Korea\", \"Spain\", \"Sri Lanka\", \"Suriname\", \"Sweden\", \"Switzerland\", \"Taiwan\", \"Tanzania\", \"Thailand\", \"Togo\", \"Trinidad and Tobago\", \"Tunisia\", \"Turkmenistan\", \"USA\", \"Uganda\", \"Ukraine\", \"United Kingdom\", \"Uruguay\", \"Uzbekistan\", \"Vietnam\", \"Zambia\", \"Zimbabwe\"];\nconst CORE_COUNTRIES = [\"Argentina\", \"Brazil\", \"Czech Republic\", \"Egypt\", \"Hungary\", \"India\", \"Mexico\", \"Pakistan\", \"Poland\", \"Romania\", \"South Africa\", \"Turkey\", \"UAE\"];\n\n// Trialsites spellings that are not the leads.country spelling, read from the\n// live /countries list on 2026-10-09 (236 spellings). A spelling neither here\n// nor equal to an included name is simply not harvested -- nothing guesses. The\n// build refuses an alias whose target is not an included country, so a\n// sanctioned jurisdiction can never be reached through this table (\"Korea,\n// Democratic People's Republic Of\" is in Trialsites and deliberately absent).\nconst TRIALSITES_ALIASES = {\n  'united states': 'USA',\n  'united states of america': 'USA',\n  'czechia': 'Czech Republic',\n  'korea, south': 'South Korea',\n  'korea, republic of': 'South Korea',\n  'turkey (turkiye)': 'Turkey',\n  'united arab emirates': 'UAE',\n  'tanzania, united republic of': 'Tanzania',\n  'democratic republic of the congo': 'DR Congo',\n  'congo (the democratic republic of the)': 'DR Congo',\n  'congo, democratic republic': 'DR Congo',\n  'republic of the congo': 'Congo',\n  'north macedonia': 'Macedonia',\n  'the gambia': 'Gambia',\n  'the bahamas': 'Bahamas',\n  'bosnia & herzegovina': 'Bosnia and Herzegovina',\n};\n\nfunction str(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\n// Accent-folded, lower-cased, curly apostrophes made straight: \"Côte d’Ivoire\"\n// and \"Türkiye\" meet the table the way a person would expect.\nfunction fold(v) {\n  return str(v).normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[‘’]/g, \"'\")\n    .toLowerCase().replace(/\\s+/g, ' ');\n}\n\nconst INCLUDED_BY_KEY = {};\nINCLUDED_COUNTRIES.forEach(function (c) { INCLUDED_BY_KEY[fold(c)] = c; });\nconst CORE_KEYS = CORE_COUNTRIES.map(fold);\n\n// leads.country for a Trialsites spelling, or null if it is not harvested.\nfunction canonicalCountry(trialsitesName) {\n  const k = fold(trialsitesName);\n  if (Object.prototype.hasOwnProperty.call(INCLUDED_BY_KEY, k)) return INCLUDED_BY_KEY[k];\n  if (Object.prototype.hasOwnProperty.call(TRIALSITES_ALIASES, k)) {\n    const target = fold(TRIALSITES_ALIASES[k]);\n    return Object.prototype.hasOwnProperty.call(INCLUDED_BY_KEY, target) ? INCLUDED_BY_KEY[target] : null;\n  }\n  return null;\n}\n\nfunction isCore(country) {\n  return CORE_KEYS.indexOf(fold(country)) !== -1;\n}\n\n// Build Harvest Requests -- n8n Code node (Run Once for All Items).\n//\n// Workflow 1b, Trialsites. Input: the live /countries list (the HTTP node splits\n// its JSON array into one item per country, {country, sites}). Output: one item\n// per Trialsites country spelling that maps to an included country, per tier\n// (A and B) -- each becomes one paginated /sites request. Core countries first,\n// so if the run is cut short the countries worth the full geography weight are\n// the ones already read.\n//\n// The country list is read live rather than written down because Trialsites\n// spells some countries two ways (\"Czech Republic\" and \"Czechia\"; \"United\n// States\" and \"United States Of America\") and a request for one spelling misses\n// the rows filed under the other. A country with no sites at all costs no\n// request.\n\nconst TIERS = ['A', 'B'];\n\n// ---------------------------------------------------------------------------\n// Node body\n// ---------------------------------------------------------------------------\n\nconst rows = [];\n$input.all().forEach(function (i) {\n  const j = i.json || {};\n  if (Array.isArray(j)) { j.forEach(function (r) { rows.push(r); }); return; }\n  if (Array.isArray(j.countries)) { j.countries.forEach(function (r) { rows.push(r); }); return; }\n  rows.push(j);\n});\n\nconst seen = {};\nconst requests = [];\nrows.forEach(function (r) {\n  const name = str(r && r.country);\n  if (!name || seen[name] || !(Number(r.sites) > 0)) return;\n  seen[name] = true;\n  const canonical = canonicalCountry(name);\n  if (!canonical) return;\n  TIERS.forEach(function (tier) {\n    requests.push({ trialsites_country: name, country: canonical, tier: tier, core: isCore(canonical) });\n  });\n});\nrequests.sort(function (a, b) {\n  return (a.core === b.core ? 0 : a.core ? -1 : 1) || a.country.localeCompare(b.country) ||\n    a.trialsites_country.localeCompare(b.trialsites_country) || a.tier.localeCompare(b.tier);\n});\n\nif (!requests.length) {\n  // The list came back empty or unreadable. Throwing fails the execution\n  // loudly instead of logging a harvest that read nothing: a harvest log row\n  // would otherwise stop the next attempt for a week.\n  throw new Error('Trialsites /countries returned no harvestable country (' + rows.length + ' rows read)');\n}\nreturn requests.map(function (r) { return { json: r }; });\n"
+      },
+      "name": "Build Harvest Requests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -320,
+        0
+      ],
+      "notes": "One item per included country spelling, per tier (A, B). Core countries first."
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "name": "Loop Over Requests",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -210,
+        0
+      ],
+      "notes": "One country/tier at a time, so one request is in flight at a time. Measured 2026-10-09: the HTTP node's own batching only sleeps between dispatches and never awaits a response, so slow answers overlapped, pages came on top, and 8 requests timed out at 60 s in the first four minutes of a harvest. 'done' carries every page back to Select Candidates."
+    },
+    {
+      "parameters": {
+        "url": "https://api.aimronline.org/api/v1/sites",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "country",
+              "value": "={{ $json.trialsites_country }}"
+            },
+            {
+              "name": "tier",
+              "value": "={{ $json.tier }}"
+            },
+            {
+              "name": "identified_only",
+              "value": "1"
+            },
+            {
+              "name": "sort",
+              "value": "-recent_trials_3yr"
+            },
+            {
+              "name": "limit",
+              "value": "500"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "NovaScoutBot/1.0 (+https://github.com/abdullahamir2308/nova-scout)"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000,
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "offset",
+                    "value": "={{ $pageCount * 500 }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.results || $response.body.results.length < 500 }}",
+              "limitPagesFetched": true,
+              "maxRequests": 4,
+              "requestInterval": 1100
+            }
+          }
+        }
+      },
+      "name": "Fetch Trialsites Sites",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -100,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000,
+      "notes": "Free, no key, 60 requests a minute. ONE request in flight at a time: Loop Over Requests hands this node a single country/tier, its pages are fetched one after another 1100 ms apart, and Pace Requests waits before the next. Up to 4 pages of 500 per country and tier, most recent trial activity first.\n\nOnly the search endpoint is ever called. The site-detail endpoint (/sites/{id}) can carry investigator records and this workflow never requests it -- the standing rule: never use personal investigator emails from registry data.\n\nonError continue: a country that fails is counted in the harvest's stats as a failed response rather than failing the whole week."
+    },
+    {
+      "parameters": {
+        "amount": 1.1,
+        "unit": "seconds"
+      },
+      "name": "Pace Requests",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        120,
+        -120
+      ],
+      "notes": "1.1 s after each country/tier's last page, before the next request. Under 65 s n8n waits in memory, so the execution never parks."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Trialsites country mapping -- shared by Build Harvest Requests and Select\n// Candidates. build_workflow.py prepends this file, verbatim, to both nodes'\n// sources, so the two can never disagree about which countries are harvested.\n// It must never read another node or its own input: it is not a node of its own.\n//\n// \"Only countries the CRO scraper already includes\" (the operator's brief) is\n// Section 12's clock table: every country the ICH GCP scraper takes has a row\n// there, and Send can reach no other. Both lists are substituted at build time\n// from NovaScout_MasterRef.md by n8n/sites/build_workflow.py.\n\nconst INCLUDED_COUNTRIES = [\"Argentina\", \"Brazil\", \"Czech Republic\", \"Egypt\", \"Hungary\", \"India\", \"Mexico\", \"Pakistan\", \"Poland\", \"Romania\", \"South Africa\", \"Turkey\", \"UAE\", \"Albania\", \"Algeria\", \"Angola\", \"Armenia\", \"Australia\", \"Austria\", \"Azerbaijan\", \"Bahamas\", \"Bahrain\", \"Bangladesh\", \"Belgium\", \"Benin\", \"Bosnia and Herzegovina\", \"Bulgaria\", \"Burkina Faso\", \"Burundi\", \"Cambodia\", \"Cameroon\", \"Canada\", \"Chile\", \"China\", \"Colombia\", \"Congo\", \"Costa Rica\", \"Cote d'Ivoire\", \"Croatia\", \"Cyprus\", \"DR Congo\", \"Denmark\", \"Djibouti\", \"Dominican Republic\", \"Ecuador\", \"El Salvador\", \"Equatorial Guinea\", \"Estonia\", \"Ethiopia\", \"Finland\", \"France\", \"Gabon\", \"Gambia\", \"Georgia\", \"Germany\", \"Ghana\", \"Greece\", \"Guatemala\", \"Guinea\", \"Hong Kong\", \"Indonesia\", \"Ireland\", \"Israel\", \"Italy\", \"Jamaica\", \"Japan\", \"Jordan\", \"Kazakhstan\", \"Kenya\", \"Kosovo\", \"Kuwait\", \"Kyrgyzstan\", \"Latvia\", \"Lebanon\", \"Liberia\", \"Lithuania\", \"Luxembourg\", \"Macedonia\", \"Madagascar\", \"Malawi\", \"Malaysia\", \"Mali\", \"Malta\", \"Mauritania\", \"Mauritius\", \"Moldova\", \"Mongolia\", \"Montenegro\", \"Morocco\", \"Mozambique\", \"Nepal\", \"Netherlands\", \"New Zealand\", \"Nigeria\", \"Norway\", \"Oman\", \"Panama\", \"Papua New Guinea\", \"Paraguay\", \"Peru\", \"Philippines\", \"Portugal\", \"Qatar\", \"Rwanda\", \"Saint Lucia\", \"Saudi Arabia\", \"Senegal\", \"Serbia\", \"Singapore\", \"Slovakia\", \"Slovenia\", \"South Korea\", \"Spain\", \"Sri Lanka\", \"Suriname\", \"Sweden\", \"Switzerland\", \"Taiwan\", \"Tanzania\", \"Thailand\", \"Togo\", \"Trinidad and Tobago\", \"Tunisia\", \"Turkmenistan\", \"USA\", \"Uganda\", \"Ukraine\", \"United Kingdom\", \"Uruguay\", \"Uzbekistan\", \"Vietnam\", \"Zambia\", \"Zimbabwe\"];\nconst CORE_COUNTRIES = [\"Argentina\", \"Brazil\", \"Czech Republic\", \"Egypt\", \"Hungary\", \"India\", \"Mexico\", \"Pakistan\", \"Poland\", \"Romania\", \"South Africa\", \"Turkey\", \"UAE\"];\n\n// Trialsites spellings that are not the leads.country spelling, read from the\n// live /countries list on 2026-10-09 (236 spellings). A spelling neither here\n// nor equal to an included name is simply not harvested -- nothing guesses. The\n// build refuses an alias whose target is not an included country, so a\n// sanctioned jurisdiction can never be reached through this table (\"Korea,\n// Democratic People's Republic Of\" is in Trialsites and deliberately absent).\nconst TRIALSITES_ALIASES = {\n  'united states': 'USA',\n  'united states of america': 'USA',\n  'czechia': 'Czech Republic',\n  'korea, south': 'South Korea',\n  'korea, republic of': 'South Korea',\n  'turkey (turkiye)': 'Turkey',\n  'united arab emirates': 'UAE',\n  'tanzania, united republic of': 'Tanzania',\n  'democratic republic of the congo': 'DR Congo',\n  'congo (the democratic republic of the)': 'DR Congo',\n  'congo, democratic republic': 'DR Congo',\n  'republic of the congo': 'Congo',\n  'north macedonia': 'Macedonia',\n  'the gambia': 'Gambia',\n  'the bahamas': 'Bahamas',\n  'bosnia & herzegovina': 'Bosnia and Herzegovina',\n};\n\nfunction str(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\n// Accent-folded, lower-cased, curly apostrophes made straight: \"Côte d’Ivoire\"\n// and \"Türkiye\" meet the table the way a person would expect.\nfunction fold(v) {\n  return str(v).normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[‘’]/g, \"'\")\n    .toLowerCase().replace(/\\s+/g, ' ');\n}\n\nconst INCLUDED_BY_KEY = {};\nINCLUDED_COUNTRIES.forEach(function (c) { INCLUDED_BY_KEY[fold(c)] = c; });\nconst CORE_KEYS = CORE_COUNTRIES.map(fold);\n\n// leads.country for a Trialsites spelling, or null if it is not harvested.\nfunction canonicalCountry(trialsitesName) {\n  const k = fold(trialsitesName);\n  if (Object.prototype.hasOwnProperty.call(INCLUDED_BY_KEY, k)) return INCLUDED_BY_KEY[k];\n  if (Object.prototype.hasOwnProperty.call(TRIALSITES_ALIASES, k)) {\n    const target = fold(TRIALSITES_ALIASES[k]);\n    return Object.prototype.hasOwnProperty.call(INCLUDED_BY_KEY, target) ? INCLUDED_BY_KEY[target] : null;\n  }\n  return null;\n}\n\nfunction isCore(country) {\n  return CORE_KEYS.indexOf(fold(country)) !== -1;\n}\n\n// Select Candidates -- n8n Code node (Run Once for All Items).\n//\n// Workflow 1b, Trialsites. Every item is one /sites response from the AIMR\n// Global Clinical Research Site Database (one Trialsites country spelling, one\n// tier). This node turns those rows into at most MAX_NEW candidates for the\n// website lookup, by deterministic rules only (build rule 3):\n//\n//   1. the country must be one the ICH GCP scraper already includes -- Section\n//      12's clock table, substituted at build time -- reached through an\n//      explicit alias table, never a fuzzy match. A sanctioned jurisdiction\n//      can never map: the build refuses an alias that targets one.\n//   2. tier A or B, identified (not an area-only marker), and active: at least\n//      one trial in the last three years or one recruiting now.\n//   3. an independent research site or SMO: never a hospital, a university or\n//      a government body. Trialsites' own facility_type is empty on 88 % of\n//      tier A/B rows (measured on 5,145 rows across eight countries,\n//      2026-10-09), so the type columns are used where they speak and the NAME\n//      does the rest -- an exclusion screen in the languages of the included\n//      countries, then a positive signal (a research word, a company legal\n//      form, or a private-practice / phase-1-unit type). A name with neither\n//      is not a candidate: a lookup costs real money, and a public institution\n//      is far commoner in this data than an independent site.\n//   4. not already a candidate (location_id), deduplicated on name + city\n//      within the run, and ordered core country first, then tier, then trial\n//      recency and volume.\n//\n// What this node never reads, on purpose: investigators. The site detail\n// endpoint can carry investigator records; this workflow never requests it, and\n// nothing here would store one (the standing rule: never use personal\n// investigator emails from registry data).\n\n// ---------------------------------------------------------------------------\n// Constants. The country mapping (INCLUDED_COUNTRIES, CORE_COUNTRIES, the\n// Trialsites aliases, str, fold, canonicalCountry, isCore) is code_countries.js,\n// which build_workflow.py prepends to this source verbatim.\n// ---------------------------------------------------------------------------\n\n// At most this many NEW candidates per harvest (the operator's brief: 200 a week).\nconst MAX_NEW = 200;\n\n// Types that are a public or institutional body whatever the name says.\nconst EXCLUDED_FACILITY_TYPES = [\n  'university hospital', \"children's hospital\", 'government/military hospital', 'community hospital',\n];\nconst EXCLUDED_NETWORK_TYPES = ['academic medical center', 'hospital system', 'government'];\n// Types that are themselves the positive signal.\nconst SITE_FACILITY_TYPES = ['private practice', 'cro / phase 1 unit'];\n\n// Hospitals, universities and government bodies, in the languages of the\n// included countries. Whole words of the accent-folded, lower-cased name, so\n// \"trust\" never fires inside \"trustworthy\" nor \"state\" inside \"estate\".\nconst EXCLUDED_WORDS = [\n  'hospital', 'hospitals', 'hospitalar', 'hospitalaria', 'hospitalario', 'hopital', 'ospedale', 'hastane', 'hastanesi', 'szpital',\n  'szpitala', 'szpitalny', 'korhaz', 'nemocnice', 'spital', 'spitalul', 'krankenhaus', 'klinikum',\n  'ziekenhuis', 'sjukhus', 'sygehus', 'sairaala', 'nosocomio', 'bolnica', 'policlinico', 'santa casa',\n  'infirmary', 'medical college', 'college', 'school', 'academy',\n  'university', 'universidad', 'universidade', 'universita', 'universitat', 'universite', 'universitesi',\n  'universitas', 'universitario', 'universitaria', 'universitair', 'uniwersytet', 'uniwersytecki',\n  'egyetem', 'egyetemi', 'univerzita', 'univerzitet', 'faculty', 'facultad', 'faculdade', 'fakultesi',\n  'fakultat', 'ministry', 'ministerio', 'ministerstwo', 'government', 'national', 'nacional', 'nazionale',\n  'state', 'federal', 'municipal', 'county', 'provincial', 'public health', 'health service', 'nhs',\n  'trust', 'military', 'army', 'navy', 'veterans', 'seguro social', 'imss', 'issste', 'aiims', 'pgimer',\n];\n\n// The same institutions by STEM, because the included countries' languages\n// inflect: the 2026-10-09 dry run chose \"Uniwersyteckie Centrum Kliniczne\"\n// (Gdansk's university hospital) because only \"uniwersytet\" and \"uniwersytecki\"\n// were listed, and paid a lookup for it. A word STARTING with one of these is an\n// institution's word in any of its forms. Not \"hospital\" as a stem (a Brazilian\n// research centre brands itself \"Hospitalize\"; the hospital words above are\n// whole words), and not \"univers\" (it would take \"Universal ... LLC\").\nconst EXCLUDED_STEMS = [\n  'universit', 'universid', 'uniwersyt', 'univerzit', 'egyetem', 'szpital', 'hastane', 'nemocnic', 'spital',\n  'krankenhaus', 'ziekenhuis', 'sjukhus', 'sygehus', 'sairaal', 'ospedal', 'bolnic', 'korhaz', 'ministr',\n  'minister', 'fakult', 'facult', 'faculd',\n];\n\n// A research word in the name -- the site says what it is. Polish \"kliniczne\"\n// counts: KO-MED Centra Kliniczne is a private research-site network named that\n// way, and a university clinic with the same word is caught by the stems above.\nconst RESEARCH_WORDS = [\n  'research', 'investigacion', 'investigaciones', 'investigacao', 'investigacoes', 'pesquisa',\n  'pesquisas', 'badan', 'badania', 'kliniczne', 'klinicznych', 'arastirma', 'arastirmalari', 'kutato',\n  'kutatas', 'kutatokozpont', 'vyzkum', 'vyzkumu', 'cercetare', 'cercetari', 'recherche', 'forschung',\n  'ricerca', 'onderzoek', 'trial', 'trials', 'smo', 'site management', 'estudios clinicos',\n  'estudos clinicos', 'ensayos', 'clinical studies', 'studienzentrum',\n];\n\n// A company legal form at the end of the name -- a business, not a public body.\nconst LEGAL_FORMS = [\n  'llc', 'inc', 'ltd', 'limited', 'gmbh', 'ag', 'sc', 's c', 'sa de cv', 's a de c v', 'sapi de cv',\n  's a p i de c v', 'sapi', 's de rl de cv', 's de r l de c v', 's de rl', 'ltda', 'srl', 's r l', 'sro',\n  's r o', 'sp z o o', 'sp zoo', 'kft', 'zrt', 'as', 'a s', 'sti', 'ltd sti', 'pvt ltd', 'pty ltd', 'bv',\n  'b v', 'oy', 'aps', 'sas', 'sarl', 'sl', 's l', 'slu', 'pc', 'p c', 'pllc', 'llp', 'pa', 'p a', 'corp',\n];\n\nfunction wordsRe(list) {\n  return new RegExp('(^| )(' + list.map(function (w) { return w.replace(/ /g, ' '); }).join('|') + ')( |$)');\n}\nconst EXCLUDED_NAME = wordsRe(EXCLUDED_WORDS);\nconst EXCLUDED_STEM = new RegExp('(^| )(' + EXCLUDED_STEMS.join('|') + ')[a-z]*( |$)');\nconst RESEARCH_NAME = wordsRe(RESEARCH_WORDS);\nconst LEGAL_FORM = new RegExp('(^| )(' + LEGAL_FORMS.join('|') + ')$');\n\n// ---------------------------------------------------------------------------\n// Helpers\n// ---------------------------------------------------------------------------\n\nfunction num(v) {\n  const n = Number(v);\n  return Number.isFinite(n) ? n : 0;\n}\n\n// Why a row is not a candidate, or null if it is one. One reason, the first\n// that applies, so the run's tally adds up to the rows seen.\nfunction rejection(row) {\n  const country = canonicalCountry(row.country);\n  if (!country) return 'country-not-included';\n  const tier = str(row.site_tier).toUpperCase();\n  if (tier !== 'A' && tier !== 'B') return 'tier';\n  if (str(row.site_identification) !== 'identified') return 'not-identified';\n  if (num(row.recent_trials_3yr) < 1 && num(row.active_recruiting) < 1) return 'inactive';\n  const ft = fold(row.facility_type);\n  const nt = fold(row.network_type);\n  if (EXCLUDED_FACILITY_TYPES.indexOf(ft) !== -1) return 'institution-type';\n  if (EXCLUDED_NETWORK_TYPES.indexOf(nt) !== -1) return 'institution-network';\n  const name = words(row.canonical_name);\n  if (!name) return 'no-name';\n  if (EXCLUDED_NAME.test(name) || EXCLUDED_STEM.test(name)) return 'institution-name';\n  if (!positiveSignal(name, ft)) return 'no-site-signal';\n  return null;\n}\n\n// The name as space-separated words: folded, punctuation gone, so\n// \"Arké SMO S.A de C.V\" reads \"arke smo s a de c v\".\nfunction words(v) {\n  return fold(v).replace(/[^a-z0-9&]+/g, ' ').trim();\n}\n\nfunction positiveSignal(name, facilityType) {\n  if (SITE_FACILITY_TYPES.indexOf(facilityType) !== -1) return true;\n  if (RESEARCH_NAME.test(name)) return true;\n  // Dotted forms collapse to the spaced spellings in LEGAL_FORMS\n  // (\"S.A. de C.V.\" -> \"s a de c v\"), so both are listed there.\n  return LEGAL_FORM.test(name);\n}\n\n// Lower is sooner. Core countries first (they earn the full geography weight),\n// then tier A, then the most recent trial activity, then volume.\nfunction priority(row, country) {\n  const core = isCore(country) ? 0 : 1;\n  const tier = str(row.site_tier).toUpperCase() === 'A' ? 0 : 1;\n  const recent = Math.max(0, 999 - Math.min(999, num(row.recent_trials_3yr)));\n  return core * 10000000 + tier * 1000000 + recent * 1000 + Math.max(0, 999 - Math.min(999, num(row.trial_count)));\n}\n\nfunction candidate(row) {\n  const country = canonicalCountry(row.country);\n  return {\n    location_id: num(row.location_id),\n    canonical_name: str(row.canonical_name),\n    city: str(row.city) || null,\n    state: str(row.state) || null,\n    country: country,\n    trialsites_country: str(row.country),\n    site_tier: str(row.site_tier).toUpperCase(),\n    trial_count: Math.round(num(row.trial_count)),\n    recent_trials_3yr: Math.round(num(row.recent_trials_3yr)),\n    active_recruiting: Math.round(num(row.active_recruiting)),\n    quality_score: row.quality_score === null || row.quality_score === undefined ? null : num(row.quality_score),\n    facility_type: str(row.facility_type) || null,\n    network_type: str(row.network_type) || null,\n    primary_ta: str(row.primary_ta) || null,\n    therapeutic_areas: str(row.therapeutic_areas) || null,\n    priority: priority(row, country),\n  };\n}\n\n// The whole selection, as a pure function of the responses and what is known.\nfunction select(responses, knownIds, maxNew) {\n  const known = {};\n  (knownIds || []).forEach(function (id) { known[String(id)] = true; });\n  const tally = {};\n  const seen = {};\n  const byNameCity = {};\n  let rows = 0;\n  let failed = 0;\n  const unmapped = {};\n  const out = [];\n  responses.forEach(function (resp) {\n    if (!resp || !Array.isArray(resp.results)) { failed++; return; }\n    resp.results.forEach(function (row) {\n      rows++;\n      const id = String(num(row.location_id));\n      if (seen[id]) { tally['repeat-in-run'] = (tally['repeat-in-run'] || 0) + 1; return; }\n      seen[id] = true;\n      const why = rejection(row);\n      if (why) {\n        tally[why] = (tally[why] || 0) + 1;\n        if (why === 'country-not-included') unmapped[str(row.country)] = true;\n        return;\n      }\n      if (known[id]) { tally['already-a-candidate'] = (tally['already-a-candidate'] || 0) + 1; return; }\n      const key = fold(row.canonical_name).replace(/[^a-z0-9]+/g, '') + '|' + fold(row.city);\n      if (byNameCity[key]) { tally['same-name-and-city'] = (tally['same-name-and-city'] || 0) + 1; return; }\n      byNameCity[key] = true;\n      out.push(candidate(row));\n    });\n  });\n  out.sort(function (a, b) { return a.priority - b.priority || a.location_id - b.location_id; });\n  const eligible = out.length;\n  const chosen = out.slice(0, maxNew);\n  tally['over-the-cap'] = eligible - chosen.length;\n  return {\n    candidates: chosen,\n    stats: {\n      responses: responses.length,\n      failed_responses: failed,\n      rows_seen: rows,\n      eligible_new: eligible,\n      chosen: chosen.length,\n      rejected: tally,\n      unmapped_countries: Object.keys(unmapped).sort(),\n    },\n  };\n}\n\n// ---------------------------------------------------------------------------\n// Node body\n// ---------------------------------------------------------------------------\n\nconst gate = $('Load Site State').first().json;\nconst responses = $input.all().map(function (i) { return i.json; });\nconst result = select(responses, gate.known_ids || [], MAX_NEW);\n\nreturn [{ json: { candidates: result.candidates, stats: result.stats } }];\n"
+      },
+      "name": "Select Candidates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        120,
+        0
+      ],
+      "notes": "Deterministic only (build rule 3): included country, tier A/B, active, an independent site or SMO by type and by name, never a hospital, university or government body; at most 200 new, core countries first."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Write this harvest's candidates and its log row in ONE statement, so a\n-- crash cannot leave candidates written with no harvest recorded (re-harvested\n-- next tick, harmless) or a harvest recorded with no candidates (the week lost).\n--\n-- $1 Select Candidates' {candidates, stats}\n--\n-- ON CONFLICT DO NOTHING: a location already chosen keeps its row and its\n-- lookup outcome; Select Candidates already left known ids out.\nWITH p AS (SELECT $1::jsonb AS j),\nins AS (\n  INSERT INTO site_candidates (location_id, canonical_name, city, state, country, trialsites_country,\n                               site_tier, trial_count, recent_trials_3yr, active_recruiting,\n                               quality_score, facility_type, network_type, primary_ta,\n                               therapeutic_areas, priority)\n  SELECT (c->>'location_id')::bigint, c->>'canonical_name', c->>'city', c->>'state', c->>'country',\n         c->>'trialsites_country', c->>'site_tier', (c->>'trial_count')::int,\n         (c->>'recent_trials_3yr')::int, (c->>'active_recruiting')::int,\n         (c->>'quality_score')::numeric, c->>'facility_type', c->>'network_type', c->>'primary_ta',\n         c->>'therapeutic_areas', (c->>'priority')::bigint\n    FROM p, jsonb_array_elements(p.j->'candidates') AS c\n  ON CONFLICT (location_id) DO NOTHING\n  RETURNING location_id\n)\nINSERT INTO site_harvest_log (responses, rows_seen, eligible_new, chosen, stats)\nSELECT (j->'stats'->>'responses')::int, (j->'stats'->>'rows_seen')::int,\n       (j->'stats'->>'eligible_new')::int, (SELECT count(*) FROM ins)::int, j->'stats'\n  FROM p\nRETURNING id, chosen, eligible_new, rows_seen, responses;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json)] }}"
+        }
+      },
+      "name": "Write Candidates",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        340,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Candidates and the harvest log row in one statement."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The lookup queue: candidates never tried, and failed calls under the attempt\n-- limit -- core countries first (priority is Select Candidates' ordering).\n--\n-- $1 batch size   $2 max attempts for a failed call   $3 worst-case cost of one lookup\n--\n-- The cap (migration 019): at most budget_left / worst-case lookups, so a batch\n-- is never sized past what this calendar month still allows. At $0 left the\n-- batch is empty and nothing downstream runs.\nSELECT c.location_id, c.canonical_name, c.city, c.state, c.country, c.lookup_attempts\n  FROM site_candidates c\n WHERE c.lookup_status = 'pending'\n    OR (c.lookup_status = 'call-failed' AND c.lookup_attempts < $2::int)\n ORDER BY c.priority, c.location_id\n LIMIT greatest(0, least($1::int, floor(site_lookup_budget_left() / $3::numeric)::int));",
+        "options": {
+          "queryReplacement": "={{ [10, 3, 0.04] }}"
+        }
+      },
+      "name": "Load Lookup Batch",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -980,
+        400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "At most 10 candidates, and never more than the monthly cap's remainder divided by the worst-case cost of one lookup ($0.04). An empty batch ends the lane."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Build Lookup Request -- n8n Code node (Run Once for Each Item).\n//\n// Workflow 1b, website lookup. One Anthropic Messages request per Trialsites\n// candidate: the cheapest model that does this reliably (Section 3 and Section\n// 4 record the measurement), with the server-side web search tool, and a\n// structured answer so code -- Verify Website -- makes the decision.\n//\n// The request carries only what Trialsites published about the organisation:\n// its name, city and country. Nothing about any investigator is sent or asked.\n\n// Substituted at build time by n8n/sites/build_workflow.py: model, max_tokens,\n// effort, the web search tool (with its max_uses) and the answer schema.\nconst LOOKUP_REQUEST = {\n  \"model\": \"claude-haiku-5-5\",\n  \"max_tokens\": 4000,\n  \"output_config\": {\n    \"effort\": \"low\",\n    \"format\": {\n      \"type\": \"json_schema\",\n      \"schema\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"url\": {\n            \"type\": [\n              \"string\",\n              \"null\"\n            ]\n          },\n          \"evidence_url\": {\n            \"type\": [\n              \"string\",\n              \"null\"\n            ]\n          },\n          \"confidence\": {\n            \"type\": \"string\",\n            \"enum\": [\n              \"high\",\n              \"medium\",\n              \"low\",\n              \"none\"\n            ]\n          }\n        },\n        \"required\": [\n          \"url\",\n          \"evidence_url\",\n          \"confidence\"\n        ],\n        \"additionalProperties\": false\n      }\n    }\n  },\n  \"tools\": [\n    {\n      \"type\": \"web_search_20250305\",\n      \"name\": \"web_search\",\n      \"max_uses\": 3\n    }\n  ]\n};\nconst SYSTEM_PROMPT = \"You find the official website of one clinical research organisation -- an independent\\nresearch site, a site management organisation (SMO) or a similar company -- given its name\\nand location exactly as a public trial-site registry lists them.\\n\\nRules:\\n- Search the web. Only return a URL that appeared in your search results. Never construct,\\n  complete or guess a domain from the name.\\n- The website must be this organisation's own: not a directory, registry, map, social network,\\n  news article, or a page about it on someone else's site. If it belongs to a network of sites,\\n  the network's own website is acceptable when it has a page for this location.\\n- url: the homepage of that website. evidence_url: the page on the same website that shows the\\n  organisation's name together with this city (often a contact or location page), or null if\\n  the homepage shows both.\\n- If the organisation is a hospital, a university or a government body, return url null.\\n- If you are not confident the website is this exact organisation in this city, return url\\n  null. A wrong website is worse than none.\\n- confidence: high only when a page on that website names the organisation and this city.\";\n\nfunction str(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\nconst c = $input.item.json;\nconst place = [str(c.city), str(c.state), str(c.country)].filter(Boolean).join(', ');\nconst user = [\n  'Organisation, as a public trial-site registry lists it: ' + str(c.canonical_name),\n  'Location: ' + place,\n  '',\n  'Find its official website.',\n].join('\\n');\n\nreturn {\n  json: Object.assign({}, c, {\n    request: Object.assign({}, LOOKUP_REQUEST, {\n      system: SYSTEM_PROMPT,\n      messages: [{ role: 'user', content: user }],\n    }),\n  }),\n};\n"
+      },
+      "name": "Build Lookup Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -760,
+        400
+      ],
+      "notes": "Name, city and country -- what Trialsites published about the organisation, nothing else."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "anthropicApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request) }}",
+        "options": {
+          "timeout": 180000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "name": "Claude Website Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -540,
+        400
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": "novascoutAnthropic01",
+          "name": "Anthropic - Nova Scout drafting"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "claude-haiku-5-5, effort low, web_search_20250305 (max_uses 3) -- Section 4 has the measurement that chose it.\n\nneverError + continue: a failed call is an item too, so Verify Website can pair every answer with its candidate by position and record the failure ('call-failed', retried up to 3 attempts). No retry here: a retried call is a second paid lookup."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Verify Website -- n8n Code node (Run Once for All Items).\n//\n// Workflow 1b, website lookup. Claude (with web search) has proposed a website\n// for one Trialsites candidate, or said it found none. This node decides,\n// deterministically, whether that proposal is accepted -- the model proposes,\n// code decides, which is the shape the claim check already has (Section 9,\n// Workflow 5). The operator's rule: \"No confident match means skip; never\n// guess a domain.\"\n//\n//   1. The answer must be the schema's JSON and name a URL.\n//   2. Whether the URL's host appeared in the web search results is RECORDED\n//      (`from_search`), not enforced: the fetch in 4 is the confirmation, and a\n//      site that names this organisation in this city is the right site however\n//      the model learned its address (see hostRejection).\n//   3. Not a directory, a social network or a registry, not an institutional\n//      domain (.edu, .gov, .ac.xx, .nhs.uk, ...) -- the brief excludes\n//      hospitals, universities and government bodies -- and not a sanctioned\n//      jurisdiction's country-code domain (Section 12's row-level screen).\n//   4. Fetched: the homepage and, if the model named one on the same host, the\n//      page it says shows the address. The candidate's NAME and its CITY must\n//      both appear in that text. Either missing is a skip, not a guess.\n//\n// Every call is priced here from its own `usage` block and recorded, whatever\n// the outcome, because the monthly cap (settings.site_lookup_monthly_cap_usd)\n// counts what was actually spent.\n\n// ---------------------------------------------------------------------------\n// Constants\n// ---------------------------------------------------------------------------\n\n// The lookup model's prices and the web search fee, substituted at build time\n// from NovaScout_MasterRef.md Section 4 by n8n/sites/build_workflow.py.\nconst PRICES = {\"model\": \"claude-haiku-5-5\", \"input_per_mtok\": 0.1, \"output_per_mtok\": 0.5, \"cache_read_per_mtok\": 0.01, \"cache_write_per_mtok\": 0.125, \"per_search\": 0.01};\n\n// Section 12's row-level screen: a site on an excluded jurisdiction's\n// country-code domain is dropped (the scraper's EXCLUDED_TLDS, checked equal at\n// build time).\nconst EXCLUDED_TLDS = [\"af\", \"by\", \"cu\", \"ir\", \"kp\", \"mm\", \"ni\", \"ru\", \"su\", \"sy\", \"ve\", \"xn--p1ai\"];\n\n// Not the organisation's own website, whatever the search ranked first.\nconst NOT_OWN_SITE = [\n  'linkedin.com', 'facebook.com', 'instagram.com', 'twitter.com', 'x.com', 'youtube.com', 'tiktok.com',\n  'wikipedia.org', 'google.com', 'bing.com', 'yelp.com', 'yellowpages.com', 'mapquest.com',\n  'clinicaltrials.gov', 'aimronline.org', 'who.int', 'clinicaltrialsregister.eu', 'isrctn.com',\n  'doctoralia.com', 'doctoralia.com.mx', 'doctoralia.com.br', 'znanylekarz.pl', 'healthgrades.com',\n  'webmd.com', 'doximity.com', 'vitals.com', 'zocdoc.com', 'practo.com', 'justdial.com',\n  'zoominfo.com', 'crunchbase.com', 'dnb.com', 'glassdoor.com', 'indeed.com', 'bloomberg.com',\n  'opencorporates.com', 'emis.com', 'rocketreach.co', 'apollo.io', 'signalhire.com',\n];\n\n// Public institutions by domain: universities, governments, health services.\nconst INSTITUTIONAL = [\n  /\\.edu$/, /\\.gov$/, /\\.mil$/, /\\.int$/, /\\.(ac|edu|gov|gob|gouv|govt|mil|nic)\\.[a-z]{2}$/,\n  /\\.nhs\\.uk$/, /\\.nhs\\.net$/, /\\.hscni\\.net$/, /\\.health\\.nz$/,\n];\n\n// Words that say what a place is, not which one it is. A name made only of\n// these (\"Clinical Research Center\") must match as a whole phrase.\nconst GENERIC = [\n  'clinical', 'clinic', 'clinics', 'clinica', 'clinicas', 'klinik', 'research', 'center', 'centre',\n  'centro', 'centrum', 'institute', 'instituto', 'institut', 'medical', 'medica', 'medico', 'medicine',\n  'medicina', 'health', 'healthcare', 'group', 'grupo', 'site', 'sites', 'trial', 'trials', 'study',\n  'studies', 'pesquisa', 'pesquisas', 'investigacion', 'investigaciones', 'investigacao', 'badan',\n  'unit', 'services', 'associates', 'specialists', 'network', 'care', 'the', 'of', 'and', 'for', 'in',\n  'de', 'del', 'la', 'el', 'los', 'las', 'y', 'e', 'do', 'da', 'dos', 'das', 'di', 'du', 'des', 'le',\n  'et', 'und', 'fur', 'i', 'w', 'z', 'o', 'sp', 'zoo', 's', 'a', 'c', 'v', 'cv', 'sa', 'sc', 'srl', 'sro',\n  'llc', 'inc', 'ltd', 'limited', 'gmbh', 'ag', 'kft', 'zrt', 'ltda', 'pvt', 'pty', 'bv', 'corp', 'co',\n  'pllc', 'pc', 'pa', 'llp', 'sl', 'sas', 'sarl', 'sapi', 'rl', 'dr', 'dra', 'mr', 'ms', 'nr',\n];\n\n// Cities a site's own pages commonly write in the local language. A small,\n// explicit table: a city not here must appear as the registry writes it.\nconst EXONYMS = {\n  'mexico city': ['ciudad de mexico', 'cdmx', 'mexico d f', 'mexico df'],\n  'warsaw': ['warszawa'], 'krakow': ['krakow', 'cracow'], 'prague': ['praha'], 'bucharest': ['bucuresti'],\n  'munich': ['munchen'], 'cologne': ['koln'], 'vienna': ['wien'], 'rome': ['roma'], 'milan': ['milano'],\n  'florence': ['firenze'], 'turin': ['torino'], 'naples': ['napoli'], 'lisbon': ['lisboa'],\n  'athens': ['athina'], 'belgrade': ['beograd'], 'kyiv': ['kiev', 'kyiv'], 'lodz': ['lodz'],\n  'brussels': ['bruxelles', 'brussel'], 'the hague': ['den haag'], 'gothenburg': ['goteborg'],\n  'copenhagen': ['kobenhavn'], 'seville': ['sevilla'], 'cairo': ['al qahirah'], 'bangalore': ['bengaluru'],\n  'bengaluru': ['bangalore'], 'bombay': ['mumbai'], 'mumbai': ['bombay'], 'chennai': ['madras'],\n  'washington d c': ['washington dc', 'washington'], 'sao paulo': ['sao paulo'],\n};\n\n// Each fetch gives up after 10 s, and at most CONCURRENCY candidates are read\n// at once (Section 3's parallelization principle: I/O concurrent, bounded).\n// Worst case per candidate is five homepage rungs plus four further pages,\n// ~90 s, so a batch of 10 finishes well inside the task runner's 300 s.\nconst FETCH_TIMEOUT_MS = 10000;\nconst CONCURRENCY = 4;\n\n// ---------------------------------------------------------------------------\n// Helpers\n// ---------------------------------------------------------------------------\n\nfunction str(v) {\n  return v === null || v === undefined ? '' : String(v).trim();\n}\n\nfunction fold(v) {\n  return str(v).normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[‘’]/g, \"'\")\n    .toLowerCase();\n}\n\n// Space-separated words, folded: the form every text comparison here uses.\nfunction words(v) {\n  return ' ' + fold(v).replace(/[^a-z0-9]+/g, ' ').trim() + ' ';\n}\n\n// leads.domain's own normalisation (the scraper's and Workflow 3b's): the host,\n// lower-cased, with no scheme, no www. and no path.\nfunction hostOf(url) {\n  return str(url).toLowerCase().replace(/^[a-z]+:\\/\\//, '').replace(/^www\\./, '')\n    .replace(/[/?#].*$/, '').replace(/:\\d+$/, '').replace(/\\.+$/, '');\n}\n\nfunction sameSite(a, b) {\n  if (!a || !b) return false;\n  return a === b || a.endsWith('.' + b) || b.endsWith('.' + a);\n}\n\nfunction cost(usage) {\n  const u = usage || {};\n  const inTok = Number(u.input_tokens) || 0;\n  const outTok = Number(u.output_tokens) || 0;\n  const cacheRead = Number(u.cache_read_input_tokens) || 0;\n  const cacheWrite = Number(u.cache_creation_input_tokens) || 0;\n  const searches = Number(u.server_tool_use && u.server_tool_use.web_search_requests) || 0;\n  const usd = (inTok * PRICES.input_per_mtok + outTok * PRICES.output_per_mtok +\n    cacheRead * PRICES.cache_read_per_mtok + cacheWrite * PRICES.cache_write_per_mtok) / 1e6 +\n    searches * PRICES.per_search;\n  return {\n    input_tokens: inTok, output_tokens: outTok, cache_read_tokens: cacheRead,\n    cache_write_tokens: cacheWrite, web_search_requests: searches,\n    cost_usd: Math.round(usd * 1e6) / 1e6,\n  };\n}\n\n// The model's answer and the hosts its searches returned.\nfunction readResponse(resp) {\n  if (!resp || typeof resp !== 'object' || resp.error || !Array.isArray(resp.content)) {\n    const e = resp && (resp.error || resp.message);\n    return { ok: false, detail: 'lookup call failed: ' + (e ? (typeof e === 'string' ? e : JSON.stringify(e)) : 'no content').slice(0, 300) };\n  }\n  if (resp.stop_reason && resp.stop_reason !== 'end_turn') {\n    return { ok: false, detail: 'lookup call ended ' + resp.stop_reason };\n  }\n  const resultHosts = [];\n  let answer = null;\n  resp.content.forEach(function (b) {\n    if (b && b.type === 'web_search_tool_result' && Array.isArray(b.content)) {\n      b.content.forEach(function (r) { if (r && r.url) resultHosts.push(hostOf(r.url)); });\n    }\n    if (b && b.type === 'text' && str(b.text)) {\n      try { answer = JSON.parse(b.text); } catch (e) { /* the last parseable text block wins */ }\n    }\n  });\n  if (!answer || typeof answer !== 'object' || !('url' in answer)) {\n    return { ok: false, detail: 'lookup answer was not the schema JSON' };\n  }\n  return { ok: true, answer: answer, result_hosts: resultHosts };\n}\n\n// Why a proposed host is not acceptable before anything is fetched, or null.\n//\n// Whether the host appeared in the search results is recorded, not enforced:\n// the fetch below is the confirmation the operator asked for, and a site that\n// names this organisation in this city is the right site however the model\n// learned its address (often from a directory page in the results). What the\n// rule \"never guess a domain\" forbids is accepting an address nobody checked,\n// and nothing here is accepted unchecked.\nfunction hostRejection(host) {\n  if (!host || host.indexOf('.') === -1) return { outcome: 'no-match', detail: 'no usable URL' };\n  if (NOT_OWN_SITE.some(function (d) { return host === d || host.endsWith('.' + d); })) {\n    return { outcome: 'no-match', detail: host + ' is a directory or social site, not the organisation\\'s own' };\n  }\n  if (INSTITUTIONAL.some(function (re) { return re.test(host); })) {\n    return { outcome: 'excluded', detail: host + ' is an institutional domain (university, government or health service)' };\n  }\n  const tld = host.split('.').pop();\n  if (EXCLUDED_TLDS.indexOf(tld) !== -1) {\n    return { outcome: 'excluded', detail: host + ' is on an excluded jurisdiction\\'s country-code domain (Section 12)' };\n  }\n  return null;\n}\n\n// Legal forms dropped from the END of a name before it is compared: a site\n// rarely prints \"Sp. z o.o.\" in its own heading.\nconst LEGAL_TAIL = /( (llc|inc|ltd|limited|gmbh|ag|sc|s c|sa|s a|cv|c v|de|sapi|rl|r l|ltda|srl|sro|sp|z|o|oo|zoo|kft|zrt|as|sti|pvt|pty|bv|oy|aps|sas|sarl|sl|slu|pc|pllc|llp|pa|corp|co|private|public))+ *$/;\n\nfunction core(name) {\n  let w = words(name).trim();\n  for (let i = 0; i < 6; i++) {\n    const next = (' ' + w).replace(LEGAL_TAIL, '').trim();\n    if (next === w) break;\n    w = next;\n  }\n  return w;\n}\n\n// The distinctive words of a phrase: not generic, not the city itself.\nfunction distinctive(phrase, city) {\n  const cityWords = words(city).trim().split(' ');\n  return phrase.split(' ').filter(function (w) {\n    return w.length >= 2 && GENERIC.indexOf(w) === -1 && cityWords.indexOf(w) === -1;\n  });\n}\n\n// Does the site name this organisation? Three ways, strictest first:\n//   1. the name (legal form dropped) as a phrase, or a leading part of it that\n//      carries at least half of its distinctive words -- \"Proactive CR\" for\n//      \"Proactive Cr Mexico SA de Cv\";\n//   2. the same for the brand before \" - \" or \",\": Trialsites appends the\n//      location to a network's name (\"DM Clinical Research - Brookline\"), and\n//      the city is checked separately;\n//   3. a long name (three or more distinctive words) with all but one of them\n//      present as words.\n// A name made only of generic words must match as a whole phrase. Geography\n// alone never matches: \"south florida\" on a page is not \"Research Institute\n// of South Florida\" -- rule 1 needs the phrase.\nfunction nameAppears(name, city, text) {\n  const full = core(name);\n  const brandRaw = str(name).split(/ [-\\u2013] |,/)[0];\n  const phrases = [full];\n  if (brandRaw && brandRaw !== str(name)) phrases.push(core(brandRaw));\n  for (const phrase of phrases) {\n    if (!phrase) continue;\n    const parts = phrase.split(' ');\n    const dist = distinctive(phrase, city);\n    if (!dist.length) {\n      if (text.indexOf(' ' + phrase + ' ') !== -1) return true;\n      continue;\n    }\n    for (let k = parts.length; k >= 1; k--) {\n      const prefix = parts.slice(0, k).join(' ');\n      const carried = distinctive(prefix, city);\n      if (!carried.length || carried.length * 2 < dist.length) break;\n      if (k === 1 && prefix.length < 5) break;\n      if (text.indexOf(' ' + prefix + ' ') !== -1) return true;\n    }\n  }\n  const dist = distinctive(full, city).filter(function (w, i, a) { return a.indexOf(w) === i; });\n  if (dist.length >= 3) {\n    const found = dist.filter(function (w) { return text.indexOf(' ' + w + ' ') !== -1; });\n    if (found.length >= dist.length - 1) return true;\n  }\n  return false;\n}\n\nfunction cityAppears(city, text) {\n  const c = words(city).trim();\n  if (!c) return false;\n  const forms = [c].concat(EXONYMS[c] || []);\n  return forms.some(function (f) { return text.indexOf(' ' + f + ' ') !== -1; });\n}\n\nfunction htmlToText(html) {\n  return str(html)\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<!--[\\s\\S]*?-->/g, ' ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&#0?39;|&apos;/gi, \"'\")\n    .replace(/&quot;/gi, '\"');\n}\n\n// ---------------------------------------------------------------------------\n// The decision for one candidate. `helpers` is n8n's this.helpers, passed in\n// because a nested function cannot reach `this`.\n// ---------------------------------------------------------------------------\n\nasync function fetchText(helpers, url) {\n  for (const insecure of [false, true]) {\n    try {\n      const res = await helpers.httpRequest({\n        method: 'GET', url: url, timeout: FETCH_TIMEOUT_MS, returnFullResponse: true,\n        ignoreHttpStatusErrors: true, skipSslCertificateValidation: insecure,\n        headers: { 'User-Agent': 'NovaScoutBot/1.0 (+https://github.com/abdullahamir2308/nova-scout)' },\n      });\n      if (res && res.statusCode >= 200 && res.statusCode < 400 && typeof res.body === 'string') {\n        return { ok: true, html: res.body, text: htmlToText(res.body) };\n      }\n      return { ok: false, detail: 'HTTP ' + (res && res.statusCode) };\n    } catch (e) {\n      if (insecure) return { ok: false, detail: str(e && e.message).slice(0, 120) };\n    }\n  }\n  return { ok: false, detail: 'unreachable' };\n}\n\n// Contact and location pages linked from the homepage -- the city is usually\n// on one of those, not on the homepage itself.\nconst CONTACT_LINK = /(contact|contacto|contato|kontakt|kapcsolat|iletisim|location|locations|ubicacion|localizacao|sedes|unidades|about|nosotros|quienes|sobre|o-nas|impressum|find-us|visit)/i;\n\nasync function verify(helpers, cand, resp) {\n  const spend = cost(resp && resp.usage);\n  const base = {\n    location_id: cand.location_id,\n    canonical_name: cand.canonical_name,\n    city: cand.city,\n    country: cand.country,\n    model: PRICES.model,\n  };\n  function out(outcome, detail, extra) {\n    return Object.assign({}, base, spend, { outcome: outcome, detail: str(detail).slice(0, 500) }, extra || {});\n  }\n\n  const read = readResponse(resp);\n  if (!read.ok) return out('call-failed', read.detail);\n\n  const proposed = str(read.answer.url);\n  const host = hostOf(proposed);\n  const fromSearch = read.result_hosts.some(function (h) { return sameSite(host, h); });\n  const early = hostRejection(host);\n  if (early) return out(early.outcome, early.detail, { proposed_url: proposed || null, from_search: fromSearch });\n\n  // The homepage, through the same rungs Workflow 2 uses (the URL as proposed,\n  // then https and http, with and without www.), then the model's evidence page\n  // and up to three contact or location pages on the same site.\n  let text = ' ';\n  const fetched = [];\n  const tried = [];\n  let homeHtml = null;\n  for (const u of [proposed, 'https://' + host + '/', 'https://www.' + host + '/', 'http://' + host + '/', 'http://www.' + host + '/']) {\n    if (!u || tried.indexOf(u) !== -1) continue;\n    tried.push(u);\n    const f = await fetchText(helpers, u);\n    fetched.push(u + (f.ok ? ' ok' : ' ' + f.detail));\n    if (f.ok) { homeHtml = f.html; text += words(f.text) + ' '; break; }\n  }\n  if (homeHtml === null) {\n    return out('not-confirmed', 'could not read the site: ' + fetched.join('; '), { proposed_url: proposed, from_search: fromSearch });\n  }\n  const extra = [];\n  const evidence = str(read.answer.evidence_url);\n  if (evidence && sameSite(hostOf(evidence), host) && tried.indexOf(evidence) === -1) extra.push(evidence);\n  const linkRe = /href\\s*=\\s*[\"']([^\"'#]+)[\"']/gi;\n  let m;\n  while ((m = linkRe.exec(homeHtml)) && extra.length < 4) {\n    let href = m[1].trim();\n    if (/^(mailto|tel|javascript):/i.test(href)) continue;\n    if (href.indexOf('//') === 0) href = 'https:' + href;\n    else if (href.charAt(0) === '/') href = 'https://' + host + href;\n    else if (!/^https?:/i.test(href)) continue;\n    if (!sameSite(hostOf(href), host) || !CONTACT_LINK.test(href.replace(/^https?:\\/\\/[^/]+/i, ''))) continue;\n    if (extra.indexOf(href) === -1 && tried.indexOf(href) === -1) extra.push(href);\n  }\n  for (const u of extra) {\n    const f = await fetchText(helpers, u);\n    fetched.push(u + (f.ok ? ' ok' : ' ' + f.detail));\n    if (f.ok) text += words(f.text) + ' ';\n  }\n  const nameOk = nameAppears(cand.canonical_name, cand.city, text);\n  const cityOk = cityAppears(cand.city, text);\n  if (!nameOk || !cityOk) {\n    return out('not-confirmed',\n      (nameOk ? '' : 'name not on the site; ') + (cityOk ? '' : 'city \"' + str(cand.city) + '\" not on the site; ') +\n      'read ' + fetched.join('; '), { proposed_url: proposed, from_search: fromSearch });\n  }\n  return out('resolved', 'name and city found on ' + fetched.join('; '), {\n    proposed_url: proposed,\n    from_search: fromSearch,\n    domain: host,\n    website_url: 'https://' + host + '/',\n  });\n}\n\n// Run `work` over `list` with at most `n` in flight; results keep list order.\nasync function pool(list, n, work) {\n  const results = new Array(list.length);\n  let next = 0;\n  async function lane() {\n    while (next < list.length) {\n      const k = next++;\n      results[k] = await work(list[k], k);\n    }\n  }\n  const lanes = [];\n  for (let i = 0; i < Math.min(n, list.length); i++) lanes.push(lane());\n  await Promise.all(lanes);\n  return results;\n}\n\n// ---------------------------------------------------------------------------\n// Node body\n// ---------------------------------------------------------------------------\n\nconst nodeHelpers = this.helpers;\nconst responses = $input.all();\nconst requests = $('Build Lookup Request').all();\n\n// The HTTP node emits exactly one item per request, in order (onError:\n// continueRegularOutput turns a failed call into an item too). If the counts\n// ever differ, pairing by position would attach one candidate's answer to\n// another candidate's name -- so stop rather than guess.\nif (responses.length !== requests.length) {\n  throw new Error('Verify Website: ' + responses.length + ' responses for ' + requests.length + ' lookups; refusing to pair them');\n}\nconst pairs = responses.map(function (r, k) {\n  const p = r.pairedItem;\n  const idx = p && typeof p === 'object' && Number.isInteger(p.item) ? p.item : (Number.isInteger(p) ? p : k);\n  return { cand: requests[idx].json, resp: r.json };\n});\nconst results = await pool(pairs, CONCURRENCY, function (pr) { return verify(nodeHelpers, pr.cand, pr.resp); });\nreturn results.map(function (j, k) { return { json: j, pairedItem: { item: k } }; });\n"
+      },
+      "name": "Verify Website",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -320,
+        400
+      ],
+      "notes": "The model proposes, code decides. Accepted only if the site is the organisation's own (not a directory, social network, institution or sanctioned ccTLD) and its pages carry both the candidate's name and its city. No confident match is a skip, never a guess."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Record one lookup: its outcome, its cost, and -- if the website was\n-- confirmed -- the lead, all in ONE statement, so a crash cannot write a lead\n-- whose candidate still says 'pending' (looked up and paid for again).\n--\n-- $1 Verify Website's verdict for one candidate\n--\n-- A confirmed domain that is already a lead is 'duplicate', not a second lead:\n-- leads.domain is UNIQUE and the INSERT is ON CONFLICT DO NOTHING, so an\n-- existing row -- an ICH GCP CRO, or another location of the same network -- is\n-- never touched, its status least of all. The candidate is linked to it only if\n-- that lead came from Trialsites too; a CRO keeps its CRO scoring.\nWITH p AS (SELECT $1::jsonb AS j),\ncand AS (\n  SELECT c.* FROM site_candidates c, p WHERE c.location_id = (p.j->>'location_id')::bigint\n),\nnew_lead AS (\n  INSERT INTO leads (domain, company_name, country, source, status)\n  SELECT p.j->>'domain', cand.canonical_name, cand.country, 'trialsites', 'ingested'\n    FROM p, cand\n   WHERE p.j->>'outcome' = 'resolved' AND coalesce(p.j->>'domain', '') <> ''\n  ON CONFLICT (domain) DO NOTHING\n  RETURNING id\n),\nold_lead AS (\n  SELECT l.id, l.source FROM leads l, p\n   WHERE p.j->>'outcome' = 'resolved' AND l.domain = p.j->>'domain'\n),\nupd AS (\n  UPDATE site_candidates c SET\n    lookup_status   = CASE WHEN p.j->>'outcome' <> 'resolved' THEN p.j->>'outcome'\n                           WHEN EXISTS (SELECT 1 FROM new_lead) THEN 'resolved'\n                           ELSE 'duplicate' END,\n    lookup_attempts = c.lookup_attempts + 1,\n    lookup_detail   = left(CASE WHEN p.j->>'outcome' = 'resolved' AND NOT EXISTS (SELECT 1 FROM new_lead)\n                                THEN 'domain already a lead (id ' || coalesce((SELECT id FROM old_lead)::text, '?')\n                                     || ', source ' || coalesce((SELECT source FROM old_lead), '?') || '); '\n                                ELSE '' END || coalesce(p.j->>'detail', ''), 1000),\n    looked_up_at    = now(),\n    proposed_url    = p.j->>'proposed_url',\n    website_url     = CASE WHEN p.j->>'outcome' = 'resolved' THEN p.j->>'website_url' END,\n    domain          = CASE WHEN p.j->>'outcome' = 'resolved' THEN p.j->>'domain' END,\n    lead_id         = CASE WHEN p.j->>'outcome' <> 'resolved' THEN c.lead_id\n                           WHEN EXISTS (SELECT 1 FROM new_lead) THEN (SELECT id FROM new_lead)\n                           WHEN (SELECT source FROM old_lead) = 'trialsites' THEN (SELECT id FROM old_lead)\n                           ELSE NULL END\n    FROM p\n   WHERE c.location_id = (p.j->>'location_id')::bigint\n  RETURNING c.location_id, c.lookup_status, c.lead_id, c.domain\n),\nlogged AS (\n  INSERT INTO site_lookup_log (location_id, model, input_tokens, output_tokens, cache_read_tokens,\n                               cache_write_tokens, web_search_requests, cost_usd, outcome)\n  SELECT (j->>'location_id')::bigint, j->>'model', coalesce((j->>'input_tokens')::int, 0),\n         coalesce((j->>'output_tokens')::int, 0), coalesce((j->>'cache_read_tokens')::int, 0),\n         coalesce((j->>'cache_write_tokens')::int, 0), coalesce((j->>'web_search_requests')::int, 0),\n         coalesce((j->>'cost_usd')::numeric, 0), j->>'outcome'\n    FROM p\n   WHERE EXISTS (SELECT 1 FROM cand)\n  RETURNING cost_usd\n)\nSELECT u.location_id, u.lookup_status, u.lead_id, u.domain, (SELECT cost_usd FROM logged) AS cost_usd\n  FROM upd u;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json)] }}"
+        }
+      },
+      "name": "Record Lookup",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -100,
+        400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "novascoutPg01",
+          "name": "Postgres - novascout"
+        }
+      },
+      "notes": "Outcome, cost and (if confirmed) the lead in one statement. The lead is source='trialsites', status='ingested'; an existing domain is never touched."
+    }
+  ],
+  "connections": {
+    "Every 30 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Load Site State",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Load Lookup Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Load Site State",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Load Lookup Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Site State": {
+      "main": [
+        [
+          {
+            "node": "Harvest Due?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Harvest Due?": {
+      "main": [
+        [
+          {
+            "node": "Fetch Trialsites Countries",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Fetch Trialsites Countries": {
+      "main": [
+        [
+          {
+            "node": "Build Harvest Requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Harvest Requests": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Requests": {
+      "main": [
+        [
+          {
+            "node": "Select Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fetch Trialsites Sites",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Trialsites Sites": {
+      "main": [
+        [
+          {
+            "node": "Pace Requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pace Requests": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Select Candidates": {
+      "main": [
+        [
+          {
+            "node": "Write Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Lookup Batch": {
+      "main": [
+        [
+          {
+            "node": "Build Lookup Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Lookup Request": {
+      "main": [
+        [
+          {
+            "node": "Claude Website Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Website Lookup": {
+      "main": [
+        [
+          {
+            "node": "Verify Website",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Website": {
+      "main": [
+        [
+          {
+            "node": "Record Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all"
+  },
+  "pinData": {}
+}

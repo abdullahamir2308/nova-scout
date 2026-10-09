@@ -1096,6 +1096,9 @@ SELECT ((SELECT count(*) FROM ins) = 1
        l.company_name                                                           AS company_name,
        l.domain                                                                 AS domain,
        l.country                                                                AS country,
+       -- CRO, site or SMO (2026-10-09, lead_company_type(), migration 019):
+       -- which one-pager the notification links.
+       lead_company_type(e.raw_extraction, l.source)          AS company_type,
        s.fit_score                                                              AS fit_score,
        c.email                                                                  AS contact_email,
        p.p->>'from_addr'                                                        AS from_addr,
@@ -1111,7 +1114,8 @@ SELECT ((SELECT count(*) FROM ins) = 1
   FROM p
   LEFT JOIN leads l    ON l.id = (SELECT lead_id FROM hit)
   LEFT JOIN scores s   ON s.lead_id = l.id
-  LEFT JOIN contacts c ON c.lead_id = l.id;"""
+  LEFT JOIN contacts c ON c.lead_id = l.id
+  LEFT JOIN enrichments e ON e.lead_id = l.id;"""
 
 COMMAND_CONTEXT_SQL = with_iso("""-- Load Command Context: the three things Decide Command cannot read off the
 -- message itself (Section 9, Workflow 7). READ-ONLY -- it changes nothing, so a
@@ -1340,6 +1344,8 @@ SELECT q.message_id                                                     AS inbou
        l.domain                                                         AS domain,
        l.country                                                        AS country,
        l.source                                                         AS source,
+       -- CRO, site or SMO: lead_company_type(), the one definition (migration 019).
+       lead_company_type(e.raw_extraction, l.source)          AS company_type,
        -- A name only when the person who wrote IS the contact on file; the
        -- display name is not stored and a first name guessed out of a local
        -- part would be an invented fact in the greeting.
@@ -1359,7 +1365,8 @@ SELECT q.message_id                                                     AS inbou
                   'code', k.code, 'slot', k.slot, 'body', btrim(k.body),
                   'countries', to_jsonb(k.countries), 'measured', k.measured,
                   'confirmed', k.confirmed, 'active', k.active,
-                  'capabilities', to_jsonb(k.capabilities)) ORDER BY k.code), '[]'::jsonb)
+                  'capabilities', to_jsonb(k.capabilities),
+                  'company_types', to_jsonb(k.company_types)) ORDER BY k.code), '[]'::jsonb)
           FROM claims_library k
          WHERE k.active AND k.confirmed)                                AS library,
        e.therapeutic_areas                                              AS therapeutic_areas,
@@ -1736,11 +1743,14 @@ SELECT l.id                                                             AS lead_
        __ISO_FIRST__                                                    AS first_sent_at,
        __ISO_LAST__                                                     AS last_sent_at,
        l.country                                                        AS country,
+       -- CRO, site or SMO: lead_company_type(), the one definition (migration 019).
+       lead_company_type(e.raw_extraction, l.source)          AS company_type,
        lf.message_body                                                  AS last_follow_up_body,
        (SELECT coalesce(jsonb_agg(jsonb_build_object(
                   'code', k.code, 'slot', k.slot, 'body', btrim(k.body),
                   'countries', to_jsonb(k.countries), 'measured', k.measured,
-                  'confirmed', k.confirmed, 'capabilities', to_jsonb(k.capabilities))
+                  'confirmed', k.confirmed, 'capabilities', to_jsonb(k.capabilities),
+                  'company_types', to_jsonb(k.company_types))
                   ORDER BY k.code), '[]'::jsonb)
           FROM claims_library k
          WHERE k.active)                                                AS library,
@@ -2470,9 +2480,10 @@ FOLLOWUP_REQUEST = {
 }
 
 FOLLOWUP_SYSTEM_PROMPT = "\n".join([
-    "You write one short follow-up email to a small contract research organisation (CRO) that has",
-    "not replied to a cold first email from " + SENDER_NAME + ". A person reviews it before anything is",
-    "sent.",
+    "You write one short follow-up email to a small clinical research business -- a contract",
+    "research organisation (CRO), an independent research site or a site management organisation",
+    "(SMO); the message says which -- that has not replied to a cold first email from " + SENDER_NAME + ".",
+    "A person reviews it before anything is sent.",
     "",
     "Each message gives you THE FIRST EMAIL exactly as it was sent, and APPROVED CLAIMS: the only",
     "things you may say about what we built, the problem it solves, and who uses it. You may",
@@ -2495,8 +2506,9 @@ FOLLOWUP_SYSTEM_PROMPT = "\n".join([
     "",
     "THE PROSPECT: no new fact about them. The only facts are the ones the first email already",
     "states. Never describe them as sponsoring anything -- in these emails \"sponsor\" means the",
-    "biotech, pharma, device or academic company that hires a CRO, their client. Never write the",
-    "company's name or a person's name.",
+    "biotech, pharma, device or academic company that runs a trial and hires a CRO or a research",
+    "site, their client. A research site or an SMO is never a CRO: never call it one, and never",
+    "write \"CRO websites\" to it. Never write the company's name or a person's name.",
     "",
     "THE PRODUCT: the first email introduced it; refer back to it (\"the assistant\"), do not",
     "describe it again and do not name it. Never call it a chatbot or a Q&A bot. The word \"AI\"",
@@ -2511,7 +2523,8 @@ FOLLOWUP_SYSTEM_PROMPT = "\n".join([
     "- claiming to identify anonymous website visitors",
     "- naming any CRM, tool or integration",
     "- supported languages",
-    "- any count of clients beyond the two named deployments",
+    "- any count of clients beyond the deployments the proof line names",
+    "- calling Vertex Clinical Research a CRO -- it is a clinical research center",
     "- saying it books calls or fills a calendar -- it sends the sponsor your booking link, and the",
     "  sponsor books",
     "- saying it answers from SOPs or from documents -- it answers from their website",
@@ -2590,8 +2603,9 @@ REPLY_TOPICS = re.findall(r"^\s*topic: '([a-z]+)',", _reply_topics, re.M)
 assert len(REPLY_TOPICS) == 5, "code_reply_topics.js no longer holds the operator's five open topics: %r" % REPLY_TOPICS
 
 REPLY_SYSTEM_PROMPT = "\n".join([
-    "You write one short email replying to a small contract research organisation (CRO) that has",
-    "answered a cold email from " + SENDER_NAME + ". " + SENDER_NAME + " reads your draft and approves,",
+    "You write one short email replying to a small clinical research business -- a CRO, an",
+    "independent research site or an SMO; the message says which -- that has answered a cold email",
+    "from " + SENDER_NAME + ". " + SENDER_NAME + " reads your draft and approves,",
     "edits or rejects it before anything is sent. You are answering a real person who took the time",
     "to write back.",
     "",
@@ -2624,7 +2638,8 @@ REPLY_SYSTEM_PROMPT = "\n".join([
     "",
     "THE PROSPECT: only the facts in their record and in the thread. Never describe them as",
     "sponsoring anything -- in these emails \"sponsor\" means the biotech, pharma, device or",
-    "academic company that hires a CRO, their client. Never invent a trial, a person, a city or a",
+    "academic company that runs a trial and hires a CRO or a research site, their client. A research",
+    "site or an SMO is never a CRO: never call it one. Never invent a trial, a person, a city or a",
     "number. Do not name their company back at them.",
     "",
     "THE PRODUCT: the first email introduced it; refer back to it (\"the assistant\"). Never call it",

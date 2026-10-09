@@ -68,8 +68,24 @@ t.check('a small headcount does not disqualify',
   codes(ok({ employee_estimate: 12 })), []);
 
 // --- the other deterministic rules ---------------------------------------
-t.check('explicit is_cro false disqualifies',
-  codes(withRaw({ is_cro: false })), ['not_a_cro']);
+t.check('a pre-enum lead with explicit is_cro false disqualifies (not a CRO, site or SMO)',
+  codes(withRaw({ is_cro: false })), ['not_cro_site_smo']);
+t.check('a pre-enum lead whose label says site management organisation is NOT disqualified',
+  codes(withRaw({ is_cro: false, company_type: 'site management organisation' })), []);
+t.check('a pre-enum lead whose label says research centre is NOT disqualified',
+  codes(withRaw({ is_cro: false, company_type: 'clinical research centre' })), []);
+// --- company_type, the closed enum since 2026-10-09 ------------------------
+t.check('company_type other disqualifies', codes(withRaw({ is_cro: undefined, company_type: 'other' })), ['not_cro_site_smo']);
+t.check('company_type CRO does not', codes(withRaw({ is_cro: undefined, company_type: 'CRO' })), []);
+t.check('company_type site does not', codes(withRaw({ is_cro: undefined, company_type: 'site' })), []);
+t.check('company_type SMO does not', codes(withRaw({ is_cro: undefined, company_type: 'SMO' })), []);
+t.check('company_type unclear is not evidence', codes(withRaw({ is_cro: undefined, company_type: 'unclear' })), []);
+t.check('company_type null is not evidence', codes(withRaw({ is_cro: undefined, company_type: null })), []);
+t.check('the enum wins over a stale is_cro: site + is_cro false is not disqualified',
+  codes(withRaw({ is_cro: false, company_type: 'site' })), []);
+const tsReason = hardDisqualifiers(Object.assign(withRaw({ company_type: 'other' }), { source: 'trialsites' }))[0].text;
+t.check('a Trialsites lead reason says where it came from, not "ICH GCP"',
+  [tsReason.indexOf('Trialsites') !== -1, tsReason.indexOf('ICH GCP') === -1], [true, true]);
 t.check('an existing chatbot disqualifies',
   codes(ok({ has_chatbot: true, chatbot_vendor: 'Tawk' })), ['has_chatbot']);
 t.check('blocklisted domain disqualifies',
@@ -167,7 +183,7 @@ t.check('every matching rule is recorded, most-decisive first',
     employee_estimate: 900,
     raw_extraction: { enrichment_status: 'ok', is_cro: false, fetch: { ok: true, errors: [] } },
   })),
-  ['blocklist', 'not_a_cro', 'enterprise_scale', 'has_chatbot']);
+  ['blocklist', 'not_cro_site_smo', 'enterprise_scale', 'has_chatbot']);
 
 // --- the reason text is for a human --------------------------------------
 const chatbotReason = hardDisqualifiers(ok({ has_chatbot: true, chatbot_vendor: 'Intercom' }))[0].text;

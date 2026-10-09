@@ -26,7 +26,6 @@ return {
       raw_extraction: {
         enrichment_status: src.fetch_ok ? 'no_readable_text' : 'unreachable',
         domain: src.domain,
-        is_cro: null,
         company_type: null,
         founder_title: null,
         city: null,

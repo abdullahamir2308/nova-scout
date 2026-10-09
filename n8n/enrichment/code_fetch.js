@@ -55,8 +55,12 @@ const SYSTEM_PROMPT = [
   '- founder_title: that person\'s title as written on the site. Otherwise null.',
   '- employee_estimate: only if the site states a headcount or team size. Never estimate from page length or tone. Otherwise null.',
   '- city: headquarters city if stated, as a plain city name only ("Cdad. Autonoma de Buenos Aires" -> "Buenos Aires", "Valinhos-SP" -> "Valinhos"). Otherwise null.',
-  '- is_cro: true only if this is a contract research organisation or clinical research services provider. False for marketing agencies, consultancies, software vendors, hospitals, or companies selling lab products.',
-  '- company_type: short label, e.g. "CRO", "site management organisation", "consultancy", "lab services", "unclear".',
+  '- company_type: exactly one of "CRO", "site", "SMO", "other", "unclear".',
+  '    CRO: a contract research organisation that runs or manages clinical trials for sponsors (monitoring, project or data management, regulatory, biostatistics, bioequivalence). A CRO that also runs its own clinic or phase I unit is still CRO.',
+  '    site: an independent clinical research site or research centre where trials are carried out with patients and investigators, including a private clinic or practice that runs clinical trials. Not a hospital and not a university.',
+  '    SMO: a site management organisation that runs or manages a network of research sites, or supplies sites with study coordinators and patient recruitment.',
+  '    other: anything else -- a hospital, a university or medical school, a government body, a marketing agency, a consultancy, a software or technology vendor, a laboratory or product supplier, or a pharmaceutical or biotech company.',
+  '    unclear: the text does not say what the company is.',
   '- site_quality_notes: one or two factual sentences on the site\'s depth, professionalism and apparent budget. No marketing adjectives.',
 ].join('\n');
 

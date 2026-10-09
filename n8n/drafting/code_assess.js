@@ -227,13 +227,41 @@ function firstName(name) {
   return parts.length ? parts[0] : '';
 }
 
-// The active claims-library rows, as the batch query aggregated them. A row
-// with no text is not a line, whatever its flags say.
-function libraryRows(raw) {
+// Which kind of prospect this is (2026-10-09, Workflow 1b). The batch query
+// already resolves it; anything unexpected is treated as a CRO, the type every
+// line written before sites existed is for.
+const COMPANY_TYPES = ['CRO', 'site', 'SMO'];
+function companyTypeOf(v) {
+  return COMPANY_TYPES.indexOf(str(v)) !== -1 ? str(v) : 'CRO';
+}
+
+// What the model is told about the prospect's kind, in the user message (never
+// the cached system prompt, which is the same for every lead). A site hears from
+// sponsors AND from CROs choosing sites, and is never itself a CRO. Its web pages
+// are "your website": the 2026-10-09 dry run's first site draft opened "Your site
+// lists ...", which to a research site reads as the clinic, not the web page.
+const SITE_WORDING = 'Call its web pages "your website", never "your site" -- to a research site,\n' +
+  '"your site" means the clinic.';
+const PROSPECT_TYPE_NOTES = {
+  CRO: 'THE PROSPECT is a contract research organisation (CRO). Its inquiries come from sponsors.',
+  site: 'THE PROSPECT is an independent clinical research site, NOT a CRO. Its inquiries come from sponsors\n' +
+    'and from CROs choosing sites for a study. Never call it a CRO, never write "CRO websites", and\n' +
+    'never use a proof that calls a deployment a CRO. ' + SITE_WORDING,
+  SMO: 'THE PROSPECT is a site management organisation (SMO) running research sites, NOT a CRO. Its\n' +
+    'inquiries come from sponsors and from CROs choosing sites for a study. Never call it a CRO, never\n' +
+    'write "CRO websites", and never use a proof that calls a deployment a CRO. ' + SITE_WORDING,
+};
+
+// The active claims-library rows, as the batch query aggregated them, that are
+// written for this kind of prospect. A row with no text is not a line, whatever
+// its flags say; a row with no company_types predates them and is a CRO line.
+function libraryRows(raw, companyType) {
   const list = Array.isArray(raw) ? raw : [];
   const out = [];
   for (const r of list) {
     if (!r || typeof r !== 'object' || !str(r.body)) continue;
+    const types = Array.isArray(r.company_types) && r.company_types.length ? r.company_types.map(str) : ['CRO'];
+    if (companyType && types.indexOf(companyType) === -1) continue;
     out.push({
       code: str(r.code),
       slot: str(r.slot),
@@ -324,6 +352,10 @@ const base = {
   company_name: lead.company_name,
   country: lead.country,
   fit_score: lead.fit_score,
+  // CRO, site or SMO -- the batch query's one definition (enrichment's
+  // company_type when it is one of the three, otherwise by source). It decides
+  // which claims are offered and which wording Assemble Drafts refuses.
+  company_type: companyTypeOf(lead.company_type),
 };
 
 // --- Can this lead ever be sent to? ---------------------------------------
@@ -650,7 +682,7 @@ const prompt = [
 //
 // A lead that is not groundable does not need the library -- it gets the
 // low-context note either way -- so it is not held back by it.
-const lib = libraryRows(lead.library);
+const lib = libraryRows(lead.library, base.company_type);
 const bySlot = function (slot) { return lib.filter(function (r) { return r.slot === slot; }); };
 const pools = {
   description: lines(bySlot('description')),
@@ -693,7 +725,8 @@ const repeatSheet = pairs.length
     '\n\n'
   : '';
 
-const fullPrompt = prompt + '\n\nAPPROVED CLAIMS FOR THIS EMAIL. Nothing about the product, the problem or the\n' +
+const fullPrompt = PROSPECT_TYPE_NOTES[base.company_type] + '\n\n' + prompt +
+  '\n\nAPPROVED CLAIMS FOR THIS EMAIL. Nothing about the product, the problem or the\n' +
   'proof may come from anywhere else. Rephrase freely; never widen what a line says.\n\n' +
   claimsSheet + '\n\n' + repeatSheet +
   'Write the email subject, the email (body and ask) and the LinkedIn DM (body and ask).\n' +

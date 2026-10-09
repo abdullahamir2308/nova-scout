@@ -283,4 +283,11 @@ t.check('every notification links the one-pager, and no recording link exists (n
 t.check('the asset section is one line per asset -- today, exactly one',
   n.text.match(/^  [^:]+: https:\/\//gm).length, 1);
 
+// The reply link by company type (2026-10-09): a site or SMO gets the site one-pager.
+const assetUrl = (type) => (note({ company_type: type }).text.match(/^  [^:]+: (https:\/\/\S+)$/m) || [])[1];
+t.check('a CRO reply links the CRO one-pager', assetUrl('CRO'), 'https://raw.githubusercontent.com/abdullahamir2308/nova-scout/main/nova-one-pager.docx');
+t.check('a site reply links the site one-pager', assetUrl('site'), 'https://raw.githubusercontent.com/abdullahamir2308/nova-scout/main/nova-one-pager-sites.docx');
+t.check('an SMO reply links the site one-pager', assetUrl('SMO'), 'https://raw.githubusercontent.com/abdullahamir2308/nova-scout/main/nova-one-pager-sites.docx');
+t.check('no company type (an unmatched sender, an old row) falls back to the CRO one-pager', assetUrl(undefined), assetUrl('CRO'));
+
 t.done();

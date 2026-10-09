@@ -30,38 +30,13 @@
 // investigator emails from registry data).
 
 // ---------------------------------------------------------------------------
-// Constants. The two country lists are substituted at build time from
-// NovaScout_MasterRef.md Section 12 by n8n/sites/build_workflow.py.
+// Constants. The country mapping (INCLUDED_COUNTRIES, CORE_COUNTRIES, the
+// Trialsites aliases, str, fold, canonicalCountry, isCore) is code_countries.js,
+// which build_workflow.py prepends to this source verbatim.
 // ---------------------------------------------------------------------------
-
-const INCLUDED_COUNTRIES = __INCLUDED_COUNTRIES__;
-const CORE_COUNTRIES = __CORE_COUNTRIES__;
 
 // At most this many NEW candidates per harvest (the operator's brief: 200 a week).
 const MAX_NEW = __MAX_NEW__;
-
-// Trialsites spellings that are not the leads.country spelling. Read from the
-// live /countries list on 2026-10-09. A spelling not here and not equal to an
-// included name is simply not harvested -- the run reports it, nothing guesses.
-const TRIALSITES_ALIASES = {
-  'united states': 'USA',
-  'united states of america': 'USA',
-  'czechia': 'Czech Republic',
-  'korea, south': 'South Korea',
-  'korea, republic of': 'South Korea',
-  'turkiye': 'Turkey',
-  'turkey (turkiye)': 'Turkey',
-  'united arab emirates': 'UAE',
-  'tanzania, united republic of': 'Tanzania',
-  'democratic republic of the congo': 'DR Congo',
-  'congo (the democratic republic of the)': 'DR Congo',
-  'congo, democratic republic': 'DR Congo',
-  'republic of the congo': 'Congo',
-  'north macedonia': 'Macedonia',
-  'the gambia': 'Gambia',
-  'the bahamas': 'Bahamas',
-  'bosnia & herzegovina': 'Bosnia and Herzegovina',
-};
 
 // Types that are a public or institutional body whatever the name says.
 const EXCLUDED_FACILITY_TYPES = [
@@ -75,7 +50,7 @@ const SITE_FACILITY_TYPES = ['private practice', 'cro / phase 1 unit'];
 // included countries. Whole words of the accent-folded, lower-cased name, so
 // "trust" never fires inside "trustworthy" nor "state" inside "estate".
 const EXCLUDED_WORDS = [
-  'hospital', 'hospitals', 'hospitalar', 'hopital', 'ospedale', 'hastane', 'hastanesi', 'szpital',
+  'hospital', 'hospitals', 'hospitalar', 'hospitalaria', 'hospitalario', 'hopital', 'ospedale', 'hastane', 'hastanesi', 'szpital',
   'szpitala', 'szpitalny', 'korhaz', 'nemocnice', 'spital', 'spitalul', 'krankenhaus', 'klinikum',
   'ziekenhuis', 'sjukhus', 'sygehus', 'sairaala', 'nosocomio', 'bolnica', 'policlinico', 'santa casa',
   'infirmary', 'medical college', 'college', 'school', 'academy',
@@ -87,7 +62,22 @@ const EXCLUDED_WORDS = [
   'trust', 'military', 'army', 'navy', 'veterans', 'seguro social', 'imss', 'issste', 'aiims', 'pgimer',
 ];
 
-// A research word in the name -- the site says what it is.
+// The same institutions by STEM, because the included countries' languages
+// inflect: the 2026-10-09 dry run chose "Uniwersyteckie Centrum Kliniczne"
+// (Gdansk's university hospital) because only "uniwersytet" and "uniwersytecki"
+// were listed, and paid a lookup for it. A word STARTING with one of these is an
+// institution's word in any of its forms. Not "hospital" as a stem (a Brazilian
+// research centre brands itself "Hospitalize"; the hospital words above are
+// whole words), and not "univers" (it would take "Universal ... LLC").
+const EXCLUDED_STEMS = [
+  'universit', 'universid', 'uniwersyt', 'univerzit', 'egyetem', 'szpital', 'hastane', 'nemocnic', 'spital',
+  'krankenhaus', 'ziekenhuis', 'sjukhus', 'sygehus', 'sairaal', 'ospedal', 'bolnic', 'korhaz', 'ministr',
+  'minister', 'fakult', 'facult', 'faculd',
+];
+
+// A research word in the name -- the site says what it is. Polish "kliniczne"
+// counts: KO-MED Centra Kliniczne is a private research-site network named that
+// way, and a university clinic with the same word is caught by the stems above.
 const RESEARCH_WORDS = [
   'research', 'investigacion', 'investigaciones', 'investigacao', 'investigacoes', 'pesquisa',
   'pesquisas', 'badan', 'badania', 'kliniczne', 'klinicznych', 'arastirma', 'arastirmalari', 'kutato',
@@ -108,38 +98,13 @@ function wordsRe(list) {
   return new RegExp('(^| )(' + list.map(function (w) { return w.replace(/ /g, ' '); }).join('|') + ')( |$)');
 }
 const EXCLUDED_NAME = wordsRe(EXCLUDED_WORDS);
+const EXCLUDED_STEM = new RegExp('(^| )(' + EXCLUDED_STEMS.join('|') + ')[a-z]*( |$)');
 const RESEARCH_NAME = wordsRe(RESEARCH_WORDS);
 const LEGAL_FORM = new RegExp('(^| )(' + LEGAL_FORMS.join('|') + ')$');
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function str(v) {
-  return v === null || v === undefined ? '' : String(v).trim();
-}
-
-// Accent-folded, lower-cased, curly apostrophes made straight: "Côte d’Ivoire"
-// and "Türkiye" meet the table the way a person would expect.
-function fold(v) {
-  return str(v).normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[‘’]/g, "'")
-    .toLowerCase().replace(/\s+/g, ' ');
-}
-
-const INCLUDED_BY_KEY = {};
-INCLUDED_COUNTRIES.forEach(function (c) { INCLUDED_BY_KEY[fold(c)] = c; });
-const CORE_KEYS = CORE_COUNTRIES.map(fold);
-
-// leads.country for a Trialsites spelling, or null if it is not harvested.
-function canonicalCountry(trialsitesName) {
-  const k = fold(trialsitesName);
-  if (Object.prototype.hasOwnProperty.call(INCLUDED_BY_KEY, k)) return INCLUDED_BY_KEY[k];
-  if (Object.prototype.hasOwnProperty.call(TRIALSITES_ALIASES, k)) {
-    const target = TRIALSITES_ALIASES[k];
-    return Object.prototype.hasOwnProperty.call(INCLUDED_BY_KEY, fold(target)) ? INCLUDED_BY_KEY[fold(target)] : null;
-  }
-  return null;
-}
 
 function num(v) {
   const n = Number(v);
@@ -161,7 +126,7 @@ function rejection(row) {
   if (EXCLUDED_NETWORK_TYPES.indexOf(nt) !== -1) return 'institution-network';
   const name = words(row.canonical_name);
   if (!name) return 'no-name';
-  if (EXCLUDED_NAME.test(name)) return 'institution-name';
+  if (EXCLUDED_NAME.test(name) || EXCLUDED_STEM.test(name)) return 'institution-name';
   if (!positiveSignal(name, ft)) return 'no-site-signal';
   return null;
 }
@@ -183,7 +148,7 @@ function positiveSignal(name, facilityType) {
 // Lower is sooner. Core countries first (they earn the full geography weight),
 // then tier A, then the most recent trial activity, then volume.
 function priority(row, country) {
-  const core = CORE_KEYS.indexOf(fold(country)) !== -1 ? 0 : 1;
+  const core = isCore(country) ? 0 : 1;
   const tier = str(row.site_tier).toUpperCase() === 'A' ? 0 : 1;
   const recent = Math.max(0, 999 - Math.min(999, num(row.recent_trials_3yr)));
   return core * 10000000 + tier * 1000000 + recent * 1000 + Math.max(0, 999 - Math.min(999, num(row.trial_count)));
@@ -264,7 +229,7 @@ function select(responses, knownIds, maxNew) {
 // Node body
 // ---------------------------------------------------------------------------
 
-const gate = $('Harvest Due?').first().json;
+const gate = $('Load Site State').first().json;
 const responses = $input.all().map(function (i) { return i.json; });
 const result = select(responses, gate.known_ids || [], MAX_NEW);
 

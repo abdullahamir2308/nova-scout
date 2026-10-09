@@ -84,6 +84,16 @@ t.check('an HTML error page instead of JSON drops the lead',
 t.check('totalCount 0 is a real answer and is NOT a failure',
   noTrials.write, true);
 
+// --- a Trialsites lead takes the trials factor from Trialsites -------------
+const TS = { points: 19, max: 20, basis: 'confirmed', detail: 'Trialsites: 20 trials in the last 3 years (10), 48 in all (4), tier A (5)',
+  source: 'trialsites', recent_trials_3yr: 20, trial_count: 48, active_recruiting: 9, site_tier: 'A' };
+const tsScored = score({ totalCount: 0 }, { trialsites_trials: TS });
+t.check('a Trialsites lead scores its trials factor from Trialsites, not the CT.gov 0', tsScored.fit_score, 94);
+t.check('a Trialsites lead is NOT dropped when ClinicalTrials.gov fails', score({ error: 'ETIMEDOUT' }, { trialsites_trials: TS }).write, true);
+t.check('the rationale prompt states the Trialsites activity, not a CT.gov sponsor count',
+  [/Trialsites registry aggregate\): 20 trials in the last 3 years/.test(tsScored.prompt), /ClinicalTrials\.gov as sponsor/.test(tsScored.prompt)], [true, false]);
+t.check('the stored breakdown names Trialsites as the source', /trials 19\/20 \(confirmed: Trialsites/.test(tsScored.payload.rationale), true);
+
 // --- the stored rationale is auditable ------------------------------------
 t.check('the deterministic rationale names the company',
   withTrials.payload.rationale.indexOf('Example Clinical Research') !== -1, true);

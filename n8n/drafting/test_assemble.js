@@ -568,4 +568,53 @@ t.check('a repaired answer (Apply Repair\'s output) runs every rule again and ca
    REPAIRED.email_flags],
   [true, 1, 1, true, FIRST.email_flags]);
 
+// --- sites and SMOs (2026-10-09): never "CRO websites", never "two CROs",
+// --- never the prospect called a CRO; Vertex is never a CRO for anyone -------
+
+const PR_SITE = line('PR-SITE', "It's live at Vertex Clinical Research, a research center in Mexico.");
+const SITE_D = line('D-SITE2', 'an AI assistant for your website that turns study inquiries from sponsors and CROs into qualified leads', true,
+  ['qualifies', 'captures-lead']);
+const SITE_ANG = line('ANG-SITE-SPEED', "CROs choosing sites notice how quickly you respond, and a research site can't staff an inquiry desk around the clock.");
+const SITE_BEN = line('BEN-SITE-247', 'It answers sponsors and CROs from your own website, in real time, at any hour.', true, ['answers']);
+const SITE_POOLS = { description: [SITE_D], angle: [SITE_ANG], benefit: [SITE_BEN], proof: [PR_SITE], ask: [A1, A2] };
+const SITE_BODY =
+  'Your site lists oncology and respiratory work. CROs choosing sites notice how quickly you respond, and a ' +
+  "research site can't staff an inquiry desk around the clock.\n\n" +
+  'We built an AI assistant for your website that turns study inquiries from sponsors and CROs into qualified ' +
+  'leads (we call it Nova). It answers sponsors and CROs from your own website at any hour. ' +
+  "It's live at Vertex Clinical Research, a research center in Mexico.";
+function siteGen(over) {
+  return Object.assign({
+    email_subject: 'Oncology study inquiries from sponsors and CROs',
+    email_body: SITE_BODY,
+    linkedin_body: 'Your site lists oncology and respiratory work. We built an AI assistant for your website that ' +
+      "turns study inquiries from sponsors and CROs into qualified leads (we call it Nova); it's live at Vertex " +
+      'Clinical Research, a research center in Mexico.',
+    email_claims: ['D-SITE2', 'ANG-SITE-SPEED', 'BEN-SITE-247', 'PR-SITE', 'A1'],
+    linkedin_claims: ['D-SITE2', 'PR-SITE', 'A2'],
+  }, over || {});
+}
+function siteFlagsOf(genOver, type) {
+  return assemble(siteGen(genOver), { company_type: type || 'site', library_pools: SITE_POOLS }).email_flags;
+}
+const SITE_TAGS = ['cro-website', 'proof-two-cros', 'prospect-cro', 'vertex-cro'];
+t.check('a clean site email naming CROs as its visitors carries no site tag',
+  siteFlagsOf({}).filter(function (f) { return SITE_TAGS.indexOf(f) !== -1; }), []);
+t.check('"CRO websites" in a site email is tagged cro-website',
+  has(siteFlagsOf({ email_body: SITE_BODY.replace('CROs choosing sites notice', 'Sponsors browsing CRO websites notice') }), 'cro-website'), true);
+t.check('the "two CROs" proof in a site email is tagged proof-two-cros',
+  has(siteFlagsOf({ email_body: SITE_BODY.replace("It's live at Vertex Clinical Research, a research center in Mexico.", "It's live at two CROs, in Türkiye and Mexico.") }), 'proof-two-cros'), true);
+t.check('calling the site "a small CRO" is tagged prospect-cro',
+  has(siteFlagsOf({ email_body: SITE_BODY.replace('CROs choosing sites notice', 'As a small CRO, you know CROs choosing sites notice') }), 'prospect-cro'), true);
+t.check('"your CRO" in the subject of a site email is tagged too',
+  has(siteFlagsOf({ email_subject: 'Study inquiries reaching your CRO after hours' }), 'prospect-cro'), true);
+t.check('the same wording holds for an SMO',
+  has(siteFlagsOf({ email_body: SITE_BODY.replace('CROs choosing sites notice', 'Sponsors browsing CRO websites notice') }, 'SMO'), 'cro-website'), true);
+t.check('Vertex called a CRO is tagged vertex-cro in a site email',
+  has(siteFlagsOf({ email_body: SITE_BODY.replace('a research center in Mexico', 'a CRO in Mexico') }), 'vertex-cro'), true);
+t.check('... and in a CRO email too: Vertex is never a CRO, whoever reads it',
+  has(emailFlags({ email_body: CLEAN_BODY.replace("It's live at NoblePath, an oncology CRO in Türkiye.", "It's live at Vertex Clinical Research, a CRO in Mexico.") }), 'vertex-cro'), true);
+t.check('a CRO email may still say CROs and use PR-BOTH (the site rules are for sites)',
+  emailFlags().filter(function (f) { return SITE_TAGS.indexOf(f) !== -1; }), []);
+
 t.done();
