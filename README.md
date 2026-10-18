@@ -47,3 +47,7 @@ committed** — it holds the Postgres credentials and the n8n encryption key.
 claude --resume fe99025d-ea7d-4e3d-b31d-7bcbc3d2353c
 powershell -ExecutionPolicy Bypass -File .\run-all.ps1 -SkipPreflight
 -TaskTimeoutMinutes 60
+
+claude --resume 24addfde-1f53-4f55-9e27-7b6dd265d78c
+
+claude --resume b943fe7a-8ac5-4420-8bf9-98322a2f0b64
