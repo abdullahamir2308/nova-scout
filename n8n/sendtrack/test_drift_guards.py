@@ -8,8 +8,10 @@ script itself, introduces exactly one divergence, and asserts the build refuses.
 
 The cases worth reading twice: the warm-up table (the ceiling IS the product of
 this workflow), Section 6 (a send query that can see LinkedIn drafts), the
-opt-out sentence and keywords (Section 5's GDPR/KVKK mechanism), and the wiring
-cases (Workflow 4's silent-empty-field bug, for every node boundary here).
+opt-out keywords and the retired opt-out sentence (Section 5's GDPR/KVKK
+mechanism), the follow-up templates (Section 9, LOCKED wording since 2026-10-19),
+and the wiring cases (Workflow 4's silent-empty-field bug, for every node
+boundary here).
 
 Exits non-zero on the first guard that failed to fire.
 """
@@ -26,18 +28,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 MASTER_REF = os.path.join(REPO, "NovaScout_MasterRef.md")
 COMPOSE = os.path.join(REPO, "docker-compose.yml")
-# The follow-ups are composed under drafting skill v3 (section 8): the build
-# parses the skill and embeds drafting's code_assemble.js rules, so each case
-# gets its own copy of both.
-SKILL = os.path.join(REPO, "NovaScout_DraftingSkill.md")
+# Three of drafting's files are read by this build: code_assemble.js (the Reply
+# Assistant's claim rules, embedded verbatim), code_template.js (the follow-up
+# templates and the gate, embedded verbatim since 2026-10-19) and template_spec.py
+# (which checks those templates against Section 9). Each case gets its own copy.
 RULES = os.path.join(REPO, "n8n", "drafting", "code_assemble.js")
-# Auto-approval (migration 014): Follow-Ups embeds drafting's Approval Gate and
-# Apply Claim Check verbatim, so each case gets its own copy of those too.
-APPROVAL = os.path.join(REPO, "n8n", "drafting", "code_approval.js")
-APPROVAL_APPLY = os.path.join(REPO, "n8n", "drafting", "code_approval_apply.js")
-# The repair loop (2026-10-03): Apply Repair's body and the chain generator.
-APPROVAL_REPAIR = os.path.join(REPO, "n8n", "drafting", "code_approval_repair.js")
-APPROVAL_CHAIN = os.path.join(REPO, "n8n", "drafting", "approval_chain.py")
+TEMPLATE = os.path.join(REPO, "n8n", "drafting", "code_template.js")
+TEMPLATE_SPEC = os.path.join(REPO, "n8n", "drafting", "template_spec.py")
 # Section 12's clock table must cover every country the scraper includes, so each
 # case gets its own copy of the scraper tree -- geography.py classifies the slugs
 # and index_slugs.json is the /cro-list index as it was last read.
@@ -58,7 +55,11 @@ def index_countries():
 PASSED = []
 FAILED = []
 
-FIXTURE_SENDER = "Drift Test Sender"
+# The follow-up template carries the sender's name and title as approved text,
+# and the build refuses a sign-off that is not NOVASCOUT_SENDER_NAME / _TITLE --
+# so every case builds as that sender.
+FIXTURE_SENDER = "Abdullah Amir"
+FIXTURE_TITLE = "Founder, Amitrix Labs"
 FIXTURE_MAILBOX = "sender@drift-test.example"
 
 
@@ -76,15 +77,15 @@ def run_build(tmp, env_overrides=None):
     env = dict(os.environ)
     env["NOVASCOUT_MASTER_REF"] = os.path.join(tmp, "MasterRef.md")
     env["NOVASCOUT_COMPOSE"] = os.path.join(tmp, "docker-compose.yml")
-    env["NOVASCOUT_DRAFTING_SKILL"] = os.path.join(tmp, "DraftingSkill.md")
     env["NOVASCOUT_DRAFTING_DIR"] = os.path.join(tmp, "drafting")
     env["SENDTRACK_OUT"] = os.path.join(tmp, "out")
     env["NOVASCOUT_SCRAPER_ROOT"] = tmp
     # The real .env is out of every case unless a case brings its own file.
     env["NOVASCOUT_ENV_FILE"] = os.path.join(tmp, "no-such.env")
     env["NOVASCOUT_SENDER_NAME"] = FIXTURE_SENDER
+    env["NOVASCOUT_SENDER_TITLE"] = FIXTURE_TITLE
     env["NOVASCOUT_MAILBOX_ADDRESS"] = FIXTURE_MAILBOX
-    for k in ("NOVASCOUT_SENDER_TITLE", "NOVASCOUT_SENDER_PHONE", "NOVASCOUT_OPERATOR_EMAIL",
+    for k in ("NOVASCOUT_SENDER_PHONE", "NOVASCOUT_OPERATOR_EMAIL",
               "SENDTRACK_VARIANTS_OUT", "SENDTRACK_DRYRUN_NOW", "SENDTRACK_FIXTURES"):
         env.pop(k, None)
     env["PYTHONIOENCODING"] = "utf-8"
@@ -98,19 +99,14 @@ def run_build(tmp, env_overrides=None):
     return p.returncode, p.stderr.decode("utf-8", "replace")
 
 
-def setup(mutate_doc=None, mutate_compose=None, mutate_file=None, mutate_skill=None, mutate_rules=None,
-          mutate_approval=None, mutate_index=None):
+def setup(mutate_doc=None, mutate_compose=None, mutate_file=None, mutate_rules=None, mutate_template=None,
+          mutate_index=None):
     tmp = tempfile.mkdtemp(prefix="novascout-sendtrack-drift-")
-    for src, dst, fn, label in ((SKILL, "DraftingSkill.md", mutate_skill, "the skill"),
-                                (RULES, os.path.join("drafting", "code_assemble.js"), mutate_rules, "code_assemble.js"),
-                                (APPROVAL, os.path.join("drafting", "code_approval.js"), mutate_approval,
-                                 "code_approval.js"),
-                                (APPROVAL_APPLY, os.path.join("drafting", "code_approval_apply.js"), None,
-                                 "code_approval_apply.js"),
-                                (APPROVAL_REPAIR, os.path.join("drafting", "code_approval_repair.js"), None,
-                                 "code_approval_repair.js"),
-                                (APPROVAL_CHAIN, os.path.join("drafting", "approval_chain.py"), None,
-                                 "approval_chain.py")):
+    for src, dst, fn, label in ((RULES, os.path.join("drafting", "code_assemble.js"), mutate_rules, "code_assemble.js"),
+                                (TEMPLATE, os.path.join("drafting", "code_template.js"), mutate_template,
+                                 "code_template.js"),
+                                (TEMPLATE_SPEC, os.path.join("drafting", "template_spec.py"), None,
+                                 "template_spec.py")):
         text = read(src)
         if fn:
             new = fn(text)
@@ -151,9 +147,8 @@ def setup(mutate_doc=None, mutate_compose=None, mutate_file=None, mutate_skill=N
 
 
 def case(label, expect_in, mutate_doc=None, mutate_compose=None, mutate_file=None, env_overrides=None,
-         mutate_skill=None, mutate_rules=None, mutate_approval=None, mutate_index=None):
-    tmp = setup(mutate_doc, mutate_compose, mutate_file, mutate_skill, mutate_rules, mutate_approval,
-                mutate_index)
+         mutate_rules=None, mutate_template=None, mutate_index=None):
+    tmp = setup(mutate_doc, mutate_compose, mutate_file, mutate_rules, mutate_template, mutate_index)
     try:
         rc, err = run_build(tmp, env_overrides)
         if rc == 0:
@@ -166,10 +161,8 @@ def case(label, expect_in, mutate_doc=None, mutate_compose=None, mutate_file=Non
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def positive(label, check, mutate_doc=None, env_overrides=None, files=None, mutate_skill=None, mutate_approval=None,
-             mutate_index=None):
-    tmp = setup(mutate_doc, mutate_skill=mutate_skill, mutate_approval=mutate_approval,
-                mutate_index=mutate_index)
+def positive(label, check, mutate_doc=None, env_overrides=None, files=None, mutate_index=None):
+    tmp = setup(mutate_doc, mutate_index=mutate_index)
     try:
         for name, content in (files or {}).items():
             write(os.path.join(tmp, name), content)
@@ -210,9 +203,9 @@ def secrets_stay_out(tmp):
                 return "the mailbox password reached " + f
     send = load(tmp, "send.json")
     code = node(send, "Decide Send")["parameters"]["jsCode"]
-    if 'const SIGNATURE = "Env File Sender";' not in code:
-        return "the signature from .env did not reach Decide Send"
-    if node(send, "Send Email")["parameters"]["fromEmail"] != '"Env File Sender" <me@env-file.example>':
+    if 'const SENDER_IDENTITY = "Abdullah Amir\\nFounder, Amitrix Labs";' not in code:
+        return "the sender identity from .env did not reach Decide Send"
+    if node(send, "Send Email")["parameters"]["fromEmail"] != '"Abdullah Amir" <me@env-file.example>':
         return "the From header is not built from .env"
     return None
 
@@ -220,10 +213,10 @@ def secrets_stay_out(tmp):
 positive(
     ".env supplies sender and mailbox -- and the mailbox PASSWORD never reaches a workflow",
     secrets_stay_out,
-    env_overrides={"NOVASCOUT_SENDER_NAME": None, "NOVASCOUT_MAILBOX_ADDRESS": None,
+    env_overrides={"NOVASCOUT_SENDER_NAME": None, "NOVASCOUT_SENDER_TITLE": None, "NOVASCOUT_MAILBOX_ADDRESS": None,
                    "NOVASCOUT_ENV_FILE": "{tmp}/test.env"},
-    files={"test.env": 'NOVASCOUT_SENDER_NAME="Env File Sender"\nNOVASCOUT_MAILBOX_ADDRESS=me@env-file.example\n'
-                       "NOVASCOUT_MAILBOX_PASSWORD=never-in-a-workflow\n"},
+    files={"test.env": 'NOVASCOUT_SENDER_NAME="Abdullah Amir"\nNOVASCOUT_SENDER_TITLE=Founder, Amitrix Labs\n'
+                       "NOVASCOUT_MAILBOX_ADDRESS=me@env-file.example\nNOVASCOUT_MAILBOX_PASSWORD=never-in-a-workflow\n"},
 )
 positive(
     "Section 9's follow-up delay flows straight into the Follow-Ups Config",
@@ -245,18 +238,22 @@ case("the warm-up table disappears -> refuses loudly", "warm-up table not found"
 case("a middle row made open-ended -> refuses as ambiguous", "only the last row may be open-ended",
      mutate_doc=lambda d: d.replace("| Week 2 | 10 |", "| Week 2+ | 10 |", 1))
 
-# --- Section 5: the opt-out sentence and keywords ---------------------------
-case("the send path's opt-out sentence is paraphrased -> refuses", "VERBATIM",
-     mutate_file=("code_decide.js", lambda s: s.replace("I won't follow up.", "I will not follow up.", 1)))
+# --- Section 5: the retired opt-out sentence, the identity, the keywords --------
 case("the reply classifier strips a different sentence -> refuses", "strips out of replies",
      mutate_file=("code_classify_reply.js", lambda s: s.replace("I won't follow up.", "I will not follow up.", 1)))
-case("Build Follow-Up carries a different opt-out sentence -> refuses", "VERBATIM",
-     mutate_file=("code_followup.js", lambda s: s.replace("I won't follow up.", "I will not follow up.", 1)))
-case("the opt-out Assemble Follow-Up appends (drafting's rules) is paraphrased -> refuses", "VERBATIM",
-     mutate_rules=lambda s: s.replace("I won't follow up.", "I will not follow up.", 1))
-case("the doc changes the opt-out sentence and the code does not follow -> refuses", "VERBATIM",
+case("the doc changes the retired opt-out sentence and the classifier does not follow -> refuses", "strips out of replies",
      mutate_doc=lambda d: d.replace("If this isn't relevant, reply 'no' and I won't follow up.",
                                     "Reply 'stop' and you will not hear from me again.", 1))
+case("the doc loses the retired opt-out sentence -> refuses loudly", "retired opt-out sentence not found",
+     mutate_doc=lambda d: d.replace("Retired opt-out sentence, still stripped from quoted replies:", "Old sentence:", 1))
+case("Send starts requiring an opt-out sentence again -> refuses (Section 5, 2026-10-19)", "still checks for an opt-out",
+     mutate_file=("code_decide.js", lambda s: s.replace(
+         "const MAX_URLS = 1;", "const OPT_OUT = \"If this isn't relevant, reply 'no' and I won't follow up.\";\nconst MAX_URLS = 1;", 1)))
+case("Send stops checking the sender's name and title lines -> refuses", "no longer checks each body",
+     mutate_file=("code_decide.js", lambda s: s.replace(
+         "  if (('\\n' + body + '\\n').indexOf('\\n' + SENDER_IDENTITY + '\\n') === -1) return 'stale-signature';\n", "", 1)))
+case("no sender title anywhere -> refuses (Send would accept a body signed with the name alone)",
+     "NOVASCOUT_SENDER_TITLE is not set", env_overrides={"NOVASCOUT_SENDER_TITLE": None})
 case("Section 5 and Section 9 list different opt-out keywords -> refuses", "two different opt-out keyword lists",
      mutate_doc=lambda d: d.replace('"no", "unsubscribe", "remove", "stop"',
                                     '"no", "unsubscribe", "remove", "stop", "cancel"', 1))
@@ -270,30 +267,62 @@ case("the classifier stops detecting 'stop' -> refuses", "opt-out keywords drift
 case("the doc changes the URL cap -> refuses", "URL cap drifted",
      mutate_doc=lambda d: d.replace("Maximum one plain URL.", "Maximum two plain URL.", 1))
 
-# --- Section 9: follow-ups --------------------------------------------------
+# --- Section 9: follow-ups, the fixed templates (2026-10-19) ---------------------------
 case("the doc allows three follow-ups -> refuses", "follow-up maximum drifted",
      mutate_doc=lambda d: d.replace("Maximum two follow-ups", "Maximum three follow-ups", 1))
 case("Build Follow-Up allows a third follow-up -> refuses", "follow-up maximum drifted",
      mutate_file=("code_followup.js", lambda s: s.replace("const MAX_FOLLOW_UPS = 2;", "const MAX_FOLLOW_UPS = 3;", 1)))
-
-# --- drafting skill v3 section 8: composed follow-ups ------------------------
-case("the skill moves follow-up #1 to 50-80 words and the JS does not follow -> refuses", "follow-up lengths drifted",
-     mutate_skill=lambda k: k.replace("**Follow-up #1.** 40–70 words", "**Follow-up #1.** 50–80 words", 1))
-case("the skill lowers follow-up #2 to 30 words and the JS does not follow -> refuses", "follow-up lengths drifted",
-     mutate_skill=lambda k: k.replace("short final note.** At most 40 words", "short final note.** At most 30 words", 1))
-case("Assemble Follow-Up's ceiling drifts from the skill -> refuses", "follow-up lengths drifted",
-     mutate_file=("code_followup_assemble.js", lambda s: s.replace("const FOLLOW_UP_1_MAX = 70;", "const FOLLOW_UP_1_MAX = 90;", 1)))
-case("the skill's follow-up rules disappear -> refuses loudly", "follow-up #1 length not found",
-     mutate_skill=lambda k: k.replace("**Follow-up #1.**", "**First follow-up.**", 1))
-case("the skill drops 'add one angle or benefit the first email did not use' -> refuses", "new-claim check depends on it",
-     mutate_skill=lambda k: k.replace("Add one angle or benefit from §4 that the first email did not use",
-                                      "Add something new", 1))
-case("drafting's code_assemble.js loses a rule function the follow-ups call -> refuses", "no longer defines",
+case("the doc's follow-up #1 wording changes and the code does not follow -> refuses", "drifted",
+     mutate_doc=lambda d: d.replace("in case it got buried.", "in case you missed it.", 1))
+case("drafting's follow-up #2 wording changes and the doc does not -> refuses", "drifted",
+     mutate_template=lambda s: s.replace("and won't follow up again after this.", "and won't write again.", 1))
+case("the doc flips the arms and drafting's template does not follow -> refuses", "selection rules drifted",
+     mutate_doc=lambda d: d.replace("Two arms, assigned by lead_id: even = A, odd = B.",
+                                    "Two arms, assigned by lead_id: even = B, odd = A.", 1))
+case("the template's sign-off is not the sender's title -> refuses", "signs",
+     env_overrides={"NOVASCOUT_SENDER_TITLE": "CEO, Amitrix Labs"})
+case("drafting's code_template.js loses a function Build Follow-Up calls -> refuses", "no longer defines",
+     mutate_template=lambda s: s.replace("function renderFollowUp(f) {", "function renderFollowup(f) {", 1))
+case("node-body code moves above code_template.js's 'Node body' marker -> refuses", "node-body code has moved",
+     mutate_template=lambda s: s.replace("function str(v) {", "const leaked = $input.item;\nfunction str(v) {", 1))
+case("the follow-up path builds a model request -> refuses", "builds a model request",
+     mutate_file=("code_followup.js", lambda s: s.replace(
+         "const MAX_FOLLOW_UPS = 2;", "const MAX_FOLLOW_UPS = 2;\nconst MODEL = 'claude-sonnet-5-5';", 1)))
+case("a Follow-Ups node carries the Anthropic credential -> refuses", "calls a model",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         '    code_node("Build Follow-Up", FOLLOWUP_JS, "runOnceForAllItems", [-220, 130],',
+         '    dict(credentials=ANTHROPIC_CRED, **code_node("Build Follow-Up", FOLLOWUP_JS, "runOnceForAllItems", [-220, 130],', 1)
+         .replace('clock or a blocklisted domain. A mark-lost row carries no draft."),',
+                  'clock or a blocklisted domain. A mark-lost row carries no draft.")),', 1)))
+case("something reaches Write Follow-Up without Build Follow-Up -> refuses", "without Build Follow-Up",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         '    "Find Due Follow-Ups": edge("Build Follow-Up"),', '    "Find Due Follow-Ups": edge("Build Follow-Up", "Write Follow-Up"),', 1)))
+case("Find Due Follow-Ups stops skipping sites and SMOs -> refuses", "no longer skips sites",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "   AND lead_company_type(e.raw_extraction, l.source) = 'CRO'\n", "", 1)))
+case("Find Due Follow-Ups reads the claims library again -> refuses", "claims library",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "       auto_approve_email_enabled()                                     AS auto_approve_email,",
+         "       auto_approve_email_enabled()                                     AS auto_approve_email,\n"
+         "       (SELECT count(*) FROM claims_library)                            AS library_rows,", 1)))
+case("the gate reads a field Build Follow-Up never passes it -> refuses", "never passes",
+     mutate_template=lambda s: s.replace("  if (!tags.length && ctx.auto_approve !== true) reasons.push(AUTO_APPROVE_OFF);",
+                                         "  if (!tags.length && (ctx.auto_approve !== true || ctx.reviewer)) reasons.push(AUTO_APPROVE_OFF);", 1))
+case("the template reads a field Build Follow-Up never passes it -> refuses", "never passes",
+     mutate_template=lambda s: s.replace("  const n = Number(f.n);", "  const n = Number(f.n || f.number);", 1))
+case("Write Follow-Up reads a draft field Build Follow-Up never emits -> refuses", "never emits ['reviewed_by']",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "         nullif(p.p->'draft'->>'hold_reason', '')\n    FROM p",
+         "         nullif(p.p->'draft'->>'hold_reason', '') || coalesce(p.p->'draft'->>'reviewed_by', '')\n    FROM p", 1)))
+case("drafting's code_assemble.js loses a rule function Assemble Reply calls -> refuses", "no longer defines",
      mutate_rules=lambda s: s.replace("function repeatFlags(", "function repeatFlagz(", 1))
-case("node-body code moves above drafting's 'Node body' marker -> refuses", "node-body code has moved",
+case("node-body code moves above drafting's code_assemble.js marker -> refuses", "node-body code has moved",
      mutate_rules=lambda s: s.replace("function unique(list) {", "const leaked = $input.item;\nfunction unique(list) {", 1))
-case("the skill bans an adjective the embedded rules do not -> refuses", "which the embedded rules do not",
-     mutate_skill=lambda k: k.replace("No banned adjectives (revolutionary,", "No banned adjectives (groundbreaking, revolutionary,", 1))
+case("Section 9 bans a reply word the embedded rules do not -> refuses", "which the embedded rules do not",
+     mutate_doc=lambda d: d.replace("**Words a reply never uses:** revolutionary,",
+                                    "**Words a reply never uses:** groundbreaking, revolutionary,", 1))
+case("Section 9 loses the reply's banned words -> refuses loudly", "banned words not found",
+     mutate_doc=lambda d: d.replace("**Words a reply never uses:**", "**Words:**", 1))
 case("Follow-Ups goes back to 'Every 6 Hours' -> refuses (n8n's clock-hour recurrence check)", "recurrenceCheck",
      mutate_file=("build_workflow.py", lambda s: s.replace(
          '{"field": "minutes", "minutesInterval": 30}', '{"field": "hours", "hoursInterval": 6}', 1)))
@@ -312,108 +341,41 @@ case("the Daily Digest moved to a real daily slot -> refuses", "one moment a day
      mutate_file=("build_workflow.py", lambda s: s.replace(
          '{"field": "minutes", "minutesInterval": 30}',
          '{"field": "days", "daysInterval": 1, "triggerAtHour": 8}', 1)))
-case("the follow-up schema loses a field Assemble Follow-Up requires -> refuses", "do not match the follow-up schema",
-     mutate_file=("build_workflow.py", lambda s: s.replace(
-         '"required": ["body", "ask", "added_claim", "claims", "first_email_covers"],',
-         '"required": ["body", "ask", "claims", "first_email_covers"],', 1)))
-case("Section 3 loses the drafting model line -> refuses", "drafting model not found",
-     mutate_doc=lambda d: d.replace("**Drafting model: `claude-sonnet-5-5`**", "**Drafting: `claude-sonnet-5-5`**", 1))
+case("Section 3 loses the reply model line -> refuses", "reply model not found",
+     mutate_doc=lambda d: d.replace("**Reply model: `claude-sonnet-5-5`**", "**Reply: `claude-sonnet-5-5`**", 1))
 
 
-def _fu_code(tmp, name):
-    return node(load(tmp, "follow-ups.json"), name)["parameters"]["jsCode"]
+def _code(tmp, wf_file, name):
+    return node(load(tmp, wf_file), name)["parameters"]["jsCode"]
 
 
 positive(
-    "Section 3's drafting model flows straight into the follow-up request (and the claim check, once it agrees)",
-    lambda tmp: None if '"model": "claude-test-9"' in _fu_code(tmp, "Build Follow-Up")
-    and "const CHECK_MODEL = 'claude-test-9';" in _fu_code(tmp, "Apply Claim Check")
-    else "the follow-up request or the claim check does not name the doc's model",
-    mutate_doc=lambda d: d.replace("**Drafting model: `claude-sonnet-5-5`**", "**Drafting model: `claude-test-9`**", 1),
-    mutate_approval=lambda s: s.replace("const CHECK_MODEL = 'claude-sonnet-5-5';", "const CHECK_MODEL = 'claude-test-9';", 1),
+    "Section 3's reply model flows straight into the Reply Assistant's request",
+    lambda tmp: None if '"model": "claude-test-9"' in _code(tmp, "reply-assistant.json", "Build Reply")
+    else "the reply request does not name the doc's model",
+    mutate_doc=lambda d: d.replace("**Reply model: `claude-sonnet-5-5`**", "**Reply model: `claude-test-9`**", 1),
 )
 
-# --- auto-approval (migration 014): the shared gate in Follow-Ups -------------
-case("Section 3 changes model but the claim check does not -> refuses", "the claim check is not Section 3's",
-     mutate_doc=lambda d: d.replace("**Drafting model: `claude-sonnet-5-5`**", "**Drafting model: `claude-test-9`**", 1))
-case("the claim check is moved to a cheaper model -> refuses", "the claim check is not Section 3's",
-     mutate_approval=lambda s: s.replace("const CHECK_MODEL = 'claude-sonnet-5-5';", "const CHECK_MODEL = 'claude-haiku-4-5';", 1))
-case("node-body code moves above code_approval.js's 'Node body' marker -> refuses", "node-body code has moved",
-     mutate_approval=lambda s: s.replace("const KINDS = ['claim', 'prospect', 'none'];",
-                                         "const KINDS = ['claim', 'prospect', 'none'];\nconst early = $input.item.json;", 1))
-case("a composed follow-up reaches Write Follow-Up without the Approval Gate -> refuses",
-     "something reaches Write Follow-Up without the Approval Gate",
-     mutate_file=("build_workflow.py", lambda s: s.replace(
-         '"Drop Failed Generations": edge("Approval Gate"),', '"Drop Failed Generations": edge("Write Follow-Up"),', 1)))
-case("Write Follow-Up reads a draft field nothing upstream produces -> refuses", "never emits ['reviewed_by']",
-     mutate_file=("build_workflow.py", lambda s: s.replace(
-         "nullif(p.p->'draft'->>'hold_reason', ''),", "nullif(p.p->'draft'->>'hold_reason', ''), p.p->'draft'->>'reviewed_by',", 1)))
-case("the shared gate reads an approval field Assemble Follow-Up never builds -> refuses",
-     "Assemble Follow-Up's `approval` has no",
-     mutate_approval=lambda s: s.replace("if (ctx.auto_approve !== true)", "if (ctx.auto_approve !== true || ctx.reviewer)", 1))
-def _approval_src():
-    """code_approval.js as the build ships it: with Section 12's clock table
-    substituted for __SEND_CLOCK_COUNTRIES__ (rule 3b, 2026-10-07). Comparing
-    against the raw file would report the shipped code as not verbatim when the
-    only difference is the one constant both generators bake in."""
-    doc = read(MASTER_REF)
-    at = doc.index("**Business-hours clocks")
-    head = "| Country | Standard offset | Weekend | Tier |"
-    body = doc[doc.index(head, at):].split(chr(10) + chr(10))[0].splitlines()[2:]
-    names = sorted(ln.strip().strip("|").split("|")[0].strip() for ln in body)
-    return read(APPROVAL).replace("__SEND_CLOCK_COUNTRIES__", json.dumps(names, ensure_ascii=False))
 
-
-def _rules():
-    src = _approval_src()
+def _template_rules():
+    src = read(TEMPLATE)
     return src[:src.index("// Node body")]
 
 
 positive(
-    "Follow-Ups ships drafting's Approval Gate verbatim in every round, and Apply Claim Check / Apply Repair as its "
-    "rules + their bodies, each reading its own round's node",
-    lambda tmp: None if all(_fu_code(tmp, g) == _approval_src()
-                            for g in ("Approval Gate", "Approval Gate R1", "Approval Gate R2"))
-    and _fu_code(tmp, "Apply Claim Check") == _rules() + "\n" + read(APPROVAL_APPLY).replace("$('__GATE__')", "$('Approval Gate')")
-    and _fu_code(tmp, "Apply Claim Check R2") == _rules() + "\n" + read(APPROVAL_APPLY).replace("$('__GATE__')", "$('Approval Gate R2')")
-    and _fu_code(tmp, "Apply Repair 1") == _rules() + "\n" + read(APPROVAL_REPAIR).replace("$('__CHECKED__')", "$('Apply Claim Check')")
-    and _fu_code(tmp, "Apply Repair 2") == _rules() + "\n" + read(APPROVAL_REPAIR).replace("$('__CHECKED__')", "$('Apply Claim Check R1')")
-    and _fu_code(tmp, "Assemble Follow-Up R1") == _fu_code(tmp, "Assemble Follow-Up")
-    else "the follow-up approval and repair nodes are not drafting's code, verbatim, each reading its own round",
+    "Build Follow-Up ships drafting's template rules verbatim, then the follow-up body -- and nothing calls a model",
+    lambda tmp: None if _code(tmp, "follow-ups.json", "Build Follow-Up").find(_template_rules()) != -1
+    and "function followUpAction(r, item) {" in _code(tmp, "follow-ups.json", "Build Follow-Up")
+    and [n["name"] for n in load(tmp, "follow-ups.json")["nodes"]]
+    == ["Every 30 Minutes", "Manual Trigger", "Config", "Find Due Follow-Ups", "Build Follow-Up", "Write Follow-Up"]
+    and "anthropic" not in json.dumps(load(tmp, "follow-ups.json")).lower()
+    else "the shipped Follow-Ups is not Find Due -> Build Follow-Up (template rules + body) -> Write, model-free",
 )
 positive(
-    "MAX_REPAIRS decides how many repair rounds Follow-Ups unrolls",
-    lambda tmp: None if "Apply Claim Check R3" in {n["name"] for n in load(tmp, "follow-ups.json")["nodes"]}
-    else "MAX_REPAIRS = 3 did not unroll a third round",
-    mutate_approval=lambda s: s.replace("const MAX_REPAIRS = 2;", "const MAX_REPAIRS = 3;", 1),
+    "Assemble Reply still ships drafting's code_assemble.js rules verbatim",
+    lambda tmp: None if _code(tmp, "reply-assistant.json", "Assemble Reply").find(read(RULES)[:read(RULES).index("// Node body")]) != -1
+    else "the shipped Assemble Reply does not carry drafting's rules section verbatim",
 )
-case("the repair is sent to a cheaper model than the claim check -> refuses", "the repair request no longer uses",
-     mutate_approval=lambda s: s.replace("function repairRequest(ctx, flagged) {\n  return {\n    model: CHECK_MODEL,",
-                                         "function repairRequest(ctx, flagged) {\n  return {\n    model: 'claude-haiku-4-5',", 1))
-case("Apply Claim Check stops reading its own round's gate -> refuses", "must read $('__GATE__') exactly once",
-     mutate_file=("build_workflow.py", lambda s: s.replace("import approval_chain  # noqa: E402",
-                                                           "import approval_chain  # noqa: E402\n"
-                                                           "approval_chain_load = approval_chain.load\n"
-                                                           "def _load(d, *a, **k):\n"
-                                                           "    import io as _io\n"
-                                                           "    p = os.path.join(d, 'code_approval_apply.js')\n"
-                                                           "    src = _io.open(p, encoding='utf-8').read()\n"
-                                                           "    _io.open(p, 'w', encoding='utf-8').write(src.replace(\"$('__GATE__')\", \"$('Approval Gate')\"))\n"
-                                                           "    return approval_chain_load(d, *a, **k)\n"
-                                                           "approval_chain.load = _load", 1)))
-case("Assemble Follow-Up stops handing the composition to the repair loop -> refuses",
-     "the repair loop (composition / repair / repair_fields)",
-     mutate_file=("code_followup_assemble.js", lambda s: s.replace("    composition: parsed,\n", "", 1)))
-case("a repaired follow-up reaches Write Follow-Up without the Approval Gate -> refuses",
-     "something reaches Write Follow-Up without the Approval Gate",
-     mutate_file=("build_workflow.py", lambda s: s.replace(
-         '    "Drop Failed Generations": edge("Approval Gate"),\n    **_fu_chain_conns,\n}',
-         '    "Drop Failed Generations": edge("Approval Gate"),\n    **_fu_chain_conns,\n'
-         '    "Apply Repair 1": edge("Write Follow-Up"),\n}', 1)))
-case("'build the note around it' comes back into the follow-up prompt -> refuses", "build the note around it",
-     mutate_file=("code_followup.js", lambda s: s.replace("almost word for word,", "almost word for word, and build the note around it,", 1)))
-case("skill section 8 drops the word-for-word rule -> refuses", "almost word for word",
-     mutate_skill=lambda s: s.replace("in that line's own words: almost word for word", "in its own words", 1))
 
 # --- the Daily Digest --------------------------------------------------------
 case("Build Digest reads a field Load Digest does not return -> refuses", "Load Digest does not produce",
@@ -430,18 +392,6 @@ case("the digest goes back to a once-a-day schedule tick of 2 days -> refuses", 
      mutate_file=("build_workflow.py", lambda s: s.replace(
          '{"parameters": {"rule": {"interval": [{"field": "minutes", "minutesInterval": 30}]}},\n     "name": DIGEST_TRIGGER',
          '{"parameters": {"rule": {"interval": [{"field": "days", "daysInterval": 2}]}},\n     "name": DIGEST_TRIGGER', 1)))
-positive(
-    "the skill's follow-up numbers reach the prompt the model sees",
-    lambda tmp: None if "40-70 words" in _fu_code(tmp, "Build Follow-Up") and "at most 40 words" in _fu_code(tmp, "Build Follow-Up")
-    else "the follow-up prompt does not state the skill's numbers",
-)
-positive(
-    "Assemble Follow-Up ships drafting's rules verbatim, then the follow-up body",
-    lambda tmp: None if _fu_code(tmp, "Assemble Follow-Up").find(read(RULES)[:read(RULES).index("// Node body")]) != -1
-    and "const src = $('Build Follow-Up').item.json;" in _fu_code(tmp, "Assemble Follow-Up")
-    else "the shipped Assemble Follow-Up is not drafting's rules + the follow-up body",
-)
-
 # --- Section 12's business-hours clocks -------------------------------------
 #
 # Since 2026-10-07 the clock table covers every country the scraper includes,
@@ -548,19 +498,11 @@ case("the classifier stops emitting a field Record Inbound reads -> refuses", "n
      mutate_file=("code_classify_reply.js", lambda s: s.replace(
          "    freemail: FREEMAIL.indexOf(fromDomain) !== -1,\n", "", 1)))
 case("Build Follow-Up reads a field Find Due Follow-Ups does not return -> refuses", "does not produce",
-     mutate_file=("code_followup.js", lambda s: s.replace("r.first_variant", "r.first_touch_variant", 1)))
-case("Find Due Follow-Ups stops returning the claims library -> refuses", "does not produce",
+     mutate_file=("code_followup.js", lambda s: s.replace("    contact_name: r.contact_name,", "    contact_name: r.contact,", 1)))
+case("Find Due Follow-Ups stops returning whether the address is verified -> refuses", "does not produce",
      mutate_file=("build_workflow.py", lambda s: s.replace(
-         "         WHERE k.active)                                                AS library",
-         "         WHERE k.active)                                                AS claims", 1)))
-case("Assemble Follow-Up reads a field Build Follow-Up never emits -> refuses", "never emits",
-     mutate_file=("code_followup_assemble.js", lambda s: s.replace("src.absent_areas", "src.missing_areas", 1)))
-case("Build Follow-Up stops emitting the request the Claude node sends -> refuses", "never emits",
-     mutate_file=("code_followup.js", lambda s: s.replace(
-         "      request: Object.assign({}, CLAUDE_REQUEST, {", "      req: Object.assign({}, CLAUDE_REQUEST, {", 1)))
-case("Assemble Follow-Up stops emitting `write` (Drop Failed Generations reads it) -> refuses", "never emits",
-     mutate_file=("code_followup_assemble.js", lambda s: s.replace("      write: false,", "      written: false,", 1)
-                  .replace("    write: true,", "    written: true,", 1)))
+         "       coalesce(c.verified, false)                                      AS verified,",
+         "       coalesce(c.verified, false)                                      AS is_verified,", 1)))
 case("the notification reads a field Record Inbound does not return -> refuses", "does not produce",
      mutate_file=("code_notify.js", lambda s: s.replace("r.fit_score === null", "r.score === null", 1)))
 case("a Code node keeps an unsubstituted build placeholder -> refuses", "unsubstituted placeholders",
@@ -662,6 +604,10 @@ case("the dry-run IMAP Health variant keeps its schedule trigger -> refuses", "I
      mutate_file=("build_workflow.py", lambda s: s.replace(
          '{},\n                             {"Every %d Minutes" % HEALTH_INTERVAL_MIN})',
          '{},\n                             set())', 1)),
+     env_overrides={"SENDTRACK_VARIANTS_OUT": "{tmp}/variants", "SENDTRACK_DRYRUN_NOW": "2026-09-14T10:00:00Z"})
+case("the dry-run Follow-Ups variant keeps its schedule trigger -> refuses", "Follow-Ups variant drifted",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         '{"now_override": DRYRUN_NOW}, {FOLLOWUP_TRIGGER})', '{"now_override": DRYRUN_NOW}, set())', 1)),
      env_overrides={"SENDTRACK_VARIANTS_OUT": "{tmp}/variants", "SENDTRACK_DRYRUN_NOW": "2026-09-14T10:00:00Z"})
 
 print("drift guards for Workflow 6\n")

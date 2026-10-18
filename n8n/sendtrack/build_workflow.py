@@ -14,13 +14,14 @@ is an email in a stranger's inbox that cannot be recalled -- so the spec is
 parsed out of the Master Ref and asserted here rather than retyped:
 
     Section 5   warm-up table                 -> WARMUP in code_decide.js
-    Section 5   opt-out sentence (VERBATIM)   -> code_decide / code_classify_reply / code_followup
+    Section 5   retired opt-out sentence      -> code_classify_reply.js strips it from quoted replies
+    Section 5   sender name + title           -> the identity Send checks every body for
     Section 5   URL cap                       -> code_decide.js
     Section 5+9 opt-out keywords              -> code_classify_reply.js (both statements must agree)
     Section 9   follow-up delay and maximum   -> follow-up SQL + code_decide.js + code_followup.js
-    Section 3   drafting model and effort     -> the follow-up composition request
-    Skill §8    follow-up lengths             -> code_followup.js + code_followup_assemble.js + the prompt
-    Skill §3    claim rules                   -> Assemble Follow-Up embeds drafting's code_assemble.js rules
+    Section 9   follow-up templates (LOCKED)  -> Build Follow-Up embeds drafting's code_template.js rules
+    Section 3   reply model and effort        -> the Reply Assistant's request
+    Section 9   reply banned words            -> the reply prompt + drafting's code_assemble.js rules
     Section 12  business-hours clocks         -> COUNTRY_CLOCKS (a country with no clock cannot ship)
     Section 12  geographies + index snapshot  -> every country the scraper includes has a clock
     Section 6   LinkedIn is manual            -> every send query filters channel='email'
@@ -53,12 +54,10 @@ MASTER_REF = os.environ.get(
     "NOVASCOUT_MASTER_REF", os.path.join(HERE, "..", "..", "NovaScout_MasterRef.md")
 )
 COMPOSE = os.environ.get("NOVASCOUT_COMPOSE", os.path.join(HERE, "..", "..", "docker-compose.yml"))
-# Drafting skill v3 section 8: follow-ups are composed under the first touch's
-# rules. The skill's section 8 numbers are parsed from here, and the rule
-# functions are drafting's own code_assemble.js, embedded verbatim.
-SKILL = os.environ.get(
-    "NOVASCOUT_DRAFTING_SKILL", os.path.join(HERE, "..", "..", "NovaScout_DraftingSkill.md")
-)
+# Two of drafting's files are embedded verbatim: code_template.js's rules (the
+# follow-up templates and the gate, since 2026-10-19) and code_assemble.js's
+# rules (the Reply Assistant's claim checks). template_spec.py checks the
+# templates against Section 9.
 DRAFTING_DIR = os.environ.get("NOVASCOUT_DRAFTING_DIR", os.path.join(HERE, "..", "drafting"))
 ENV_FILE = os.environ.get("NOVASCOUT_ENV_FILE", os.path.join(HERE, "..", "..", ".env"))
 VARIANTS_OUT = os.environ.get("SENDTRACK_VARIANTS_OUT", "")
@@ -157,9 +156,20 @@ if not EMAIL_RE.match(MAILBOX):
     )
 OWN_DOMAIN = MAILBOX.rsplit("@", 1)[1].lower()
 
-# Section 5: "Signature: name, one line of title, phone." Composed exactly as the
-# drafting build composes it -- the send path refuses any body not carrying it.
+# Section 5: a reply to a prospect (Workflow 7) signs name / one line of title /
+# phone. The Reply Assistant, Send Reply and the operator's EDIT command use it.
 SIGNATURE = "\n".join([p for p in [SENDER_NAME, SENDER_TITLE, SENDER_PHONE] if p])
+# Section 5 since 2026-10-19: cold outreach signs "Cheers!" / name / title, no
+# phone. What Send checks every cold body for is what both signatures share --
+# the name line followed by the title line -- so the template's sign-off and the
+# drafts written before the switch both pass, and a draft signed by anyone else
+# does not.
+if not SENDER_TITLE:
+    raise AssertionError(
+        "NOVASCOUT_SENDER_TITLE is not set -- not in the environment and not in %s. Send checks every body "
+        "for the sender's name line followed by the title line; without a title it would accept a body "
+        "signed with the name alone." % os.path.abspath(ENV_FILE))
+SENDER_IDENTITY = SENDER_NAME + "\n" + SENDER_TITLE
 FROM_HEADER = '"%s" <%s>' % (SENDER_NAME.replace('"', ""), MAILBOX)
 
 
@@ -193,10 +203,16 @@ def load_warmup(doc):
 
 
 def load_opt_out(doc):
-    m = re.search(r"Use a plain sentence:\s*\*\"(.+?)\"\*", doc)
+    """Section 5's RETIRED opt-out sentence. No email carries it since
+    2026-10-19, but every email sent before did, so every reply to one quotes
+    it -- and Mailbox Watch strips it out before reading the reply for an
+    opt-out keyword. Parsed, not retyped: a paraphrase here would turn every
+    such reply into an opt-out."""
+    m = re.search(r"Retired opt-out sentence, still stripped from quoted replies:\s*\*\"(.+?)\"\*", doc)
     if not m:
         raise AssertionError(
-            "opt-out sentence not found in %s -- expected 'Use a plain sentence: *\"...\"*'" % MASTER_REF)
+            "the retired opt-out sentence not found in %s -- expected 'Retired opt-out sentence, still stripped "
+            "from quoted replies: *\"...\"*'" % MASTER_REF)
     return m.group(1)
 
 
@@ -237,36 +253,26 @@ def load_follow_up(doc):
     return int(m.group(1)), _number(n.group(1), "follow-up maximum")
 
 
-def load_followup_rules(skill):
-    """Drafting skill v3 section 8: follow-up #1 is N-M words; #2, the short
-    final note, at most K. Parsed, so the prompt and the check say the skill's
-    numbers."""
-    m1 = re.search(r"\*\*Follow-up #1\.\*\* (\d+)[–-](\d+) words", skill)
-    if not m1:
-        raise AssertionError("follow-up #1 length not found in %s -- expected '**Follow-up #1.** N-M words'" % SKILL)
-    m2 = re.search(r"\*\*Follow-up #2[^*]*\*\* At most (\d+) words", skill)
-    if not m2:
-        raise AssertionError("follow-up #2 length not found in %s -- expected '**Follow-up #2 ...** At most N words'"
-                             % SKILL)
-    if not re.search(r"Add one angle or benefit from §4 that the first email did not use", skill):
-        raise AssertionError("follow-up #1's rule 'Add one angle or benefit from §4 that the first email did not use' "
-                             "not found in %s -- the new-claim check depends on it" % SKILL)
-    return int(m1.group(1)), int(m1.group(2)), int(m2.group(1))
-
-
-def load_skill_banned_adjectives(skill):
-    m = re.search(r"No banned adjectives \(([^)]+)\)", skill)
+def load_reply_banned_adjectives(doc):
+    """Section 9, Workflow 7: the words a drafted reply never uses. The list the
+    retired drafting skill banned, moved into the Master Ref on 2026-10-19 when
+    the skill was superseded -- the Reply Assistant's prompt names them and the
+    embedded code_assemble.js rules must ban each one."""
+    m = re.search(r"\*\*Words a reply never uses:\*\* ([^\n]+?)\.\s*$", doc, re.M)
     if not m:
-        raise AssertionError("banned adjectives not found in %s -- expected 'No banned adjectives (a, b, ...)'" % SKILL)
+        raise AssertionError("the reply's banned words not found in Section 9 of %s -- expected '**Words a reply "
+                             "never uses:** a, b, c.'" % MASTER_REF)
     return [a.strip().lower() for a in m.group(1).split(",") if a.strip()]
 
 
 def load_drafting_model(doc):
-    """Section 3: the drafting model and effort. The follow-ups are composed by
-    the drafting model (skill section 8), with the same request parameters."""
-    m = re.search(r"\*\*Drafting model: `([a-z0-9-]+)`\*\*, effort `(low|medium|high|xhigh|max)`", doc)
+    """Section 3: the reply model and effort -- the one model call left in
+    outreach since 2026-10-19 (Workflow 7). Still named DRAFT_MODEL here: the
+    Reply Assistant's shipped node notes say "the drafting model", and they are
+    not rewritten, so its workflow JSON stays byte-identical."""
+    m = re.search(r"\*\*Reply model: `([a-z0-9-]+)`\*\*, effort `(low|medium|high|xhigh|max)`", doc)
     if not m:
-        raise AssertionError("drafting model not found in Section 3 of %s -- expected '**Drafting model: `id`**, "
+        raise AssertionError("reply model not found in Section 3 of %s -- expected '**Reply model: `id`**, "
                              "effort `level`'" % MASTER_REF)
     return m.group(1), m.group(2)
 
@@ -429,9 +435,7 @@ HEALTH_PROBLEMS = load_health_problems(DOC)
 HEALTH_INTERVAL_MIN = load_health_interval(DOC)
 COMPOSE_TEXT = _read(COMPOSE)
 SENDER_ZONE, SENDER_OFFSET = load_sender_offset(COMPOSE_TEXT)
-SKILL_DOC = _read(SKILL)
-FU1_MIN, FU1_MAX, FU2_MAX = load_followup_rules(SKILL_DOC)
-SKILL_BANNED = load_skill_banned_adjectives(SKILL_DOC)
+REPLY_BANNED = load_reply_banned_adjectives(DOC)
 DRAFT_MODEL, DRAFT_EFFORT = load_drafting_model(DOC)
 THERAPEUTIC_AREAS = load_therapeutic_areas(DOC)
 
@@ -466,10 +470,13 @@ def _assert_decide_matches_spec():
         "warm-up schedule drifted between Section 5 and code_decide.js:\n"
         "  doc: %r\n  js:  %r" % (WARMUP, found))
 
-    assert _js_string(src, "OPT_OUT", "code_decide.js") == OPT_OUT, (
-        "the opt-out sentence in code_decide.js is not Section 5's, VERBATIM. The send path "
-        "refuses any body without it, so a mismatch refuses every draft -- or passes a "
-        "paraphrase:\n  doc: %r\n  js:  %r" % (OPT_OUT, _js_string(src, "OPT_OUT", "code_decide.js")))
+    # Section 5 since 2026-10-19: no opt-out sentence is required in a body. A
+    # leftover requirement would refuse every template draft as `no-opt-out`.
+    assert "OPT_OUT" not in re.sub(r"//.*", "", src), (
+        "code_decide.js still checks for an opt-out sentence. Section 5 removed it on 2026-10-19 (operator "
+        "decision); every template draft would be refused.")
+    assert "__SENDER_IDENTITY__" in src and "'\\n' + SENDER_IDENTITY + '\\n'" in src, (
+        "code_decide.js no longer checks each body for the sender's name and title lines (Section 5)")
 
     found = _js_int(src, "MAX_URLS", "code_decide.js")
     assert found == MAX_URLS, (
@@ -540,20 +547,21 @@ def _assert_classify_matches_spec():
         "makes detecting them the GDPR/KVKK opt-out mechanism:\n  doc: %r\n  js:  %r"
         % (OPT_OUT_KEYWORDS, found))
     assert _js_string(src, "OPT_OUT", "code_classify_reply.js") == OPT_OUT, (
-        "the opt-out sentence code_classify_reply.js strips out of replies is not Section 5's. "
-        "Every reply quotes it -- if the strip misses, every reply reads as an opt-out.")
+        "the opt-out sentence code_classify_reply.js strips out of replies is not Section 5's retired one. "
+        "Every reply to an email sent before 2026-10-19 quotes it -- if the strip misses, it reads as an opt-out.")
 
 
-# Drafting skill v3 section 8: follow-ups are composed "under every rule above".
-# Assemble Follow-Up is drafting's code_assemble.js -- everything above its
-# "Node body" marker, verbatim -- followed by code_followup_assemble.js. The
-# follow-up body calls these; each must be defined there, or the node fails
-# at runtime on the first follow-up.
+# The Reply Assistant's claim rules. Assemble Reply is drafting's
+# code_assemble.js -- everything above its "Node body" marker, verbatim -- then
+# code_reply_topics.js and code_reply_assemble.js. (Until 2026-10-19 Assemble
+# Follow-Up embedded it too; the follow-ups are templates now.) The reply body
+# calls these; each must be defined there, or the node fails at runtime on the
+# first reply.
 RULES_FILE = os.path.join(DRAFTING_DIR, "code_assemble.js")
 RULES_USED = ["str", "fold", "words", "cleanText", "unique", "jaccard", "bannedAdjectivesIn", "askFlags",
               "productFlags", "aiFlags", "prospectSponsor", "claimFlags", "absentAreasNamed", "proofFlags",
-              "linkFlags", "repeatFlags"]
-RULES_CONSTS = ["OPT_OUT", "MERGE_TAG", "LINK_FREE_WEEKS", "SLOT_ORDER", "DEPLOYMENTS", "BANNED_ADJECTIVES"]
+              "linkFlags", "repeatFlags", "siteFlags"]
+RULES_CONSTS = ["MERGE_TAG", "LINK_FREE_WEEKS", "SLOT_ORDER", "DEPLOYMENTS", "BANNED_ADJECTIVES"]
 
 
 def load_rules_js():
@@ -564,8 +572,8 @@ def load_rules_js():
     missing = [f for f in RULES_USED if not re.search(r"^function %s\(" % f, rules, re.M)]
     missing += [c for c in RULES_CONSTS if not re.search(r"^const %s = " % c, rules, re.M)]
     assert not missing, (
-        "Assemble Follow-Up calls %r, which drafting's code_assemble.js no longer defines above its "
-        "'Node body' marker. The follow-ups run the first touch's claim rules; restore them there." % missing)
+        "Assemble Reply calls %r, which drafting's code_assemble.js no longer defines above its "
+        "'Node body' marker. The Reply Assistant runs those claim rules; restore them there." % missing)
     assert "$(" not in rules and "$input" not in rules and "__" not in re.sub(r"//.*", "", rules), (
         "the rules section of %s reads n8n data or holds a build placeholder -- node-body code has moved "
         "above the 'Node body' marker" % RULES_FILE)
@@ -574,48 +582,60 @@ def load_rules_js():
 
 RULES_JS = load_rules_js()
 
+# The follow-up templates (Section 9, Workflow 6, LOCKED since 2026-10-19).
+# Build Follow-Up is drafting's code_template.js -- everything above its "Node
+# body" marker, verbatim -- followed by code_followup.js, so a follow-up is
+# written and gated by the first touch's own functions. template_spec.py
+# (drafting's) renders that file's constants back into Section 9's blocks.
+TEMPLATE_FILE = os.path.join(DRAFTING_DIR, "code_template.js")
+TEMPLATE_USED = ["str", "renderFollowUp", "gate", "withTags"]
+sys.path.insert(0, DRAFTING_DIR)
+import template_spec  # noqa: E402  (drafting's; shared with n8n/drafting/build_workflow.py)
+
+
+def load_template_rules():
+    src = _read(TEMPLATE_FILE)
+    at = src.find("// Node body")
+    assert at != -1, "%s has no '// Node body' marker -- Build Follow-Up embeds everything above it" % TEMPLATE_FILE
+    rules = src[:at]
+    missing = [f for f in TEMPLATE_USED if not re.search(r"^function %s\(" % f, rules, re.M)]
+    assert not missing, (
+        "Build Follow-Up calls %r, which drafting's code_template.js no longer defines above its 'Node body' "
+        "marker. The follow-ups run the first touch's template functions; restore them there." % missing)
+    assert "$(" not in rules and "$input" not in rules and "__" not in re.sub(r"//.*", "", rules), (
+        "the rules section of %s reads n8n data or holds a build placeholder -- node-body code has moved "
+        "above the 'Node body' marker" % TEMPLATE_FILE)
+    return src, rules
+
+
+TEMPLATE_SRC, TEMPLATE_RULES_JS = load_template_rules()
+TEMPLATE_CONSTANTS = template_spec.constants(TEMPLATE_SRC, "drafting's code_template.js")
+
 
 def _assert_followup_matches_spec():
     src = js("code_followup.js")
-    assert _js_string(src, "OPT_OUT", "code_followup.js") == OPT_OUT, (
-        "the opt-out sentence in code_followup.js is not Section 5's, VERBATIM.")
-    assert _js_string(RULES_JS, "OPT_OUT", "drafting's code_assemble.js") == OPT_OUT, (
-        "the opt-out sentence Assemble Follow-Up appends (drafting's code_assemble.js) is not Section 5's, "
-        "VERBATIM.")
     found = _js_int(src, "MAX_FOLLOW_UPS", "code_followup.js")
     assert found == MAX_FOLLOW_UPS, (
         "follow-up maximum drifted between Section 9 and code_followup.js:\n  doc: %d\n  js:  %d"
         % (MAX_FOLLOW_UPS, found))
-    for name in ("code_followup.js", "code_followup_assemble.js"):
-        s = js(name)
-        found = (_js_int(s, "FOLLOW_UP_1_MIN", name), _js_int(s, "FOLLOW_UP_1_MAX", name),
-                 _js_int(s, "FOLLOW_UP_2_MAX", name))
-        assert found == (FU1_MIN, FU1_MAX, FU2_MAX), (
-            "the follow-up lengths drifted between the drafting skill (section 8) and %s:\n"
-            "  skill: #1 %d-%d words, #2 at most %d\n  js:    %r" % (name, FU1_MIN, FU1_MAX, FU2_MAX, found))
+    # The approved wording, byte for byte, and the rules that pick the arm.
+    template_spec.assert_block(DOC, template_spec.FOLLOW_UP_HEADING, template_spec.follow_up_block(TEMPLATE_CONSTANTS),
+                               MASTER_REF, "drafting's code_template.js")
+    template_spec.assert_rules(DOC, TEMPLATE_SRC, MASTER_REF, "drafting's code_template.js")
+    template_spec.assert_sign_off(TEMPLATE_CONSTANTS, SENDER_NAME, SENDER_TITLE, "drafting's code_template.js")
+    # What Send checks every body for must be in the template's sign-off.
+    assert "\n".join(TEMPLATE_CONSTANTS["SIGN_OFF"]).endswith(SENDER_IDENTITY), (
+        "the template's sign-off does not end with the identity Send checks for (%r)" % SENDER_IDENTITY)
+    # No model, anywhere in the follow-up path.
+    code = re.sub(r"(^|[^:])//.*", r"\1", src + TEMPLATE_RULES_JS, flags=re.M)
+    assert not re.search(r"api\.anthropic\.com|claude-|messages:|SYSTEM_PROMPT|CLAUDE_REQUEST", code), (
+        "the follow-up path builds a model request. Since 2026-10-19 a follow-up is a fixed template "
+        "(Section 9, Workflow 6).")
+    # The reply's banned words (Section 9, Workflow 7) are banned by the rules
+    # Assemble Reply embeds.
     banned = [a.lower() for a in re.findall(r"'([^']+)'", _js_block(RULES_JS, "BANNED_ADJECTIVES", RULES_FILE))]
-    missing = [a for a in SKILL_BANNED if a not in banned]
-    assert not missing, "the drafting skill bans %r, which the embedded rules do not" % missing
-
-    # Prompt caching (Section 3, on since 2026-10-08). The composing call's
-    # system prompt is the cached block; nothing per-follow-up may be, because
-    # caching is a prefix match and everything about the lead differs per call.
-    assert re.search(r"system: \[\{ type: 'text', text: SYSTEM_PROMPT, cache_control: CACHE_CONTROL \}\]",
-                     src), (
-        "the follow-up request's cached block is no longer exactly its system prompt. That prompt "
-        "is ~1,169 tokens and build-substituted, so it is identical for every follow-up and every "
-        "run -- the one prefix here worth a breakpoint.")
-    assert not re.search(r"messages: \[\{ role: 'user', content: prompt \}\][^}]*cache_control", src), (
-        "a message block in the follow-up request is marked for caching; everything there is "
-        "per-lead, so the entry would be read by nothing.")
-    # The TTL is the measured judgement drafting's build records; the two copies
-    # must agree, or a follow-up and a first touch would be billed differently
-    # for the same decision.
-    assert "const CACHE_CONTROL = { type: 'ephemeral' };" in src, (
-        "code_followup.js no longer uses the 5-minute (default) cache TTL. A 1-hour entry costs "
-        "2x base input to write instead of 1.25x and only pays if calls sharing the prefix land "
-        "more than 5 minutes but less than an hour apart -- measured 2026-10-08, this pipeline's "
-        "do not. Change drafting's CACHE_TTL_JS and Section 3 at the same time.")
+    missing = [a for a in REPLY_BANNED if a not in banned]
+    assert not missing, "Section 9 bans %r in a reply, which the embedded rules do not" % missing
 
 
 _assert_decide_matches_spec()
@@ -1682,20 +1702,16 @@ FOLLOWUP_DUE_SQL = """-- Find Due Follow-Ups -- Section 9: "if no reply after N 
 -- The clock restarts at the later of the last send and the last follow-up
 -- drafted, so a follow-up the reviewer rejected does not spawn the next one the
 -- same afternoon. A rejected follow-up still uses its slot: the reviewer
--- decided against it, and composing another would ask again.
+-- decided against it, and writing another would ask again.
 --
--- Drafting skill v3 section 8: the follow-up is composed by the drafting model,
--- so each due row also carries what Build Follow-Up needs for the request --
--- the lead's country (its proof line), the first touch's variant (the claim
--- codes it used, which a follow-up must not repeat), the ACTIVE claims library
--- (read per run, like Workflow 4's batch query, so an operator's edit reaches
--- the next follow-up with no rebuild), and the last follow-up that went out
--- (follow-up #2 must not repeat it).
---
--- Auto-approval (migration 014) adds the flag and the enrichment record: the
--- claim check compares each prospect fact in a follow-up with it. The record
--- never reaches the composing model -- Build Follow-Up hands that model only
--- the first email, as before -- it goes to the checker alone.
+-- Since 2026-10-19 the follow-up is a fixed template (Section 9, Workflow 6),
+-- so each due row carries what the template and the gate need and nothing
+-- else: the first email as sent and its subject (it is quoted, and "Re:"
+-- threads on it), the company name and the contact (the greeting), and the
+-- gate's inputs -- the address, whether it is verified, the country (its Send
+-- clock), the blocklist flags and settings.auto_approve_email. No claims
+-- library: a template follow-up says only the approved wording. CROs only: the
+-- template speaks to a CRO, so a site or SMO is never due.
 WITH clk AS (
   SELECT coalesce(nullif($1, '')::timestamptz, now()) AS now
 ),
@@ -1705,18 +1721,11 @@ sends AS (
    WHERE o.channel = 'email' AND o.message_id IS NOT NULL
 ),
 first_touch AS (
-  SELECT DISTINCT ON (s.lead_id) s.lead_id, s.sent_at, s.message_body, d.subject, d.variant
+  SELECT DISTINCT ON (s.lead_id) s.lead_id, s.sent_at, s.message_body, d.subject
     FROM sends s
     JOIN drafts d ON d.id = s.draft_id
    WHERE coalesce(d.variant, '') NOT LIKE 'follow-up-%'
    ORDER BY s.lead_id, s.sent_at
-),
-last_follow_up AS (
-  SELECT DISTINCT ON (s.lead_id) s.lead_id, s.message_body
-    FROM sends s
-    JOIN drafts d ON d.id = s.draft_id
-   WHERE d.variant LIKE 'follow-up-%'
-   ORDER BY s.lead_id, s.sent_at DESC
 ),
 last_send AS (
   SELECT lead_id, max(sent_at) AS sent_at FROM sends GROUP BY lead_id
@@ -1739,36 +1748,28 @@ SELECT l.id                                                             AS lead_
        coalesce(fu.created, 0) + 1                                      AS next_follow_up,
        ft.subject                                                       AS first_subject,
        ft.message_body                                                  AS first_body,
-       ft.variant                                                       AS first_variant,
        __ISO_FIRST__                                                    AS first_sent_at,
        __ISO_LAST__                                                     AS last_sent_at,
        l.country                                                        AS country,
+       l.domain                                                         AS domain,
        -- CRO, site or SMO: lead_company_type(), the one definition (migration 019).
        lead_company_type(e.raw_extraction, l.source)          AS company_type,
-       lf.message_body                                                  AS last_follow_up_body,
-       (SELECT coalesce(jsonb_agg(jsonb_build_object(
-                  'code', k.code, 'slot', k.slot, 'body', btrim(k.body),
-                  'countries', to_jsonb(k.countries), 'measured', k.measured,
-                  'confirmed', k.confirmed, 'capabilities', to_jsonb(k.capabilities),
-                  'company_types', to_jsonb(k.company_types))
-                  ORDER BY k.code), '[]'::jsonb)
-          FROM claims_library k
-         WHERE k.active)                                                AS library,
        auto_approve_email_enabled()                                     AS auto_approve_email,
        l.company_name                                                   AS company_name,
-       e.therapeutic_areas                                              AS therapeutic_areas,
-       e.phases                                                         AS phases,
-       e.raw_extraction->>'city'                                        AS city,
-       e.founder_name                                                   AS founder_name,
-       e.employee_estimate                                              AS employee_estimate
+       c.name                                                           AS contact_name,
+       c.email                                                          AS email,
+       coalesce(c.verified, false)                                      AS verified,
+       __LEAD_BLOCKED__                                                 AS lead_domain_blocked,
+       __RCPT_BLOCKED__                                                 AS recipient_domain_blocked
   FROM leads l
   JOIN first_touch ft ON ft.lead_id = l.id
   JOIN last_send ls   ON ls.lead_id = l.id
   LEFT JOIN enrichments e ON e.lead_id = l.id
-  LEFT JOIN last_follow_up lf ON lf.lead_id = l.id
+  LEFT JOIN contacts c ON c.lead_id = l.id
   LEFT JOIN fu        ON fu.lead_id = l.id
   CROSS JOIN clk
  WHERE l.status = 'sent'
+   AND lead_company_type(e.raw_extraction, l.source) = 'CRO'
    AND greatest(ls.sent_at, coalesce(fu.last_created, ls.sent_at)) <= clk.now - make_interval(days => $2::int)
    AND coalesce(fu.open, 0) = 0
    AND NOT EXISTS (SELECT 1 FROM outreach_log o WHERE o.lead_id = l.id AND (o.replied OR o.outcome = 'bounced'))
@@ -1782,32 +1783,34 @@ SELECT l.id                                                             AS lead_
     "__ISO_LAST__", iso("ls.sent_at")
 ).replace(
     "__LEAD_BLOCKED__", BLOCKED_DOMAIN.format(d="lower(l.domain)")
+).replace(
+    "__RCPT_BLOCKED__", BLOCKED_DOMAIN.format(d="lower(split_part(c.email, '@', 2))")
 )
 
 FOLLOWUP_WRITE_SQL = """-- Write Follow-Up: insert the follow-up draft, or mark the lead lost. Both
 -- guarded so a repeated run is a no-op: a lead gets each follow-up NUMBER at
--- most once, and only a lead still at 'sent' moves. A composed follow-up's
--- variant carries its claim codes and tags ('follow-up-1/BEN-DECK.A1+...'), and
--- a template one from before 2026-10-02 is the bare 'follow-up-1', so the
--- number is compared, not the variant.
+-- most once, and only a lead still at 'sent' moves. A template follow-up's
+-- variant is 'follow-up-1/template/A' (+ hold tags); a composed one from
+-- 2026-10-02 to 2026-10-19 carries claim codes ('follow-up-1/BEN-DECK.A1'), and
+-- one from before that is the bare 'follow-up-1' -- so the number is compared,
+-- not the variant.
 --
--- The draft is 'pending' -- the reviewer's queue, with hold_reason -- unless the
--- Approval Gate and the claim check approved it (migration 014): only a payload
--- marked approved_by 'auto' comes out approved, and the table's trigger
--- re-checks that against the live flag and library.
+-- The draft is 'pending' -- the reviewer's queue, with hold_reason -- unless
+-- the gate approved it: only a payload marked approved_by 'auto' comes out
+-- approved, and the table's trigger (migration 020) re-checks that against the
+-- live flag, the template variant, the address and the blocklist.
 WITH p AS (
   SELECT $1::jsonb AS p
 ),
 ins AS (
-  INSERT INTO drafts (lead_id, channel, variant, subject, body, status, approved_by, hold_reason, claim_check)
+  INSERT INTO drafts (lead_id, channel, variant, subject, body, status, approved_by, hold_reason)
   SELECT (p.p->>'lead_id')::bigint, 'email', p.p->'draft'->>'variant', p.p->'draft'->>'subject',
          p.p->'draft'->>'body',
          CASE WHEN p.p->'draft'->>'status' = 'approved' AND p.p->'draft'->>'approved_by' = 'auto'
               THEN 'approved' ELSE 'pending' END,
          CASE WHEN p.p->'draft'->>'status' = 'approved' AND p.p->'draft'->>'approved_by' = 'auto'
               THEN 'auto' END,
-         nullif(p.p->'draft'->>'hold_reason', ''),
-         nullif(p.p->'draft'->'claim_check', 'null'::jsonb)
+         nullif(p.p->'draft'->>'hold_reason', '')
     FROM p
    WHERE p.p->>'action' = 'draft-follow-up'
      AND p.p->'draft'->>'channel' = 'email'
@@ -2144,6 +2147,13 @@ _insert_cols = [c.strip() for c in re.search(r"INSERT INTO drafts \(([^)]+)\)", 
 _unknown = [c for c in _insert_cols if c not in DRAFTS_COLUMNS]
 assert not _unknown, (
     "the follow-up INSERT writes drafts.%r, which Section 8 does not define." % _unknown)
+# Section 9, Workflows 4 and 6 since 2026-10-19: the templates speak to a CRO,
+# and say only the approved wording.
+assert "AND lead_company_type(e.raw_extraction, l.source) = 'CRO'" in FOLLOWUP_DUE_SQL, (
+    "Find Due Follow-Ups no longer skips sites and SMOs -- the follow-up template is for CROs (Section 9, "
+    "Workflow 6)")
+assert "claims_library" not in FOLLOWUP_DUE_SQL + FOLLOWUP_WRITE_SQL, (
+    "Follow-Ups reads the claims library again. Since 2026-10-19 a follow-up says only the approved template.")
 
 _ALL_SQL = [LOAD_STATE_SQL, CLAIM_SQL, CONFIRM_SQL, REVERT_SQL, MIRROR_SQL, RECORD_INBOUND_SQL,
             FOLLOWUP_DUE_SQL, FOLLOWUP_WRITE_SQL, COMMAND_CONTEXT_SQL, COMMAND_APPLY_SQL, REPLY_QUEUE_SQL,
@@ -2218,48 +2228,23 @@ NOTIFY_EMAIL_READS = {"notify_to", "subject", "text"}
 _assert_js_emits("Notify Operator", NOTIFY_EMAIL_READS, _notify, "code_notify.js")
 _followup = js("code_followup.js")
 _assert_wired("Build Follow-Up (r.*)", _reads(_followup, "r"), final_select_aliases(FOLLOWUP_DUE_SQL), "Find Due Follow-Ups")
-# Skill v3 section 8: Build Follow-Up -> [Needs Model?] -> Claude Follow-Up ->
-# Assemble Follow-Up -> [Drop Failed Generations] -> Write Follow-Up, and the
-# mark-lost rows straight from Build Follow-Up to Write Follow-Up. Every
-# boundary, guarded.
-_fu_assemble = js("code_followup_assemble.js")
-FOLLOWUP_CLAUDE_READS = {"request"}
-FOLLOWUP_IF_READS = {"needs_model"}
-FOLLOWUP_FILTER_READS = {"write"}
-_assert_js_emits("Claude Follow-Up ($json.request) / Needs Model? ($json.needs_model)",
-                 FOLLOWUP_CLAUDE_READS | FOLLOWUP_IF_READS, _followup, "code_followup.js")
-_assert_js_emits("Assemble Follow-Up (src.*)", _reads(_fu_assemble, "src"), _followup, "code_followup.js")
-_assert_js_emits("Drop Failed Generations ($json.write)", FOLLOWUP_FILTER_READS, _fu_assemble,
-                 "code_followup_assemble.js")
+# Since 2026-10-19: Find Due Follow-Ups -> Build Follow-Up -> Write Follow-Up,
+# nothing in between. Every field Write Follow-Up reads off the payload and its
+# draft -- the decision fields included -- is set by Build Follow-Up.
 _fu_write_reads = _sql_payload_reads(FOLLOWUP_WRITE_SQL) | set(re.findall(r"p\.p->'draft'->>?'(\w+)'", FOLLOWUP_WRITE_SQL))
-# Auto-approval (migration 014): Assemble Follow-Up -> Approval Gate ->
-# [Needs Claim Check?] -> Claude Claim Check -> Apply Claim Check -> Write. The
-# decision fields are set on the draft by the gate and the apply node (shared
-# with Workflow 4, n8n/drafting/code_approval*.js); everything else is
-# Assemble Follow-Up's.
-FOLLOWUP_DECISION_FIELDS = {"status", "approved_by", "hold_reason", "claim_check"}
-_approval_all = _read(os.path.join(DRAFTING_DIR, "code_approval.js")) + _read(
-    os.path.join(DRAFTING_DIR, "code_approval_apply.js"))
-_approval_repair = _read(os.path.join(DRAFTING_DIR, "code_approval_repair.js"))
-for _f in sorted(_fu_write_reads & FOLLOWUP_DECISION_FIELDS):
-    assert re.search(r"\b(?:d|target)\.%s = " % _f, _approval_all), (
-        "Write Follow-Up reads draft.%s, which neither Approval Gate nor Apply Claim Check sets" % _f)
-    assert re.search(r"\bd\.%s = " % _f, _approval_repair), (
-        "Write Follow-Up reads draft.%s, which Apply Repair does not set on a held draft" % _f)
-# The repair loop runs a second copy of Assemble Follow-Up, which must hand the
-# composition and the repair state on.
-_assert_js_emits("the repair loop (composition / repair / repair_fields)", {"composition", "repair", "repair_fields"},
-                 _fu_assemble, "code_followup_assemble.js")
-_assert_js_emits("Write Follow-Up (a composed follow-up)", (_fu_write_reads - FOLLOWUP_DECISION_FIELDS) |
-                 {"payload", "draft"}, _fu_assemble, "code_followup_assemble.js")
-_assert_js_emits("Approval Gate (item.approval / item.payload)", {"approval", "payload"}, _fu_assemble,
-                 "code_followup_assemble.js")
-for _f in sorted(set(re.findall(r"\bctx\.(\w+)", _approval_all))):
-    assert re.search(r"^\s*%s:" % re.escape(_f), _fu_assemble, re.M), (
-        "the shared Approval Gate reads approval.%s, but Assemble Follow-Up's `approval` has no %s -- it would be "
-        "undefined at runtime, with no error" % (_f, _f))
-_assert_js_emits("Write Follow-Up (mark-lost)", _sql_payload_reads(FOLLOWUP_WRITE_SQL) | {"payload", "draft"},
-                 _followup, "code_followup.js")
+_assert_js_emits("Write Follow-Up", _fu_write_reads | {"payload", "draft"}, _followup, "code_followup.js")
+# What the shared template functions read off their arguments must be what
+# Build Follow-Up passes them.
+for _fn, _arg, _called in (("renderFollowUp", "f", "renderFollowUp"), ("gate", "ctx", "gate"),
+                           ("holdTags", "ctx", "gate")):
+    _body = re.search(r"^function %s\((\w+)[^)]*\) \{\n(.*?)^\}" % _fn, TEMPLATE_RULES_JS, re.M | re.S)
+    assert _body and _body.group(1) == _arg, "drafting's code_template.js no longer defines %s(%s, ...)" % (_fn, _arg)
+    _call = re.search(r"%s\(\{(.*?)\}" % _called, _followup, re.S)
+    assert _call, "code_followup.js no longer calls %s({...})" % _fn
+    for _f in sorted(set(re.findall(r"\b%s\.(\w+)" % _arg, _body.group(2)))):
+        assert re.search(r"^\s*%s:" % _f, _call.group(1), re.M), (
+            "%s reads %s.%s, but Build Follow-Up never passes %s -- it would be undefined at runtime, with no "
+            "error" % (_fn, _arg, _f, _f))
 
 # IMAP Health crosses two process boundaries before it reaches n8n -- the
 # pre-flight writes a JSON file, the checker serves it -- and both are guarded
@@ -2442,117 +2427,10 @@ def above_node_body(name):
     return lib
 
 
-# ---------------------------------------------------------------------------
-# The follow-up composition call -- drafting skill v3 section 8
-#
-# The drafting model (Section 3), with the drafting node's request parameters:
-# no temperature/top_p/top_k (a non-default value is a 400 on this model),
-# adaptive thinking by default, effort from Section 3, JSON through
-# output_config.format with a strict schema, max_tokens covering thinking plus
-# text. No prompt caching, for Workflow 4's measured reason: the HTTP node sends
-# a run's calls concurrently, so none reads another's cache.
-# ---------------------------------------------------------------------------
-
+# The Anthropic credential the Reply Assistant uses (Section 3). Since
+# 2026-10-19 nothing else in Workflow 6 calls a model: a follow-up is a fixed
+# template (Section 9, Workflow 6).
 ANTHROPIC_CRED = {"anthropicApi": {"id": "novascoutAnthropic01", "name": "Anthropic - Nova Scout drafting"}}
-
-FOLLOWUP_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "body": {"type": "string"},
-        "ask": {"type": "string"},
-        "added_claim": {"type": "string"},
-        "claims": {"type": "array", "items": {"type": "string"}},
-        "first_email_covers": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["body", "ask", "added_claim", "claims", "first_email_covers"],
-    "additionalProperties": False,
-}
-_fu_fields = (re.findall(r"'(\w+)'", re.search(r"const FU_FIELDS = \[(.*?)\];", _fu_assemble).group(1))
-              + re.findall(r"'(\w+)'", re.search(r"const FU_LISTS = \[(.*?)\];", _fu_assemble).group(1)))
-assert sorted(_fu_fields) == sorted(FOLLOWUP_SCHEMA["required"]), (
-    "Assemble Follow-Up's FU_FIELDS/FU_LISTS do not match the follow-up schema:\n  schema: %r\n  js:     %r"
-    % (FOLLOWUP_SCHEMA["required"], _fu_fields))
-
-FOLLOWUP_REQUEST = {
-    "model": DRAFT_MODEL,
-    "max_tokens": 16000,
-    "output_config": {"effort": DRAFT_EFFORT, "format": {"type": "json_schema", "schema": FOLLOWUP_SCHEMA}},
-}
-
-FOLLOWUP_SYSTEM_PROMPT = "\n".join([
-    "You write one short follow-up email to a small clinical research business -- a contract",
-    "research organisation (CRO), an independent research site or a site management organisation",
-    "(SMO); the message says which -- that has not replied to a cold first email from " + SENDER_NAME + ".",
-    "A person reviews it before anything is sent.",
-    "",
-    "Each message gives you THE FIRST EMAIL exactly as it was sent, and APPROVED CLAIMS: the only",
-    "things you may say about what we built, the problem it solves, and who uses it. You may",
-    "rephrase a claim. You may never widen what it means.",
-    "",
-    "FOLLOW-UP #1:",
-    "- Open by referring back to the first email in a few words (\"Following up on my note about",
-    "  after-hours sponsor inquiries\"). Do not restate it.",
-    "- Add exactly ONE angle or benefit from the approved list that the first email did not use. Never",
-    "  one whose point the first email already made.",
-    "- Say that line almost word for word: its own words, rephrased only for grammar (\"It sends\" may",
-    "  become \"the assistant sends\"). Add nothing to it -- no consequence, no outcome, no \"so you can",
-    "  ...\", no second sentence about it. Every follow-up held so far was held for a sentence added here.",
-    "- Then exactly one ask.",
-    "- The body plus the ask is %d-%d words." % (FU1_MIN, FU1_MAX),
-    "",
-    "FOLLOW-UP #2 -- a short final note:",
-    "- Say this is the last note, and restate the offer as the one ask. Add no new claim.",
-    "- The body plus the ask is at most %d words." % FU2_MAX,
-    "",
-    "THE PROSPECT: no new fact about them. The only facts are the ones the first email already",
-    "states. Never describe them as sponsoring anything -- in these emails \"sponsor\" means the",
-    "biotech, pharma, device or academic company that runs a trial and hires a CRO or a research",
-    "site, their client. A research site or an SMO is never a CRO: never call it one, and never",
-    "write \"CRO websites\" to it. Never write the company's name or a person's name.",
-    "",
-    "THE PRODUCT: the first email introduced it; refer back to it (\"the assistant\"), do not",
-    "describe it again and do not name it. Never call it a chatbot or a Q&A bot. The word \"AI\"",
-    "at most once. Never \"AI-powered\".",
-    "",
-    "NO REPEATS: the lines you use must not repeat the same capability -- each benefit says what it",
-    "is about -- and never restate in your own words a capability the first email already made.",
-    "",
-    "CLAIMS -- forbidden, all of them:",
-    "- guarantees (\"you'll never lose a sponsor\")",
-    "- any number, percentage or multiplier that is not in the approved claims or the first email",
-    "- claiming to identify anonymous website visitors",
-    "- naming any CRM, tool or integration",
-    "- supported languages",
-    "- any count of clients beyond the deployments the proof line names",
-    "- calling Vertex Clinical Research a CRO -- it is a clinical research center",
-    "- saying it books calls or fills a calendar -- it sends the sponsor your booking link, and the",
-    "  sponsor books",
-    "- saying it answers from SOPs or from documents -- it answers from their website",
-    "A stakes line is about the industry, not about us.",
-    "",
-    "THE ASK: one question, from the ask lines, rephrased if you like. No links, no scheduling",
-    "link, no call length, no second question. The body before it asks for nothing.",
-    "",
-    "EVERYWHERE: plain text. No links of any kind, no bullets, no placeholders, no merge tags. No",
-    "greeting, no sign-off and no opt-out line -- all three are added afterwards. Never these",
-    "words: " + ", ".join(SKILL_BANNED) + ". No invented urgency, no flattery, no exclamation marks.",
-    "",
-    "Return JSON: body (everything before the ask, paragraphs separated by a blank line); ask;",
-    "added_claim (the code of the one angle or benefit you added, or \"\" for follow-up #2); claims",
-    "(the code of every approved claim the note used, the ask included); first_email_covers (the",
-    "codes of the approved angles and benefits whose point the first email already made).",
-])
-assert "%d-%d words" % (FU1_MIN, FU1_MAX) in FOLLOWUP_SYSTEM_PROMPT and "at most %d words" % FU2_MAX in FOLLOWUP_SYSTEM_PROMPT
-# Skill section 8 (amended 2026-10-03): #1's added line is said almost word for
-# word, nothing added. The prompt and the per-lead task must both say it.
-assert re.search(r"Add one angle or benefit from §4 that the first email did not use, in that line's own words: "
-                 r"almost word for word", SKILL_DOC), (
-    "skill section 8 no longer says follow-up #1's added line is used almost word for word")
-assert "almost word for word" in FOLLOWUP_SYSTEM_PROMPT and "almost word for word" in js("code_followup.js"), (
-    "the follow-up prompt no longer tells the model to use the added line almost word for word (skill section 8)")
-assert "build the note around it" not in FOLLOWUP_SYSTEM_PROMPT + js("code_followup.js"), (
-    "'build the note around it' is back in the follow-up prompt -- it invited the added sentences every held "
-    "follow-up was held for (skill section 8, 2026-10-03)")
 
 
 # ---------------------------------------------------------------------------
@@ -2668,7 +2546,7 @@ REPLY_SYSTEM_PROMPT = "\n".join([
     "",
     "EVERYWHERE: plain text. No bullets, no headings, no placeholders, no merge tags. At most one",
     "link, and only the one offered. No greeting, no sign-off and no opt-out line -- all three are",
-    "added afterwards. Never these words: " + ", ".join(SKILL_BANNED) + ". No invented urgency, no",
+    "added afterwards. Never these words: " + ", ".join(REPLY_BANNED) + ". No invented urgency, no",
     "flattery, no exclamation marks, and never thank them twice.",
     "",
     "Return JSON: body (everything before the next step, paragraphs separated by a blank line);",
@@ -2677,7 +2555,7 @@ REPLY_SYSTEM_PROMPT = "\n".join([
     SENDER_NAME + " has to confirm, or \"\" if nothing).",
 ])
 
-DECIDE_JS = bake("code_decide.js", SIGNATURE=SIGNATURE)
+DECIDE_JS = bake("code_decide.js", SENDER_IDENTITY=SENDER_IDENTITY)
 CHECK_JS = bake("code_check_smtp.js", OWN_DOMAIN=OWN_DOMAIN)
 MIRROR_JS = bake("code_mirror_sent.js", OWN_DOMAIN=OWN_DOMAIN)
 
@@ -2698,15 +2576,13 @@ COMMAND_JS = bake("code_operator_command.js", SIGNATURE=SIGNATURE, MAX_URLS=MAX_
 COMMAND_ACK_JS = bake("code_command_ack.js")
 DETECT_SIGNAL_JS = bake("code_detect_signal.js")
 NOTIFY_JS = bake("code_notify.js")
-FOLLOWUP_JS = bake("code_followup.js", SENDER_NAME=SENDER_NAME, FOLLOWUP_SYSTEM_PROMPT=FOLLOWUP_SYSTEM_PROMPT,
-                   CLAUDE_REQUEST=FOLLOWUP_REQUEST, THERAPEUTIC_AREAS=THERAPEUTIC_AREAS)
-assert '"model": "%s"' % DRAFT_MODEL in FOLLOWUP_JS, "the shipped follow-up request does not name %s" % DRAFT_MODEL
-# Drafting's rule functions, verbatim, then the follow-up node body.
-FOLLOWUP_ASSEMBLE_JS = (
-    "// Assemble Follow-Up -- generated by n8n/sendtrack/build_workflow.py.\n"
-    "// Part 1, verbatim: n8n/drafting/code_assemble.js above its 'Node body' marker -- the\n"
-    "// first touch's claim rules. Part 2: n8n/sendtrack/code_followup_assemble.js.\n\n"
-    + RULES_JS + "\n" + bake("code_followup_assemble.js", SIGNATURE=SIGNATURE, SENDER_NAME=SENDER_NAME)
+# Drafting's template functions and gate, verbatim, then the follow-up node body.
+FOLLOWUP_JS = (
+    "// Build Follow-Up -- generated by n8n/sendtrack/build_workflow.py.\n"
+    "// Part 1, verbatim: n8n/drafting/code_template.js above its 'Node body' marker -- the\n"
+    "// fixed templates and the gate a first touch is written and judged by. Part 2:\n"
+    "// n8n/sendtrack/code_followup.js.\n\n"
+    + TEMPLATE_RULES_JS + "\n" + bake("code_followup.js", SEND_CLOCK_COUNTRIES=sorted(COUNTRY_CLOCKS))
 )
 HEALTH_JS = bake("code_health.js")
 DIGEST_JS = bake("code_digest.js", SENDER_ZONE=SENDER_ZONE, SENDER_OFFSET=SENDER_OFFSET)
@@ -2735,23 +2611,6 @@ REPLY_ASSEMBLE_JS = (
 REPLY_REVIEW_JS = bake("code_reply_review.js")
 REPLY_REMIND_JS = bake("code_reply_remind.js")
 REPLY_DECIDE_JS = bake("code_reply_decide.js", SIGNATURE=SIGNATURE, MAX_URLS=MAX_URLS)
-
-# Auto-approval (migration 014): Workflow 4's Approval Gate and Apply Claim
-# Check, verbatim -- drafting's code_approval.js, and its rules section followed
-# by code_approval_apply.js -- so a follow-up is judged by the same functions as
-# a first touch.
-# The chain itself -- gate, claim check, and the repair rounds -- comes from
-# drafting's approval_chain.py, so both workflows carry the same nodes.
-sys.path.insert(0, DRAFTING_DIR)
-import approval_chain  # noqa: E402
-APPROVAL = approval_chain.load(DRAFTING_DIR, sorted(COUNTRY_CLOCKS))
-APPROVAL_JS = APPROVAL["gate"]
-APPROVAL_RULES = APPROVAL["rules"]
-_check_model = re.search(r"^const CHECK_MODEL = '([a-z0-9-]+)';", APPROVAL_RULES, re.M)
-_check_effort = re.search(r"^const CHECK_EFFORT = '([a-z]+)';", APPROVAL_RULES, re.M)
-assert _check_model and _check_model.group(1) == DRAFT_MODEL and _check_effort and _check_effort.group(1) == DRAFT_EFFORT, (
-    "the claim check is not Section 3's drafting model and effort (%s, %s)" % (DRAFT_MODEL, DRAFT_EFFORT))
-
 
 # ---------------------------------------------------------------------------
 # Node helpers
@@ -3066,18 +2925,11 @@ assert mailwatch_connections["Operator Mail?"]["main"][1] == [{"node": "Record I
 # Workflow: Follow-Ups
 # ---------------------------------------------------------------------------
 
-# Every due lead costs a paid Claude call now (skill section 8), so the batch is
-# bounded like Workflow 4's, not Workflow 3's.
+# A template follow-up costs nothing; the batch is bounded anyway (build rule 5),
+# and Send's warm-up ceiling caps what goes out a day.
 FOLLOWUP_CONFIG = {"now_override": "", "follow_up_days": FOLLOW_UP_DAYS, "max_follow_ups": MAX_FOLLOW_UPS,
                    "batch_size": 10}
 FOLLOWUP_TRIGGER = "Every 30 Minutes"
-
-# The auto-approval chain with its repair rounds (drafting's approval_chain.py),
-# the same chain Workflow 4 carries; its Assemble copies are Assemble Follow-Up.
-_fu_chain_nodes, _fu_chain_conns, _fu_write_pos = approval_chain.build(
-    APPROVAL, "Assemble Follow-Up", FOLLOWUP_ASSEMBLE_JS, "Write Follow-Up", ANTHROPIC_CRED, DRAFT_MODEL, DRAFT_EFFORT,
-    (880, 30))
-FU_CHAIN_ROUNDS = approval_chain.names(APPROVAL["max_repairs"], "Assemble Follow-Up")
 
 followup_nodes = [
     {"parameters": {"rule": {"interval": [{"field": "minutes", "minutesInterval": 30}]}},
@@ -3103,53 +2955,18 @@ followup_nodes = [
     pg_node("Find Due Follow-Ups", FOLLOWUP_DUE_SQL,
             "={{ [$json.now_override, $json.follow_up_days, $json.max_follow_ups, $json.batch_size] }}",
             [-440, 130],
-            "Leads at 'sent', no reply, no bounce, not blocklisted, quiet for %d days: the next follow-up, or "
+            "CRO leads at 'sent', no reply, no bounce, not blocklisted, quiet for %d days: the next follow-up, or "
             "'lost' once %d have been used." % (FOLLOW_UP_DAYS, MAX_FOLLOW_UPS)),
     code_node("Build Follow-Up", FOLLOWUP_JS, "runOnceForAllItems", [-220, 130],
-              "Drafting skill v3 section 8: a follow-up is composed by the drafting model under the first touch's "
-              "claim rules. This builds the request -- the first email as sent, and the approved claims it did not "
-              "use (a benefit sharing a capability with one it used is not offered either). No fact about the lead "
-              "reaches the model except the first email, so build rule 6 holds by construction. A mark-lost row "
-              "needs no model and goes straight to Write Follow-Up."),
-    if_node("Needs Model?", "needsmodel", "={{ $json.needs_model }}", [0, 130],
-            "true: a follow-up to compose. false: mark-lost, no model call."),
-    {
-        "parameters": {
-            "method": "POST",
-            "url": "https://api.anthropic.com/v1/messages",
-            "authentication": "predefinedCredentialType",
-            "nodeCredentialType": "anthropicApi",
-            "sendHeaders": True,
-            "headerParameters": {"parameters": [{"name": "anthropic-version", "value": "2023-06-01"}]},
-            "sendBody": True,
-            "specifyBody": "json",
-            "jsonBody": "={{ JSON.stringify($json.request) }}",
-            "options": {"timeout": 300000},
-        },
-        "name": "Claude Follow-Up", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [220, 30],
-        "credentials": ANTHROPIC_CRED, "onError": "continueRegularOutput", "retryOnFail": True, "maxTries": 2,
-        "waitBetweenTries": 5000,
-        "notes": ("%s through the Anthropic Messages API, effort %s (Section 3) -- the drafting model, with the "
-                  "drafting node's request parameters. The key is the n8n credential %s, never in this JSON. If "
-                  "the call fails nothing is written and the lead is due again next run: no fallback to the local "
-                  "model (skill section 6)." % (DRAFT_MODEL, DRAFT_EFFORT, ANTHROPIC_CRED["anthropicApi"]["id"])),
-    },
-    code_node("Assemble Follow-Up", FOLLOWUP_ASSEMBLE_JS, "runOnceForEachItem", [440, 30],
-              "Drafting's own claim rules (code_assemble.js above its 'Node body' marker, embedded verbatim) plus "
-              "skill section 8's: #1 is %d-%d words and adds exactly one angle or benefit the first email did not "
-              "use; #2 is at most %d words and adds none. Violations tag the variant. The greeting, the Section 5 "
-              "opt-out, the signature and the quoted first email are appended here, never generated -- the frame "
-              "the send path checks for." % (FU1_MIN, FU1_MAX, FU2_MAX)),
-    {
-        "parameters": {"conditions": boolean_condition("writable", "={{ $json.write }}"), "options": {}},
-        "name": "Drop Failed Generations", "type": "n8n-nodes-base.filter", "typeVersion": 2.2, "position": [660, 30],
-        "notes": "A failed Claude call writes nothing; the lead is due again on the next run.",
-    },
-    *_fu_chain_nodes,
-    pg_node("Write Follow-Up", FOLLOWUP_WRITE_SQL, "={{ [JSON.stringify($json.payload)] }}", _fu_write_pos,
+              "The fixed follow-up templates (Section 9, Workflow 6, LOCKED wording, approved 2026-10-19), written "
+              "by drafting's own template functions (code_template.js above its 'Node body' marker, embedded "
+              "verbatim): the greeting rules, the cleaned company name, #1 closing with the lead's arm's close "
+              "(lead_id even A, odd B), Re: the first subject and the first email quoted. No model call. Then the "
+              "same gate as a first touch: approved unless there is no verified deliverable address, no Send "
+              "clock or a blocklisted domain. A mark-lost row carries no draft."),
+    pg_node("Write Follow-Up", FOLLOWUP_WRITE_SQL, "={{ [JSON.stringify($json.payload)] }}", [0, 130],
             "Into drafts as 'pending' with hold_reason -- the exceptions queue -- or approved by this workflow "
-            "when the gate and the claim check passed it (migration 014; the table re-checks). Or the lead "
-            "marked lost."),
+            "when the gate passed it (the table re-checks, migration 020). Or the lead marked lost."),
 ]
 
 followup_connections = {
@@ -3157,22 +2974,18 @@ followup_connections = {
     "Manual Trigger": edge("Config"),
     "Config": edge("Find Due Follow-Ups"),
     "Find Due Follow-Ups": edge("Build Follow-Up"),
-    "Build Follow-Up": edge("Needs Model?"),
-    "Needs Model?": branch("Claude Follow-Up", "Write Follow-Up"),
-    "Claude Follow-Up": edge("Assemble Follow-Up"),
-    "Assemble Follow-Up": edge("Drop Failed Generations"),
-    "Drop Failed Generations": edge("Approval Gate"),
-    **_fu_chain_conns,
+    "Build Follow-Up": edge("Write Follow-Up"),
 }
 
-# A composed follow-up reaches the write only through the gate; the only other
-# way in is a mark-lost row, which carries no draft.
+# A follow-up reaches the write only through Build Follow-Up's gate, and no node
+# in this workflow calls a model or carries the credential that could.
 _into_write = sorted(src for src, outs in followup_connections.items()
                      for br in outs["main"] for e in br if e["node"] == "Write Follow-Up")
-assert _into_write == sorted(approval_chain.exits(FU_CHAIN_ROUNDS) + ["Needs Model?"]), (
-    "something reaches Write Follow-Up without the Approval Gate: %r" % _into_write)
-assert len(FU_CHAIN_ROUNDS) == APPROVAL["max_repairs"] + 1, "the chain does not unroll MAX_REPAIRS repair rounds"
-assert followup_connections["Needs Model?"]["main"][1] == [{"node": "Write Follow-Up", "type": "main", "index": 0}]
+assert _into_write == ["Build Follow-Up"], "something reaches Write Follow-Up without Build Follow-Up: %r" % _into_write
+for _n in followup_nodes:
+    assert "anthropicApi" not in json.dumps(_n.get("credentials", {})) and "api.anthropic.com" not in json.dumps(
+        _n.get("parameters", {})), (
+        "%s calls a model. Since 2026-10-19 a follow-up is a fixed template (Section 9, Workflow 6)." % _n["name"])
 
 # ---------------------------------------------------------------------------
 # Workflow: IMAP Health
@@ -3739,9 +3552,10 @@ for _file, _wf in SHIPPED:
 # ---------------------------------------------------------------------------
 
 _DRY_CREDS = {"postgres": PG_DRY, "smtp": SMTP_DRY}
-# The Claude call has no side effect outside this machine but its cost: it reaches
-# no inbox, so a dry run keeps the real credential (a follow-up composed in a
-# dry run is a real API call).
+# A Claude call has no side effect outside this machine but its cost: it reaches
+# no inbox, so a dry run would keep the real credential. No dry variant carries
+# one since 2026-10-19 (the follow-ups stopped calling a model); the Reply
+# Assistant, the one workflow that does, has no dry variant (below).
 _DRY_KEEPS = {"anthropicApi"}
 
 
@@ -3890,8 +3704,7 @@ if VARIANTS_OUT:
     #
     # Deliberately NOT generated: a dry-run variant of the Reply Assistant
     # itself (reply0001). _DRY_KEEPS leaves the Anthropic credential real on
-    # every dry variant (drafting and follow-ups measure real cost against
-    # it), so a reply0001 dry run would place a real, billed Claude call --
+    # every dry variant, so a reply0001 dry run would place a real, billed Claude call --
     # and every scenario this harness proves (operator authentication, the
     # one-time code, the reply send lane's skipped/kept guards) is provable
     # without composing a single reply. Seeding `drafts` and `reply_approvals`
@@ -3927,11 +3740,11 @@ print("  sender clock: %s (%+d min) -- the day the ceiling counts" % (SENDER_ZON
 print("  business-hours clocks (Section 12): %d countries -- %d core, %d extended; every one of the %d the index snapshot includes has one"
       % (len(COUNTRY_CLOCKS), len(CLOCK_CORE), len(COUNTRY_CLOCKS) - len(CLOCK_CORE), len(INDEX_COUNTRIES)))
 print("  opt-out keywords (Sections 5+9): %r" % OPT_OUT_KEYWORDS)
-print("  follow-ups (Section 9): after %d days, maximum %d; composed by %s (effort %s) under drafting's rules, "
-      "#1 %d-%d words, #2 at most %d (skill section 8)" % (FOLLOW_UP_DAYS, MAX_FOLLOW_UPS, DRAFT_MODEL, DRAFT_EFFORT,
-                                                          FU1_MIN, FU1_MAX, FU2_MAX))
+print("  follow-ups (Section 9): after %d days, maximum %d; the fixed templates, byte for byte with Section 9, "
+      "written and gated by drafting's code_template.js -- no model call" % (FOLLOW_UP_DAYS, MAX_FOLLOW_UPS))
 print("  From: %s    own domain: %s" % (FROM_HEADER, OWN_DOMAIN))
-print("  signature checked on every body: %r" % SIGNATURE)
+print("  identity Send checks on every cold body: %r (no opt-out sentence, no phone)" % SENDER_IDENTITY)
+print("  reply signature: %r" % SIGNATURE)
 print("  operator notification address: read at runtime from settings.operator_email "
       "(sync_settings.py) -- not baked in")
 print("  reply assistant (Section 9, Workflow 7): %d message(s)/run composed by %s (effort %s), %d-%d words, "

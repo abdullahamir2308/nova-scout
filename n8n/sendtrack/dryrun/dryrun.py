@@ -330,7 +330,9 @@ expect("plain text only: one text/plain part, no HTML, no multipart",
 expect("no n8n attribution and no tracking anywhere in the raw message",
        b"n8n" not in raw.lower() and b"<img" not in raw.lower() and b"http" not in raw.lower())
 expect("the body sent is exactly the approved (edited) draft text", body == norm(row["sent_text"]))
-expect("the opt-out line and signature are in what was sent", OPT_OUT + "\n\nAbdullah Amir\nFounder, Amitrix Labs" in body)
+# Since 2026-10-19 Send checks for the sender's name line followed by the title
+# line, as whole lines (Section 5); the opt-out sentence is no longer required.
+expect("the sender's name and title lines are in what was sent", "\nAbdullah Amir\nFounder, Amitrix Labs" in body)
 expect("outreach_log carries the same Message-ID the sink received",
        row["message_id"] == msg.get("Message-ID"), row["message_id"])
 expect("draft -> sent, lead -> sent", (row["draft_status"], row["lead_status"]) == ("sent", "sent"))

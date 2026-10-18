@@ -1,381 +1,176 @@
 # Workflow 4 — Drafting
 
-Generates the email and LinkedIn variants for every lead at `status='contact_found'`,
-or records why it refused to. Workflow id `drafting0001`.
+Writes one first-touch email for every CRO lead at `status='contact_found'`,
+from the operator's fixed template. Workflow id `drafting0001`.
 
 Same generated-not-hand-edited pattern as `../enrichment`, `../scoring` and
 `../contacts`: the `.js` files are the tested sources, `build_workflow.py` embeds
 them verbatim into `../workflows/drafting.json`, and the spec-drift guards parse
-`NovaScout_MasterRef.md` and `NovaScout_DraftingSkill.md` and refuse to build when
-the code and the docs disagree.
+`NovaScout_MasterRef.md` and refuse to build when the code and the doc disagree.
 
 ```
-python build_workflow.py        # regenerate the workflow JSON
-node   test_grounding.js        # 140 cases -- the grounding guard (v1's 75) + the v3 library, prompt and request
-node   test_assemble.js         # 144 cases -- response handling, assembly, every skill v3 section 3 rule
-node   test_approval.js         # 87 cases -- auto-approval: the Approval Gate, Apply Claim Check and the repair loop
-python test_drift_guards.py     # 72 cases -- each guard is made to fire
-python test_rule_mutations.py   # breaks every rule in turn; the unit suites must fail each time
-python test_approval_mutations.py   # 51 mutations -- every auto-approval and repair rule broken in turn; test_approval.js must fail
-python audit_drafts_vs_onepager.py   # read-only: the live queue and library vs nova-one-pager.docx
-python provision_anthropic_credential.py   # ANTHROPIC_API_KEY in .env -> n8n credential novascoutAnthropic01
-python write_drafting_review.py [exec_id]  # read-only: DRAFTING_REVIEW.md from what n8n has deployed
+python build_workflow.py              # regenerate the workflow JSON
+node   test_template.js               # 171 cases -- the wording, the SMYKM line, every formatting rule, the A/B split, the gate
+python test_template_mutations.py     # 52 mutations -- every template rule broken in turn; test_template.js must fail
+python test_drift_guards.py           # 41 cases -- each guard is made to fire
+python redraft_with_template.py       # the 2026-10-19 switch: retire AI first touches, re-queue their leads (see below)
+node   test_assemble.js               # 159 cases -- the Reply Assistant's claim rules (code_assemble.js, see below)
+python test_rule_mutations.py         # breaks each of those rules in turn; test_assemble.js must fail
+python audit_drafts_vs_onepager.py    # read-only: the live queue and library vs nova-one-pager.docx
+python provision_anthropic_credential.py   # ANTHROPIC_API_KEY in .env -> n8n credential novascoutAnthropic01 (Reply Assistant)
 ```
 
-## Drafting skill v3 — Claude composes, code enforces
+## Fixed templates since 2026-10-19 — no model call
 
-Since 2026-10-02 a first touch is built to `NovaScout_DraftingSkill.md` v3. The
-drafting node is **Claude Sonnet 5.5** (`claude-sonnet-5-5`) on the Anthropic API,
-through the n8n credential `novascoutAnthropic01`; enrichment and scoring stay on
-local `qwen3.5:9b`. The request parameters come from the live Sonnet 5.5 docs
-and are recorded in Master Ref Section 3: no sampling parameters (a 400 on this
-model), adaptive thinking by default, effort `high`, structured output through
-`output_config.format`. **If a call fails, nothing is written and the lead stays
-`contact_found`. There is no fallback to the local model.**
+The operator replaced AI-composed outreach with fixed templates. A first touch is
+the approved wording in Master Ref Section 9, Workflow 4, filled by code with
+facts the pipeline already holds. Sonnet composition, the claim check, the repair
+loop and the claims-library reads are gone from this workflow (and from
+Follow-Ups); `NovaScout_DraftingSkill.md` and `DRAFTING_REVIEW.md` are
+superseded.
 
-v2 had the model write a subject and two hooks and pasted claims-library lines
-after them, verbatim. v3 is composition: the model writes the whole email and the
-LinkedIn DM from the fact it is told to open on, plus this lead's approved claims
-(`claims_library`, migration 012) -- every description, pain angle, benefit and
-ask, and only the proof line matched to the lead's country. It may rephrase a
-claim, never widen it. Its schema is subject, body and **ask as a separate field**
-for each channel, plus the claim codes each message used, so "exactly one ask"
-is checkable.
+```
+Get Draft Batch -> ClinicalTrials.gov Lookup -> Build First Touch -> Drop Failed Lookups -> Write Drafts & Advance
+```
 
-| Part | Where it comes from |
+`code_template.js` is the whole of it. Everything above its `// Node body`
+marker is pure and shared — Follow-Ups (`../sendtrack/code_followup.js`) embeds
+it verbatim — so a first touch and a follow-up are written and gated by the same
+functions:
+
+| What | Rule |
 |---|---|
-| Subject, body, ask | the model, from the fact sheet and the approved claims |
-| Which fact opens each channel, which proof line is offered | Assess Grounding, deterministically |
-| Greeting, opt-out, signature | appended here, never generated |
-| Link | none in warm-up weeks 1-2; after that only the library's `link` line, appended here |
+| Wording | Section 9's blocks, byte for byte. `template_spec.py` renders the JS constants back into the doc's block format and both builds refuse on any difference |
+| Arm | lead_id even = A, odd = B (`ARM_BY_PARITY`); the close and the SMYKM sentence follow it |
+| SMYKM line | the first fact the lead has: recruiting trials, therapeutic areas, city (`SMYKM_ORDER`); none omits the line and its blank line |
+| Trials | only the studies whose lead sponsor or a collaborator **is** the company (below); never `query.spons`' raw `totalCount` |
+| Areas | the locked taxonomy, case-insensitively, `Other` and free text dropped; at most two, lowercase, joined with "and", taxonomy order (oncology first) |
+| Phases | "Phase I to III" for a full run, "Phase I and III" for a gap, "Phase II" alone; Bioequivalence is not a phase; none drops "from {phases}" |
+| Grammar | "1 trial" / "3 trials"; "an" before a vowel in "a {area1}"; an apostrophe alone after a name ending in s |
+| Company | legal forms stripped from the end (S.A., Ltd, s.r.o., GmbH, Sp. z o.o., Pvt Ltd, S.A. de C.V., Inc., LLC, …), a trailing parenthetical, Romania's leading S.C.; an ALL-CAPS name fixed unless a word is an acronym (three letters or fewer, or at most one vowel) |
+| Greeting | "Hi {first_name}," only when the address is that person's (a token overlap with the contact's name); a role inbox, an unattributed address or no name is "Hi there,"; honorifics, credentials after a comma and bare initials skipped |
+| Gate | approved by auto unless no deliverable verified address (`no-address`, `unverified-address`), no Send clock (`no-send-clock`) or a blocklisted domain (`blocklisted`) — or `settings.auto_approve_email` off |
+| Variant | `template/<arm>/<trials\|areas\|city\|none>/<named\|role-inbox\|unnamed\|unaddressed>`, hold tags after `+` |
 
-**Every rule skill section 3 states is enforced in `code_assemble.js` and tagged
-on `variant`** -- length (70-110 target, `long` above 125), one ask, the link
-policy, the product name at most once and in brackets, "AI" at most once, no
-"You're sponsoring", the forbidden claims (guarantees, numbers the library does
-not hold, visitor identification, named CRMs and tools, languages, "chatbot"),
-the geography-matched proof, the subject rules, and v2's grounding checks.
-Since 2026-10-02 (migration 013) also: never that Nova books a call (`claim-books`
--- it sends the booking link, the sponsor books), never SOPs or client documents
-as its source (`claim-sop` -- it answers from the website), and **no repeats**:
-each description and benefit line names its `capabilities`, Assess Grounding
-tells the model which pairs share one (D2 with BEN-247 or BEN-BOOK), and a
-message whose claim codes repeat a capability is tagged `claim-repeat`.
-Since 2026-10-06, an **email to a contact with no email address** -- a
-LinkedIn-only contact written by Workflow 3b from the site's own founder
-LinkedIn -- is tagged `no-address`. The Approval Gate holds it like any other
-tag (no claim check is paid for); Send would refuse it anyway (`contact-unverified`,
-`no-valid-address`), so the tag only keeps it out of the "auto-approved" list.
-The LinkedIn DM to that contact is drafted normally.
+**Sites and SMOs are not drafted.** Get Draft Batch selects only
+`lead_company_type() = 'CRO'`, so a site or SMO waits at `contact_found`
+without taking a place in the batch; Build First Touch writes nothing for a
+non-CRO row; migration 020's trigger refuses to auto-approve a template draft for
+one. **No LinkedIn DM is drafted**: Write Drafts & Advance inserts and retires
+email rows only, so the DMs drafted before 2026-10-19 stay in the queue
+untouched.
 
-**The rules section is shared.** Workflow 6's follow-ups (`../sendtrack/`,
-skill section 8) embed everything in `code_assemble.js` above its `// Node body`
-marker, verbatim, so they run these same rule functions. Keep that section pure
--- no `$(...)`, no `$input`, no build placeholder -- or the sendtrack build
-refuses.
-`DRAFTING_REVIEW.md` (repo root, generated from the deployed workflow) lists
-every tag and its pattern. `test_rule_mutations.py` breaks each rule in the
-source in turn and proves the unit suite fails.
+## The recruiting-trial count is the company's own
 
-`variant` records each message's own claim codes in slot order, e.g.
-`role-inbox/D2.ANG-HOURS.BEN-247.PR-TR.A1+unconfirmed-claim`. When the model
-leaves out the ask or proof code -- it did on three of eight messages in the
-first run -- code attributes it from the text rather than trusting the model to
-copy an identifier.
+`query.spons` is the only ClinicalTrials.gov query this project trusts, but it is
+a full-text match on the sponsor and collaborator fields, not an identity check.
+Measured on the 30 leads redrafted 2026-10-19: "Therapeutics" matched 1,175
+recruiting trials of every "… Therapeutics", "A+ Science" six trials of Chinese
+hospitals, "JSS Medical Research" an unrelated JSS college, "CRO Group" a
+Tigermed company. Printed in the template, each would have been a false sentence
+under the sender's name.
 
-**Prompt caching is off on purpose.** The HTTP node dispatches every item's
-request before awaiting any, so a run's calls are concurrent and never read each
-other's cache (measured: four writes, zero reads), and cron runs are 30 minutes
-apart, past the 5-minute cache lifetime.
+So the lookup asks for each study's lead sponsor and collaborators (up to 1,000
+studies, the API's page maximum), and `verifiedTrials()` counts a study only when
+one of those names, folded and stripped of legal forms and punctuation, is the
+company's — or the company's followed only by corporate filler ("Innovaderm
+Research Inc." is Innovaderm, "MCRA (an IQVIA business)" is MCRA). A lookup that
+matched more studies than it returned cannot be verified and counts as none. The
+query itself keeps the company name verbatim, as Workflow 3's does. A lookup that
+fails writes nothing and the lead stays queued.
 
-**Terminology, reversed in v3.** "Sponsor" is the CRO's client again, in the
-claims, the prompt, the drafts and the one-pager. The prospect is never the one
-sponsoring: the trial fact says "registered under your company", and any draft
-that says "You're sponsoring" is tagged `prospect-sponsor`.
+## The table re-checks
 
-**A redraft retires what it replaces.** Send a lead back to `contact_found` and
-the write statement sets its earlier pending or approved first-touch drafts to
-`rejected` / `bad draft` in the same statement as the insert. New drafts are
-always `pending`. A lead Workflow 6 has already emailed must be put back to
-`sent` after its redraft (2026-10-02 did this for leads 7, 91 and 104); its new
-email draft can never send, because Workflow 6 refuses `already-contacted`.
+Migration 020's `drafts_approval_rules` turns any `approved_by = 'auto'` approval
+into a hold (`db-guard: …`) unless the flag is on, it is an email, its variant is
+a template's with no `+` tag, its text was not edited, its lead is a CRO, its
+contact has a verified deliverable address and neither domain is blocklisted. A
+workflow bug can make approval less likely, never more, and a draft written any
+other way — the retired composer's, a hand-written one — can no longer approve
+itself.
 
-## Auto-approval -- the review queue is the exceptions queue
+## A redraft retires what it replaces
 
-Since 2026-10-03 (migration 014) an email draft is approved by the workflow
-that wrote it when it passes every check below, and held for a person otherwise.
-Two Code nodes do it, and Follow-Ups (`../sendtrack/`) ships the same two
-verbatim, so a first touch and a follow-up are judged by the same functions:
+Send a lead back to `contact_found` and the write statement sets its earlier
+pending or approved first-touch email drafts to `rejected` / `bad draft` in the
+same statement as the insert, so Send (which sends the oldest approved draft)
+cannot send the old one first. Sent drafts, follow-ups, replies and LinkedIn
+drafts are never touched.
 
-```
-Assemble Drafts / Build Low-Context Drafts -> Approval Gate -> Needs Claim Check? -> Claude Claim Check -> Apply Claim Check
-  -> Needs Repair 1? -> Claude Repair 1 -> Apply Repair 1 -> Repaired 1? -> Assemble Drafts R1 -> Approval Gate R1
-  -> Needs Claim Check R1? -> Claude Claim Check R1 -> Apply Claim Check R1 -> Needs Repair 2? -> ... -> Apply Claim Check R2
-  -> Write Drafts & Advance                  (every "no" exit goes straight to Write Drafts & Advance)
-```
-
-The chain is generated by `approval_chain.py`, which both builds import, so
-Drafting and Follow-Ups carry the same nodes; it unrolls `MAX_REPAIRS` repair
-rounds as real nodes rather than an n8n loop, because each Code node reads the
-item it follows by name (`$('Approval Gate R1').item`).
-
-| Rule | Where | Held as |
-|---|---|---|
-| `settings.auto_approve_email` is on (unset = on) | Approval Gate, from the batch query | `auto-approve-off` |
-| an email -- LinkedIn never auto-approves (Section 6) | Approval Gate | `linkedin` |
-| not a low-context note | Approval Gate | `low-context` |
-| no rule tag: nothing after `+` in `variant` | Approval Gate | `rule-tags: ...` |
-| every claim code in `variant` is active and confirmed | Approval Gate | `unconfirmed-claim: ...` / `no-claims` |
-| a second Sonnet 5.5 call finds every claim supported by a confirmed line and every prospect fact in the record -- a widened claim fails, after up to 2 repairs | Claude Claim Check -> Apply Claim Check (-> the repair rounds) | `claim-check: widened "..." (BEN-SEE)`; after repairs `first draft: ... \| after repair 1: ... \| after repair 2: ...` |
-
-`code_approval.js` is the Approval Gate (rules above its `// Node body` marker);
-Apply Claim Check is that rules section followed by `code_approval_apply.js`.
-The deterministic rules run first, so a draft they hold costs no API call. The
-check gets exactly what the drafter had: the lead's fact sheet (the
-ClinicalTrials.gov trial included -- it is looked up per run and stored nowhere)
-and the confirmed lines; for a follow-up, the enrichment record and the first
-email as context.
-
-**The model judges statements; code decides.** The check's schema has no
-overall verdict to trust. It returns every statement, sentence by sentence,
-with its kind (claim / prospect / none), the claim code or fact it compared it
-with, and a verdict. Apply Claim Check approves only if every claim is
-`supported` by a code that is really a confirmed line, every prospect fact is
-`supported`, and the sentences it quoted account for the whole email -- a
-sentence it skipped is a sentence nobody judged. Any failed call (HTTP error,
-refusal, cut-off, wrong schema) holds the draft. There is no fallback model: the
-check is Sonnet 5.5's or a person's.
-
-**The repair loop (2026-10-03).** A claim-check hold that names `widened`,
-`unsupported` or `joined` statements is not final: Apply Claim Check sends the
-drafting model the email, the confirmed lines, the record and each flagged
-sentence with the checker's exact reason (`repairRequest`), and
-`code_approval_repair.js` applies the returned `{original, replacement}`
-rewrites **by code** -- only to flagged sentences, only inside the fields the
-email's text came from (`approval.repair_fields`), so nothing else can change.
-The repaired composition goes through a second copy of Assemble Drafts (every
-rule again, the same code), the gate and the check. At most `MAX_REPAIRS` (2);
-a failed or no-op repair ends the loop. A hold the composer cannot fix (a
-failed call, incomplete quotes, a "supported" claim with no confirmed code) is
-not repaired. Every attempt -- verdicts, rewrites, the cost of its check and
-its repair -- stays in `drafts.claim_check.attempts`, and a final hold lists
-every attempt's reasons. The gate and the checker are unchanged by it.
-
-**The system prompt's widening example is not draft 99's sentence.** Draft 99's
-"..., so you know exactly what came in." is the held-out case the dry run proves
-the check catches (`../sendtrack/dryrun/approval_dryrun.py`); a check shown its
-own test case proves nothing. `test_approval_mutations.py` fails if it is ever
-added.
-
-**The table re-checks.** Migration 014's `drafts_approval_rules` trigger turns
-any `approved_by = 'auto'` approval that breaks the flag, the email-only rule,
-low-context, the tags, a claim code's confirmation, or lacks a passing
-`claim_check`, into a hold (`db-guard: ...`) -- so a bug here can make the
-workflow approve less, never more. It also sets `approved_by = 'human'` for
-every other approval, clears it when a draft leaves approved/sent, and sends an
-auto-approved draft back to a person if its text is rewritten underneath it.
-A confirmed claim whose text is edited is un-confirmed by a trigger on
-`claims_library`, until someone confirms the new text.
-
-## The grounding guard
-
-Section 9's rule is locked: at least two specific facts from
-`(therapeutic area, named trial, city, founder name)`, or the draft is flagged
-`low-context` and skipped rather than invented.
-
-Two categories are deliberately **not** counted, and both are tempting:
-
-| Excluded | Why |
-|---|---|
-| `country` | Every lead has one and ingestion only touches the 13 target geographies. Section 9's own reweight found geography measures "did our scraper touch this lead", not fit. A fact every lead shares grounds nothing. |
-| `site_quality_notes` | Model-generated prose about a website. It reads like a fact and is the highest fabrication-risk field in the record. Counting it would let one model's invention license another's. |
-
-A therapeutic area only counts if it canonicalises against the locked Section 9
-enum. The live store is mixed — pre-enum rows are lowercase free text, and some
-of that text is not a therapeutic area at all (`pharma`, `medtech`, `fmcg`,
-`consumer health products`). Letting one through would put "your work in FMCG" in
-front of a CRO founder, grounded in nothing but an extraction artefact.
-
-## The ClinicalTrials.gov lookup is a deliberate addition
-
-It is not in the Section 9 Workflow 4 spec. `named trial` is one of the four
-grounding categories and **nothing in the pipeline stores one**: Workflow 3 asked
-for `NCTId` with `pageSize=1` and kept only the count, in prose, inside
-`scores.rationale`. Without this call that category is permanently dead and the
-guard runs on three of its four categories.
-
-Same call shape as Workflow 3, so the same evidence applies: `query.spons`
-verbatim is the only ClinicalTrials.gov query this project trusts — `query.locn`
-and `query.term` were both measured against real leads and rejected on false
-positives (see the Master Ref). A `query.spons` hit really is this company's
-trial, so its `briefTitle` is safe to hand a drafting model. Free, no API key.
-
-On this lead set it changes one verdict: Innovate Research has a city and two
-recruiting trials, which is two real facts, and is drafted instead of skipped.
-
-## Joining, not fabrication, is the failure mode
-
-Measured across three real leads at temperature 0.7, 0.45 and 0.35. The model
-rarely invents from nothing. What it does is **join** — build one sentence from
-two facts, where every word traces to the record and the sentence is still untrue:
-
-> "one recruiting **oncology** trial **in Istanbul**"
-
-Neither the trial's therapeutic area nor its location is known. Temperature did
-not fix this, and neither did a prompt rule stated once at the top.
-
-What fixed it was changing the shape of the data. Each fact is handed to the
-model with its own boundary sentence attached:
-
-```
-3. The company is based in Istanbul. This says nothing about where any trial
-   runs or where any staff sit.
-```
-
-plus a one-sentence-one-fact rule. Three further fixes followed the same
-principle — fix the data, not the prompt:
-
-- **At most two therapeutic areas reach the prompt.** "Name at most two" was in
-  the instructions and the model listed five anyway. It cannot list a fifth area
-  it was never given. Oncology goes first when present (Section 12's strongest
-  signal).
-- **The trial fact is phrased in the second person** ("with you as the sponsor").
-  The model copies this line almost verbatim, so a third-person phrasing came
-  back as "this company" and "their own material" in a message addressed to that
-  company.
-- **`founder_name` and `city` never open a message.** Founder because you cannot
-  tell someone their own name — opening from it produced *"Enrique Gaubeca is
-  founder or MD on their site"* as the first line of a DM addressed to Enrique
-  Gaubeca. City because it is thin, and given nothing worth saying the model
-  reliably upgraded "based in Istanbul" into "you run trials in Istanbul".
-
-Which fact opens each channel rotates on `lead_id`: deterministic, so a redraft
-after a re-queue is comparable to what it replaced, but not identical across a
-batch — every email opening on the same kind of sentence is a merge-tag tell
-produced without a merge tag.
-
-## What the model is not allowed to write
-
-The opt-out sentence, the signature and the greeting are appended in
-`code_assemble.js`, not generated. Section 5 locks the opt-out **verbatim** and
-makes it the basis of the GDPR/KVKK legitimate-interest position.
-`test_drift_guards.py` refuses the build on even a punctuation change to it, in
-the JS or in the skill's section 4.
-
-Nothing about the product, the problem or the proof may come from anywhere but
-the approved claims the prompt lists; what comes back is checked against them
-(numbers, deployments, claim codes).
-
-Constraint violations tag the draft's `variant` rather than discarding it. The
-reviewer sees the tag next to the text; a silently dropped draft teaches nobody
-anything.
+**The switch, 2026-10-19 (`redraft_with_template.py`).** The 30 approved or
+pending AI-composed first touches that had not been sent were retired with
+`--retire-only` (each marked in `hold_reason`); their leads stayed at `drafted`,
+so neither Send nor the old composing Drafting — still running from n8n's memory
+until the new one is published — could act on them. `--apply` re-queues them to
+`contact_found` (and retires any AI first touch written since), and refuses until
+the published Drafting version is the template build. With no flag it changes
+nothing and says what it would do.
 
 ## A role inbox is not a person
 
-Section 9 Workflow 3b, locked. The email greeting is gated on the **address**,
-not on whether a name is known. KLIXAR is the live case: Enrique Gaubeca is a
-confirmed founder with a confirmed LinkedIn profile, and `hello@klixar.com` is
-still not his mailbox. He is greeted by name on LinkedIn and not by name over
-email. `Devesh.kumar@innovate-research.com` is the mirror image — a
-personal-shaped address whose owner no source names, so it gets no name either.
+Section 9 Workflow 3b, locked. The greeting is gated on the **address**, not on
+whether a name is known: KLIXAR's founder is a confirmed name with a confirmed
+LinkedIn profile, and KLIXAR's hello@ inbox is still not his mailbox, so it is
+greeted "Hi there,". A personal-shaped address whose owner no source names gets
+no name either.
 
 ## Sender identity
 
-The signature (Section 5: name / one line of title / phone) and the sender name
-the system prompt gives the model come from `NOVASCOUT_SENDER_NAME`,
-`NOVASCOUT_SENDER_TITLE` and `NOVASCOUT_SENDER_PHONE` — the environment if set,
-otherwise the repo's `.env`. Both are baked into the Code nodes at build time,
-so a change means rebuild and re-import.
+The template carries "Abdullah Amir" and "Founder, Amitrix Labs" as approved
+text. Send checks every cold body for `NOVASCOUT_SENDER_NAME` followed by
+`NOVASCOUT_SENDER_TITLE` (the environment if set, otherwise the repo's `.env`),
+and the Reply Assistant signs with them, so the build refuses a template whose
+sign-off is not exactly `Cheers!` / those two lines. There is no default name:
+a default once signed every draft as the wrong person.
 
-There is **no default name**. The build used to fall back to "Fatima", and
-because the signature is baked in, a rebuild from any shell without the variable
-set silently signed every future draft as the wrong person. A missing name now
-refuses the build (`test_drift_guards.py` proves it, and proves the `.env`
-fallback lands in the shipped node). A missing title or phone only warns;
-nothing is invented to fill the gap.
+## code_assemble.js is the Reply Assistant's now
 
-## Known gaps
-
-- **Confirmation is per text.** The operator confirmed every active line on
-  2026-10-03 after reviewing them in `DRAFTING_REVIEW.md`. Editing a confirmed
-  line's text un-confirms it (migration 014), and a draft using it is held
-  until it is confirmed again -- in a second save, after reading it.
-- **A follow-up's trial mention is a reference, not a fact.** Follow-Ups has
-  no ClinicalTrials.gov lookup, so the record its check gets holds no trial: a
-  follow-up that says something about the trial is held, but one that only
-  mentions it while referring back to the first email passes as a reference
-  (measured 2026-10-03, draft 107: "...and the INM004 trial").
-- **"pharma team" is not a rule tag.** A follow-up that refers back to a
-  2026-09-22 first email can copy its retired v2 wording; drafts 107 and 108
-  did, passed the gate, and fail `audit_drafts_vs_onepager.py`.
-- **A pattern check is a pattern check, and the claim check is a model.** The
-  dry run measures it on real text (draft 99 held twice, a clean draft passed),
-  not on every possible widening. Every auto-approval lands in the Daily Digest
-  before its recipient's business hours open.
-- **Pending LinkedIn draft 90 still carries pre-013 wording** (D2 with
-  "books the call"). It is held for a person, like every LinkedIn draft, and is
-  sent by hand -- do not send it as it stands.
-- **A pattern check is a pattern check.** The claim rules catch the phrasings
-  their patterns name (`DRAFTING_REVIEW.md` lists them). A forbidden claim worded
-  some other way gets past them, and the human review is the backstop.
-- **The subject and link checks are email-only.** The LinkedIn DM is sent by a
-  human from their own account (Section 6). Any URL in a DM is tagged.
+`code_assemble.js` was the composer's Assemble Drafts node. It is no longer
+shipped in this workflow, but everything above its `// Node body` marker is
+embedded verbatim in the Reply Assistant's Assemble Reply
+(`../sendtrack/build_workflow.py`): the claim rules a drafted reply is checked
+by. It was left byte-identical on 2026-10-19 so `reply-assistant.json` did not
+change. `test_assemble.js` and `test_rule_mutations.py` still prove those rules.
+Keep its rules section free of n8n reads.
 
 ## The one-pager is not built here
 
-`nova-one-pager.docx` (repo root) is the asset Follow-Up #1 offers
-(`../sendtrack/code_followup.js`). **No script in this repo builds it.** Its
+`nova-one-pager.docx` (repo root) is the asset Mailbox Watch's reply
+notification links. **No script in this repo builds it.** Its
 `docProps/core.xml` (creator `Un-named`, revision 1, created and modified 9 ms
 apart) is programmatic output, consistent with the JS `docx` library, and the
 versions created on 2026-09-18 and 2026-09-21 both carried an
 `[Abdullah: ... Do not estimate one.]` note paragraph (the first also had
 `[DATE]` placeholders). The repo's copy is that output **edited in place**
-(`word/document.xml`) to drop the note and, later the same day, to say "pharma
-team" instead of "sponsor". `core.xml` was left alone, so it still shows the
-generator's timestamp.
+(`word/document.xml`).
 
 If whatever generated it runs again and its output replaces this file, the
-source needs the same fixes, or they come back with it. The note already came
-back once: the 2026-09-21 regeneration dropped the `[DATE]`s and re-emitted the
-note.
+source needs the same fixes, or they come back with it:
 
 1. **No internal note and no placeholders:** no `[Abdullah: ...]` paragraph, no
    `[DATE]`, nothing in square brackets.
 2. **`sponsor` for the CRO's client, never `pharma team`, and nothing calling
-   the reader a sponsor** (skill v3, 2026-10-02 -- this reverses the 2026-09-21
-   rule). The claims and the drafts say "sponsor" for the client again.
-3. **No speed claim beyond "in real time".** The one-pager says Nova answers
-   "in real time"; nothing supports a seconds figure, and no active claim
-   says more (the audit's section B fails on a seconds claim).
+   the reader a sponsor.**
+3. **No speed claim beyond "in real time".**
 4. **The five capability bullets under "What Nova does"** (added 2026-10-02):
    qualification fields, routing of investigators and trainees, the
-   capabilities deck, the booking link, the dashboard. Each is worded to what
-   the Nova Agent Kit code does, and several active claims cite them as
-   evidence (`audit_drafts_vs_onepager.py`, section C).
-5. **The website is the only knowledge source** (settled 2026-10-02, migration
-   013): "Nova is trained on your own website", no SOPs, protocols or "service
-   documentation"; the 48-hour demo step is "You share your site URL" and "We
-   configure Nova specifically on your site content and service pages". The
-   Nova Agent Kit has no code path for documents a client provides.
-6. **No "new dashboard" line.** "Nova doesn't force a new dashboard into that"
-   was dropped with BEN-ROUTE's clause: Nova has its own leads dashboard.
+   capabilities deck, the booking link, the dashboard.
+5. **The website is the only knowledge source**: "Nova is trained on your own
+   website", no SOPs, protocols or "service documentation"; the 48-hour demo
+   step is "You share your site URL".
+6. **No "new dashboard" line.**
 
 After regenerating, run `python audit_drafts_vs_onepager.py` before the file is
-served. It fails on a placeholder, on leftover "pharma team" wording, on anything calling
-the reader a sponsor, and on any claim an active library line makes that the
-one-pager does not. It also reads the live
-queue, so run it after a library edit or a redraft too.
+served, then `python build_onepager_sites.py` (it stops if any phrase is not
+found exactly once).
 
 ## The bug worth remembering
 
-The first live run produced four drafts that mentioned neither Nova nor
-NoblePath. The system prompt was assigned on the **Config** node, and a Postgres
-node replaces the items wholesale — so `$json.system_prompt` resolved to an empty
-string by the time it reached Ollama. n8n does not error on a missing expression
-field. The model got no instructions, summarised the fact sheet back, and the
-execution reported `"status": "success"`.
-
-Unit tests could not catch it (they test the Code node, not the wiring) and
-runtime could not catch it (nothing errored). It is now a **build-time** guard:
-every `$json.X` the model node's body reads (today the Claude Draft node's
-`$json.request`) must be a field `code_assess.js` actually emits, with two drift-guard cases proving the guard fires.
+The first live run, in September, produced four drafts that mentioned neither
+Nova nor NoblePath: the system prompt was assigned on the Config node, and a
+Postgres node replaces the items wholesale, so the model got an empty prompt and
+the execution reported success. n8n does not error on a missing field. The
+template build keeps the guard that came out of it: every field a node reads off
+the item (`$json.ok`, `$json.payload`, each `d->>'…'` of the write, each `lead.…`
+of Build First Touch) must be something the node above actually emits, with
+drift-guard cases proving each guard fires.

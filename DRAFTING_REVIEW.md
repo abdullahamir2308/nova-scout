@@ -1,5 +1,7 @@
 # Drafting review — Workflow 4, skill v3, as deployed
 
+> **SUPERSEDED on 2026-10-19.** This reviews the model-composed drafting, the claim check and the repair loop, all removed that day in favour of fixed templates (NovaScout_MasterRef.md §9 Workflows 4–6). Its generator, `write_drafting_review.py`, was removed with them. Kept for history only.
+
 Generated 2026-10-06 08:09 UTC by `n8n/drafting/write_drafting_review.py`, read-only, from the live n8n and novascout databases — not from the repo.
 
 | Source | Value |

@@ -28,8 +28,8 @@ const WARMUP = [
   [4, 20],
 ];
 
-// Section 5, message rules. Verbatim -- this sentence is the opt-out mechanism.
-const OPT_OUT = "If this isn't relevant, reply 'no' and I won't follow up.";
+// Section 5, message rules. Since 2026-10-19 no opt-out sentence and no phone
+// are required in a body (operator decision); the URL cap stands.
 const MAX_URLS = 1;
 
 // Section 9: "Maximum two follow-ups, then mark lost."
@@ -242,11 +242,13 @@ const BUSINESS_END_MIN = 17 * 60;
 // within seconds; fifteen minutes is generous.
 const MIRROR_GRACE_MIN = 15;
 
-// The signature this build signs with (Section 5: name / title / phone). A body
-// that does not carry it -- opt-out line, blank line, signature -- was drafted
-// under a different identity or had its compliance footer edited. Substituted
-// at build time.
-const SIGNATURE = __SIGNATURE__;
+// Who this build signs as: the sender's name line followed by the title line
+// (NOVASCOUT_SENDER_NAME / _TITLE), substituted at build time. A body that does
+// not carry both, as whole lines, was drafted under a different identity. Both
+// signatures in the queue carry them -- the template's "Cheers!" / name / title
+// (Section 5, since 2026-10-19) and the name / title / phone of everything
+// written before -- so this is the one check both pass.
+const SENDER_IDENTITY = __SENDER_IDENTITY__;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -399,8 +401,7 @@ function ineligibility(c) {
 
   if (/^low-context/.test(str(c.variant)) || /^NOT DRAFTED/.test(body)) return 'low-context';
   if (!str(c.subject)) return 'no-subject';
-  if (body.indexOf(OPT_OUT) === -1) return 'no-opt-out';
-  if (body.indexOf(OPT_OUT + '\n\n' + SIGNATURE) === -1) return 'stale-signature';
+  if (('\n' + body + '\n').indexOf('\n' + SENDER_IDENTITY + '\n') === -1) return 'stale-signature';
   if (countUrls(body) > MAX_URLS) return 'too-many-urls';
   if (!clockFor(c.country)) return 'unknown-country:' + str(c.country);
   return null;

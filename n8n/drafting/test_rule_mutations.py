@@ -1,4 +1,9 @@
-"""Proves every rule Workflow 4 enforces in code fails a test when it is broken.
+"""Proves every claim rule in code_assemble.js fails a test when it is broken.
+
+Since 2026-10-19 those rules run in one place only: the Reply Assistant's Assemble
+Reply embeds code_assemble.js above its "Node body" marker (Section 9, Workflow 7).
+First touches and follow-ups are fixed templates -- test_template_mutations.py
+covers those -- and code_assess.js, which this suite also mutated, is gone.
 
     python n8n/drafting/test_rule_mutations.py
 
@@ -41,7 +46,7 @@ V3_TAGS = {
     "claim-repeat", "claim-books", "claim-sop",
 }
 
-TESTS = {"code_assemble.js": "test_assemble.js", "code_assess.js": "test_grounding.js"}
+TESTS = {"code_assemble.js": "test_assemble.js"}
 
 # (label, file, old, new) -- each `old` must occur exactly once.
 STRUCTURAL = [
@@ -86,30 +91,6 @@ STRUCTURAL = [
     ("[v3] the fact sheet's numbering does not license number words", "code_assemble.js",
      "factCorpus.replace(/^\\d+\\.\\s/gm, '')",
      "factCorpus"),
-    ("[v3] the trial fact never calls the prospect a sponsor", "code_assess.js",
-     "' registered under your company. '",
-     "' with you as the sponsor. '"),
-    ("[v3] the trial hook instruction never teaches \"sponsoring\"", "code_assess.js",
-     "'running ...\" -- about them, not about ClinicalTrials.gov, and never \"sponsoring\".',",
-     "'sponsoring ...\" -- about them, not about ClinicalTrials.gov.',"),
-    ("[v3] the request carries no sampling parameter", "code_assess.js",
-     "const request = Object.assign({}, CLAUDE_REQUEST, {",
-     "const request = Object.assign({ temperature: 0.45 }, CLAUDE_REQUEST, {"),
-    ("[v3] only the lead's own proof line is offered", "code_assess.js",
-     "proof: lines(forCountry(bySlot('proof'), lead.country)),",
-     "proof: lines(bySlot('proof')),"),
-    ("[v3] the prompt names every claim pair that repeats a capability", "code_assess.js",
-     "const pairs = repeatPairs(pools.description.concat(pools.benefit));",
-     "const pairs = [];"),
-    ("[v3] a description or benefit line shows the model its capabilities", "code_assess.js",
-     "? '  (about: ' + l.capabilities.join(', ') + ')' : '';",
-     "? '' : '';"),
-    ("[v3] a lead missing a v3 slot is held back before any API call", "code_assess.js",
-     "const libraryHolds = groundable && libraryGap !== null;",
-     "const libraryHolds = false;"),
-    ("[2026-10-06] an honorific is not a first name (\"Hi Dr.,\")", "code_assess.js",
-     "while (parts.length > 1 && HONORIFICS.indexOf(parts[0].toLowerCase().replace(/\\.+$/, '')) !== -1) parts.shift();",
-     ""),
 ]
 
 

@@ -3,15 +3,20 @@
 //   node test_decide.js
 //
 // Every guard is exercised against the real function sliced out of the shipped
-// node, with the build-time signature substituted exactly as build_workflow.py
-// substitutes it. dryrun.py then proves the same guards end-to-end through n8n,
-// Postgres and an SMTP sink.
+// node, with the build-time sender identity substituted exactly as
+// build_workflow.py substitutes it. dryrun.py and template_dryrun.py then prove
+// the same guards end-to-end through n8n, Postgres and an SMTP sink.
 const path = require('path');
 const { extractFunctions, runOnceForAll, runner } = require('./harness');
 
 const FILE = path.join(__dirname, 'code_decide.js');
-const SIG = 'Test Sender\nFounder, Test Labs\n+10000000000';
-const transform = (s) => s.replace('__SIGNATURE__', JSON.stringify(SIG));
+// What Send checks for since 2026-10-19: the name line, then the title line.
+const IDENTITY = 'Test Sender\nFounder, Test Labs';
+const transform = (s) => s.replace('__SENDER_IDENTITY__', JSON.stringify(IDENTITY));
+// The two signatures in the queue: the template's (Section 5, since
+// 2026-10-19) and the name / title / phone of everything written before.
+const SIG = 'Cheers!\n' + IDENTITY;
+const OLD_SIG = IDENTITY + '\n+10000000000';
 const { decide, warmupState, ceilingForWeek, localClock, normaliseBody } = extractFunctions(
   FILE, '// Node body',
   ['decide', 'warmupState', 'ceilingForWeek', 'localClock', 'normaliseBody'],
@@ -21,8 +26,9 @@ const { decide, warmupState, ceilingForWeek, localClock, normaliseBody } = extra
 const t = runner('Workflow 6 -- Decide Send');
 
 const OPT = "If this isn't relevant, reply 'no' and I won't follow up.";
-const BODY = 'Hello,\n\nYour site lists oncology work. Nova is an assistant trained on your own ' +
-  'SOPs. It already runs at NoblePath. Would you like the recording?\n\n' + OPT + '\n\n' + SIG;
+const BODY = 'Hi there,\n\nWe have yet to be properly introduced. Klixar has 2 trials recruiting right now. ' +
+  'Would you like to learn more?\n\n' + SIG;
+const OLD_BODY = 'Hello,\n\nYour site lists oncology work. Would you like the recording?\n\n' + OPT + '\n\n' + OLD_SIG;
 
 // Monday 2026-09-14 15:00 UTC = 20:00 PKT, sender-day 2026-09-14.
 // Argentina 12:00, Mexico 09:00, Poland 16:00 -- at work.
@@ -133,10 +139,15 @@ const reasonFor = (over) => {
   ['low-context variant, even though a human approved it', { variant: 'low-context/role-inbox' }, 'low-context'],
   ['low-context note as the body', { variant: 'role-inbox', body: 'NOT DRAFTED -- low context.\n\nFound: a city' }, 'low-context'],
   ['empty subject', { subject: '  ' }, 'no-subject'],
-  ['opt-out sentence deleted in an edit', { body: BODY.replace(OPT, '') }, 'no-opt-out'],
-  ['opt-out sentence paraphrased', { body: BODY.replace("won't", 'will not') }, 'no-opt-out'],
-  ['signed as a previous sender identity', { body: BODY.replace(SIG, 'Fatima') }, 'stale-signature'],
-  ['signature separated from the opt-out line', { body: BODY.replace(OPT + '\n\n' + SIG, OPT + '\n\nThanks!\n\n' + SIG) }, 'stale-signature'],
+  ['a template body: no opt-out sentence, no phone (Section 5, 2026-10-19)', { body: BODY }, 'eligible'],
+  ['a body written before 2026-10-19: opt-out line, name / title / phone', { body: OLD_BODY }, 'eligible'],
+  ['signed as a previous sender identity', { body: BODY.replace(IDENTITY, 'Fatima\nFounder, Test Labs') }, 'stale-signature'],
+  ['the title line missing', { body: BODY.replace('\nFounder, Test Labs', '') }, 'stale-signature'],
+  ['name and title run together on one line', { body: BODY.replace(IDENTITY, 'Test Sender, Founder, Test Labs') }, 'stale-signature'],
+  ['the identity only inside a quoted earlier email, not signed by this one',
+    { variant: 'follow-up-1', lead_status: 'sent', prior_sends: 1,
+      body: 'Hi there,\n\nJust bringing this back.\n\nCheers!\n\nOn Mon, 05 Oct 2026, Test Sender wrote:\n> Hi there,\n>\n> ' +
+        IDENTITY.split('\n').join('\n> ') }, 'stale-signature'],
   ['two URLs (Section 5 allows one)', { body: BODY.replace('Would you', 'See https://a.example and www.b.example. Would you') }, 'too-many-urls'],
   ['country outside Section 12', { country: 'Narnia' }, 'unknown-country:Narnia'],
   ['first touch to a lead the workflow already emailed', { prior_sends: 1 }, 'already-contacted'],

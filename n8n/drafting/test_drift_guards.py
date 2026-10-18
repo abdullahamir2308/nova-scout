@@ -1,17 +1,16 @@
 """Checks that build_workflow.py's spec-drift guards actually FIRE.
 
 A guard that has never been seen to fail is not a guard. Each case here takes a
-real copy of the Master Ref (or of a Code-node source), introduces exactly one
-divergence, and asserts the build refuses to run.
+real copy of the Master Ref, of code_template.js or of the build script itself,
+introduces exactly one divergence, and asserts the build refuses to run.
 
     python n8n/drafting/test_drift_guards.py
 
-Workflow 4's guards matter more than the others'. A scoring drift produces a
-wrong number in a table someone can re-derive; a drafting drift produces a
-sentence in a stranger's inbox, sent under a real person's name, that nobody can
-un-send. The two cases worth reading twice are the opt-out sentence (Section 5
-makes it the entire GDPR/KVKK opt-out mechanism) and the fact vocabulary (widen
-it and the grounding guard passes everything while still looking correct).
+Since 2026-10-19 Workflow 4 writes the operator's approved template and nothing
+else, so the cases worth reading twice are the wording ones: a word changed in
+the doc or in the code, and the build stops until both say the same thing --
+plus the sender guard (a template signed by anyone but the sender Send checks
+for would be refused at send time, or sent under the wrong name).
 
 Exits non-zero on the first guard that failed to fire.
 """
@@ -29,12 +28,15 @@ BS = chr(92)
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 MASTER_REF = os.path.join(REPO, "NovaScout_MasterRef.md")
-SKILL = os.path.join(REPO, "NovaScout_DraftingSkill.md")
-CLAIMS_MIGRATION = os.path.join(REPO, "postgres", "migrations", "010_claims_library.sql")
-CLAIMS_V3_MIGRATION = os.path.join(REPO, "postgres", "migrations", "012_claims_library_v3.sql")
 
 PASSED = []
 FAILED = []
+
+# The template carries the sender's name and title as approved text, so every
+# case builds as that sender. The cases must not depend on a gitignored .env
+# existing, so NOVASCOUT_ENV_FILE points at a path that is never created.
+FIXTURE_SENDER = "Abdullah Amir"
+FIXTURE_TITLE = "Founder, Amitrix Labs"
 
 
 def read(p):
@@ -47,40 +49,13 @@ def write(p, s):
         fh.write(s)
 
 
-# Every case builds as this sender, never the real one. The cases must not
-# depend on a gitignored .env existing, so NOVASCOUT_ENV_FILE points at a path
-# that is never created -- the real .env is out of every case unless a case
-# opts in with a file of its own.
-FIXTURE_SENDER = "Drift Test Sender"
-
-
-def stage_companions(workdir, mutate_skill=None, mutate_migration=None, mutate_v3_migration=None):
-    """The drafting skill and migrations 010 and 012 are parsed by the build too.
-    Every case gets its own copy, so a case can mutate one without touching the repo."""
-    for label, src, name, mutate in (("skill", SKILL, "DraftingSkill.md", mutate_skill),
-                                     ("migration", CLAIMS_MIGRATION, "010_claims_library.sql",
-                                      mutate_migration),
-                                     ("v3 migration", CLAIMS_V3_MIGRATION, "012_claims_library_v3.sql",
-                                      mutate_v3_migration)):
-        text = read(src)
-        if mutate:
-            new = mutate(text)
-            assert new != text, "mutation did not change the %s" % label
-            text = new
-        write(os.path.join(workdir, name), text)
-
-
 def run_build(workdir, doc_path, env_overrides=None):
     env = dict(os.environ)
     env["NOVASCOUT_MASTER_REF"] = doc_path
-    env["NOVASCOUT_DRAFTING_SKILL"] = os.path.join(workdir, "DraftingSkill.md")
-    env["NOVASCOUT_CLAIMS_MIGRATION"] = os.path.join(workdir, "010_claims_library.sql")
-    env["NOVASCOUT_CLAIMS_V3_MIGRATION"] = os.path.join(workdir, "012_claims_library_v3.sql")
     env["DRAFTING_OUT"] = os.path.join(workdir, "out", "drafting.json")
     env["NOVASCOUT_ENV_FILE"] = os.path.join(workdir, "no-such.env")
     env["NOVASCOUT_SENDER_NAME"] = FIXTURE_SENDER
-    for k in ("NOVASCOUT_SENDER_TITLE", "NOVASCOUT_SENDER_PHONE", "NOVASCOUT_DEMO_URL"):
-        env.pop(k, None)
+    env["NOVASCOUT_SENDER_TITLE"] = FIXTURE_TITLE
     env["PYTHONIOENCODING"] = "utf-8"
     for k, v in (env_overrides or {}).items():
         if v is None:
@@ -95,631 +70,214 @@ def run_build(workdir, doc_path, env_overrides=None):
     return proc.returncode, err.decode("utf-8", "replace")
 
 
-def case(label, mutate_doc=None, mutate_js=None, js_file="code_assess.js", expect_in="",
-         env_overrides=None, mutate_skill=None, mutate_migration=None, mutate_v3_migration=None):
+def staged(mutate_doc=None, mutate_files=None):
     tmp = tempfile.mkdtemp(prefix="novascout-drift-")
+    shutil.copytree(HERE, os.path.join(tmp, "drafting"), ignore=shutil.ignore_patterns("__pycache__"))
+    doc_path = os.path.join(tmp, "MasterRef.md")
+    doc = read(MASTER_REF)
+    if mutate_doc:
+        new_doc = mutate_doc(doc)
+        assert new_doc != doc, "a doc mutation did not change the doc"
+        doc = new_doc
+    write(doc_path, doc)
+    for name, fn in (mutate_files or {}).items():
+        p = os.path.join(tmp, "drafting", name)
+        src = read(p)
+        new = fn(src)
+        assert new != src, "a mutation did not change %s" % name
+        write(p, new)
+    return tmp, doc_path
+
+
+def case(label, expect_in, mutate_doc=None, mutate_js=None, mutate_build=None, env_overrides=None):
+    files = {}
+    if mutate_js:
+        files["code_template.js"] = mutate_js
+    if mutate_build:
+        files["build_workflow.py"] = mutate_build
+    tmp, doc_path = staged(mutate_doc, files)
     try:
-        shutil.copytree(HERE, os.path.join(tmp, "drafting"))
-        stage_companions(tmp, mutate_skill, mutate_migration, mutate_v3_migration)
-        doc_path = os.path.join(tmp, "MasterRef.md")
-        doc = read(MASTER_REF)
-        if mutate_doc:
-            new_doc = mutate_doc(doc)
-            assert new_doc != doc, "mutation %r did not change the doc" % label
-            doc = new_doc
-        write(doc_path, doc)
-
-        if mutate_js:
-            p = os.path.join(tmp, "drafting", js_file)
-            src = read(p)
-            new_src = mutate_js(src)
-            assert new_src != src, "mutation %r did not change %s" % (label, js_file)
-            write(p, new_src)
-
         rc, err = run_build(tmp, doc_path, env_overrides)
         if rc == 0:
             FAILED.append((label, "build SUCCEEDED but should have refused"))
-        elif expect_in and expect_in.lower() not in err.lower():
-            FAILED.append((label, "refused, but message lacked %r:\n%s" % (expect_in, err[-400:])))
+        elif expect_in.lower() not in err.lower():
+            FAILED.append((label, "refused, but message lacked %r:\n%s" % (expect_in, err[-500:])))
         else:
             PASSED.append(label)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def baseline():
-    tmp = tempfile.mkdtemp(prefix="novascout-drift-")
+def one(src, old, new):
+    assert src.count(old) == 1, "anchor %r occurs %d times" % (old, src.count(old))
+    return src.replace(old, new)
+
+
+def shipped(env_overrides=None, mutate_doc=None):
+    """Build an unmodified copy and return (rc, err, workflow)."""
+    tmp, doc_path = staged(mutate_doc)
     try:
-        shutil.copytree(HERE, os.path.join(tmp, "drafting"))
-        stage_companions(tmp)
-        doc_path = os.path.join(tmp, "MasterRef.md")
-        write(doc_path, read(MASTER_REF))
-        rc, err = run_build(tmp, doc_path)
-        if rc != 0:
-            FAILED.append(("BASELINE: unmodified build succeeds", err[-600:]))
-        else:
-            PASSED.append("BASELINE: unmodified build succeeds")
+        rc, err = run_build(tmp, doc_path, env_overrides)
+        wf = json.loads(read(os.path.join(tmp, "out", "drafting.json"))) if rc == 0 else None
+        return rc, err, wf
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-baseline()
+# --- baseline -------------------------------------------------------------------
+
+rc, err, WF = shipped()
+if rc != 0:
+    FAILED.append(("BASELINE: unmodified build succeeds", err[-600:]))
+else:
+    PASSED.append("BASELINE: unmodified build succeeds")
+    names = [n["name"] for n in WF["nodes"]]
+    if names == ["Every 30 Minutes", "Manual Trigger", "Config", "Get Draft Batch", "ClinicalTrials.gov Lookup",
+                 "Build First Touch", "Drop Failed Lookups", "Write Drafts & Advance"]:
+        PASSED.append("BASELINE: the shipped workflow is the template chain, no model node")
+    else:
+        FAILED.append(("BASELINE: the shipped workflow is the template chain, no model node", repr(names)))
+    if "anthropic" in json.dumps(WF).lower():
+        FAILED.append(("BASELINE: nothing in the shipped workflow names Anthropic", "it does"))
+    else:
+        PASSED.append("BASELINE: nothing in the shipped workflow names Anthropic")
+
+# --- the sender ---------------------------------------------------------------------
+
+case("no sender name anywhere -> refuses (there is no default)", "NOVASCOUT_SENDER_NAME is not set",
+     env_overrides={"NOVASCOUT_SENDER_NAME": None})
+case("the sender is someone else -> refuses (Send would refuse every draft)", "signs",
+     env_overrides={"NOVASCOUT_SENDER_NAME": "Fatima"})
+case("the sender's title differs from the template's -> refuses", "signs",
+     env_overrides={"NOVASCOUT_SENDER_TITLE": "CEO, Amitrix Labs"})
 
 
 def env_file_supplies_sender():
-    """The positive half of the sender guard: with the variable absent from the
-    environment, the name in .env is what lands in the shipped Code node."""
-    label = ".env supplies the sender name when the environment does not"
-    tmp = tempfile.mkdtemp(prefix="novascout-drift-")
+    label = ".env supplies the sender name and title when the environment does not"
+    tmp, doc_path = staged()
     try:
-        shutil.copytree(HERE, os.path.join(tmp, "drafting"))
-        stage_companions(tmp)
-        doc_path = os.path.join(tmp, "MasterRef.md")
-        write(doc_path, read(MASTER_REF))
         env_file = os.path.join(tmp, "test.env")
-        write(env_file, '# other keys are ignored\nOTHER=1\nNOVASCOUT_SENDER_NAME="Env File Sender"\n')
-        rc, err = run_build(tmp, doc_path, {"NOVASCOUT_SENDER_NAME": None,
+        write(env_file, '# other keys are ignored\nOTHER=1\nNOVASCOUT_SENDER_NAME="Abdullah Amir"\n'
+                        "NOVASCOUT_SENDER_TITLE=Founder, Amitrix Labs\n")
+        rc, err = run_build(tmp, doc_path, {"NOVASCOUT_SENDER_NAME": None, "NOVASCOUT_SENDER_TITLE": None,
                                             "NOVASCOUT_ENV_FILE": env_file})
-        if rc != 0:
-            FAILED.append((label, "build refused:\n" + err[-400:]))
-            return
-        wf = json.loads(read(os.path.join(tmp, "out", "drafting.json")))
-        code = [n for n in wf["nodes"] if n["name"] == "Assemble Drafts"][0]["parameters"]["jsCode"]
-        if 'const SIGNATURE = "Env File Sender";' in code:
+        if rc == 0:
             PASSED.append(label)
         else:
-            FAILED.append((label, "Assemble Drafts does not carry the name from .env"))
+            FAILED.append((label, "build refused:\n" + err[-400:]))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
 env_file_supplies_sender()
 
-# --- the grounding threshold ------------------------------------------------
-case(
-    "doc raises the fact threshold -> build refuses",
-    mutate_doc=lambda d: d.replace(
-        "lacks at least two specific facts", "lacks at least three specific facts", 1),
-    expect_in="grounding threshold",
-)
-case(
-    "JS lowers MIN_FACTS below the doc -> build refuses",
-    mutate_js=lambda s: s.replace("const MIN_FACTS = 2;", "const MIN_FACTS = 1;", 1),
-    expect_in="grounding threshold",
-)
-case(
-    "the grounding-guard sentence is reworded past recognition -> build refuses loudly",
-    mutate_doc=lambda d: d.replace(
-        "lacks at least two specific facts", "has insufficient specific facts", 1),
-    expect_in="grounding threshold not found",
-)
+# --- the approved wording, doc side and code side ---------------------------------------
 
-# --- the fact vocabulary ----------------------------------------------------
-#
-# The failure this pair guards against is the quiet one: widen the vocabulary
-# and every lead clears a two-fact threshold, so the guard keeps passing and
-# stops meaning anything.
-case(
-    "doc adds a fact category the JS cannot collect -> build refuses",
-    mutate_doc=lambda d: d.replace(
-        "(therapeutic area, named trial, city, founder name)",
-        "(therapeutic area, named trial, city, founder name, employee count)", 1),
-    expect_in="fact vocabulary",
-)
-case(
-    "doc removes a fact category the JS still collects -> build refuses",
-    mutate_doc=lambda d: d.replace(
-        "(therapeutic area, named trial, city, founder name)",
-        "(therapeutic area, named trial, city)", 1),
-    expect_in="fact vocabulary",
-)
-case(
-    "JS invents a fact category the doc does not license -> build refuses",
-    mutate_js=lambda s: s.replace(
-        "kind: 'city',", "kind: 'site_quality',", 1),
-    expect_in="fact vocabulary",
-)
-case(
-    "the missing-fact report drifts from the doc's list -> build refuses",
-    mutate_js=lambda s: s.replace(
-        "const missing = ['therapeutic_area', 'named_trial', 'city', 'founder_name']",
-        "const missing = ['therapeutic_area', 'named_trial', 'city']", 1),
-    expect_in="missing-fact report",
-)
+INTRO = "We have yet to be properly introduced, but I'm Abdullah Amir and I'm the Founder of Amitrix Labs."
+case("the doc's introduction changes and the JS does not follow -> refuses", "drifted",
+     mutate_doc=lambda d: one(d, "\n" + INTRO + "\n", "\nWe have not met yet, but I'm Abdullah Amir and I'm the Founder of Amitrix Labs.\n"))
+case("the JS pitch changes and the doc does not -> refuses", "drifted",
+     mutate_js=lambda s: one(s, "so you win more studies.\";", "so you win more trials.\";"))
+case("arm B's close changes in the JS -> refuses", "drifted",
+     mutate_js=lambda s: one(s, 'const CLOSE_B = "Worth a look for {company}?";', 'const CLOSE_B = "Worth a look?";'))
+case("the subject changes in the doc -> refuses", "drifted",
+     mutate_doc=lambda d: one(d, "Subject: {company} + {fact} + sponsor inquiries\n", "Subject: {company} + {fact}\n"))
+case("an SMYKM sentence changes in the doc -> refuses", "drifted",
+     mutate_doc=lambda d: one(d, "areas B: A sponsor planning a {area1} study will usually check",
+                              "areas B: A sponsor planning a {area1} study will check"))
+case("the subject's trial fact changes in the JS -> refuses", "drifted",
+     mutate_js=lambda s: one(s, 'const SUBJECT_FACT_TRIALS = "{n} recruiting trial(s)";',
+                             'const SUBJECT_FACT_TRIALS = "{n} trial(s)";'))
+case("follow-up #2 changes in the doc -> refuses (Drafting owns the constants)", "drifted",
+     mutate_doc=lambda d: one(d, "and won't follow up again after this.", "and won't write again."))
+case("the sign-off gains a phone line in the JS -> refuses", "drifted",
+     mutate_js=lambda s: one(s, 'const SIGN_OFF = ["Cheers!", "Abdullah Amir", "Founder, Amitrix Labs"];',
+                             'const SIGN_OFF = ["Cheers!", "Abdullah Amir", "Founder, Amitrix Labs", "+923178485713"];'))
+case("the doc loses the first-touch template heading -> refuses loudly", "not found",
+     mutate_doc=lambda d: one(d, "**First-touch template — LOCKED", "**The first touch — LOCKED"))
+case("a template constant stops being a plain string -> refuses", "no longer declares",
+     mutate_js=lambda s: one(s, 'const PITCH_LINE = "', "const PITCH_LINE = 'x' + \""))
+case("the doc stops saying 'Hi there,' for a role inbox -> refuses", "Hi there",
+     mutate_doc=lambda d: d.replace('"Hi there,"', '"Hello,"'))
 
-# --- the body length (skill v3: 70-110 words, never more than 125) -----------
-#
-# Stated in the skill and twice in the Master Ref (Section 5, Section 9). All
-# three must agree and the assembler must enforce exactly that.
-case(
-    "Section 5 raises the ceiling alone -> build refuses",
-    mutate_doc=lambda d: d.replace("First touch: body 70–110 words, never more than 125",
-                                   "First touch: body 70–110 words, never more than 150", 1),
-    expect_in="more than one body length rule",
-)
-case(
-    "both Master Ref statements move together, the skill does not -> build refuses",
-    mutate_doc=lambda d: d.replace("70–110 words, never more than 125", "70–120 words, never more than 140"),
-    expect_in="disagree on the body length",
-)
-case(
-    "the skill raises the ceiling, the Master Ref does not -> build refuses",
-    mutate_skill=lambda s: s.replace("70–110 words and never more than 125", "70–110 words and never more than 150", 1),
-    expect_in="disagree on the body length",
-)
-case(
-    "the assembler raises its ceiling above the skill -> build refuses",
-    mutate_js=lambda s: s.replace("const BODY_CEILING = 125;", "const BODY_CEILING = 150;", 1),
-    js_file="code_assemble.js",
-    expect_in="body length drifted",
-)
-case(
-    "the assembler moves its target range -> build refuses",
-    mutate_js=lambda s: s.replace("const BODY_TARGET_MAX = 110;", "const BODY_TARGET_MAX = 120;", 1),
-    js_file="code_assemble.js",
-    expect_in="body length drifted",
-)
-case(
-    "the skill's length sentence is reworded past recognition -> build refuses loudly",
-    mutate_skill=lambda s: s.replace("should be 70–110 words and never more than 125", "should be short", 1),
-    expect_in="body length rule not found",
-)
+# --- the rules that pick the arm and the fact ---------------------------------------------
 
-# --- the opt-out sentence: Section 5's compliance mechanism ------------------
-case(
-    "the opt-out sentence is paraphrased in the JS -> build refuses",
-    mutate_js=lambda s: s.replace(
-        "reply 'no' and I won't follow up.", "reply 'no' and I will not follow up.", 1),
-    js_file="code_assemble.js",
-    expect_in="verbatim",
-)
-case(
-    "even a punctuation change to the opt-out is refused",
-    mutate_js=lambda s: s.replace(
-        "reply 'no' and I won't follow up.", "reply 'no' and I won't follow up!", 1),
-    js_file="code_assemble.js",
-    expect_in="verbatim",
-)
-case(
-    "the doc changes the opt-out and the JS does not follow -> build refuses",
-    mutate_doc=lambda d: d.replace(
-        "If this isn't relevant, reply 'no' and I won't follow up.",
-        "Reply 'stop' and you will not hear from me again.", 1),
-    expect_in="verbatim",
-)
-case(
-    "the opt-out anchor is renamed -> build refuses loudly",
-    mutate_doc=lambda d: d.replace("Use a plain sentence:", "Use this line:", 1),
-    expect_in="opt-out sentence not found",
-)
+case("the doc flips the arms and the JS does not follow -> refuses", "selection rules drifted",
+     mutate_doc=lambda d: one(d, "Two arms, assigned by lead_id: even = A, odd = B.", "Two arms, assigned by lead_id: even = B, odd = A."))
+case("the JS reorders the SMYKM facts -> refuses", "selection rules drifted",
+     mutate_js=lambda s: one(s, "const SMYKM_ORDER = ['trials', 'areas', 'city'];", "const SMYKM_ORDER = ['areas', 'trials', 'city'];"))
+case("the doc allows three areas -> refuses", "selection rules drifted",
+     mutate_doc=lambda d: one(d, 'At most two areas, lowercase, joined with "and"', 'At most three areas, lowercase, joined with "and"'))
+case("the doc loses the arm sentence -> refuses loudly", "no longer states",
+     mutate_doc=lambda d: one(d, "Two arms, assigned by lead_id: even = A, odd = B.", "Two arms."))
+case("the doc brings a composing model back ('No model call' gone) -> refuses", "No model call",
+     mutate_doc=lambda d: d.replace("**No model call** in Drafting", "A model call in Drafting"))
+case("the doc's taxonomy gains an area the JS does not have -> refuses", "taxonomy drifted",
+     mutate_doc=lambda d: one(d, "\nHematology\nOther\n", "\nHematology\nUrology\nOther\n"))
 
-# --- banned adjectives ------------------------------------------------------
-case(
-    "doc names an adjective the JS does not ban -> build refuses",
-    mutate_doc=lambda d: d.replace(
-        'no adjectives like "revolutionary" or "cutting-edge"',
-        'no adjectives like "revolutionary", "paradigm-shifting" or "cutting-edge"', 1),
-    expect_in="does not ban",
-)
-case(
-    "JS stops banning an adjective the doc names -> build refuses",
-    mutate_js=lambda s: s.replace("  'revolutionary',\n", "", 1),
-    js_file="code_assemble.js",
-    expect_in="does not ban",
-)
+# --- the code side: no model, the shared rules stay pure, the wiring ----------------------
 
-# --- the URL cap ------------------------------------------------------------
-case(
-    "doc changes the URL cap -> build refuses",
-    mutate_doc=lambda d: d.replace("Maximum one plain URL.", "Maximum two plain URL.", 1),
-    expect_in="url cap",
-)
-case(
-    "JS raises the URL cap above the doc -> build refuses",
-    mutate_js=lambda s: s.replace("const MAX_URLS = 1;", "const MAX_URLS = 3;", 1),
-    js_file="code_assemble.js",
-    expect_in="url cap",
-)
-
-# --- the therapeutic-area taxonomy -----------------------------------------
-case(
-    "doc adds a taxonomy category the JS does not have -> build refuses",
-    mutate_doc=lambda d: d.replace("\nHematology\nOther\n", "\nHematology\nUrology\nOther\n", 1),
-    expect_in="taxonomy",
-)
-case(
-    "JS adds a taxonomy category the doc does not have -> build refuses",
-    mutate_js=lambda s: s.replace("  'Hematology',\n", "  'Hematology',\n  'Urology',\n", 1),
-    expect_in="taxonomy",
-)
-case(
-    "the taxonomy fence disappears -> build refuses loudly",
-    mutate_doc=lambda d: d.replace("**Therapeutic area taxonomy", "**Areas taxonomy", 1),
-    expect_in="taxonomy section not found",
-)
-
-# --- Section 3's drafting model ----------------------------------------------
-#
-# The model id is in Section 3 and in skill section 6. The request ships exactly
-# that id; a change in one place alone refuses.
-case(
-    "Section 3 names another drafting model -> build refuses",
-    mutate_doc=lambda d: d.replace("**Drafting model: `claude-sonnet-5-5`**", "**Drafting model: `claude-sonnet-5`**", 1),
-    expect_in="different drafting models",
-)
-case(
-    "the skill names another drafting model -> build refuses",
-    mutate_skill=lambda s: s.replace("- Drafting node: `claude-sonnet-5-5`", "- Drafting node: `claude-opus-5-5`", 1),
-    expect_in="different drafting models",
-)
-case(
-    "the Section 3 model line is renamed -> build refuses loudly",
-    mutate_doc=lambda d: d.replace("**Drafting model: `claude-sonnet-5-5`**", "**Model for drafting: `claude-sonnet-5-5`**", 1),
-    expect_in="drafting model not found",
-)
-
-# --- the wiring guard -------------------------------------------------------
-#
-# Not a spec drift, but the same class of bug: something the build can prove and
-# runtime cannot. n8n resolves a missing `$json.X` to an empty string without
-# erroring, so a prompt field the upstream node stops emitting produces drafts
-# that look fine, an execution that reports success, and no signal anywhere.
-# This happened for real on the first live run.
-case(
-    "the Code node stops emitting the request the Claude body reads -> build refuses",
-    mutate_js=lambda s: s.replace("    request: request,\n", "", 1),
-    expect_in="does not emit",
-)
-case(
-    "the Claude body reads a field Assess Grounding never emits -> build refuses",
-    mutate_js=lambda s: s.replace("JSON.stringify($json.request)", "JSON.stringify($json.claude_request)", 1),
-    js_file="build_workflow.py",
-    expect_in="does not emit",
-)
-
-# --- Section 8's drafts schema ---------------------------------------------
-case(
-    "the drafts table loses a column the INSERT writes -> build refuses",
-    mutate_doc=lambda d: d.replace(
-        "  id, lead_id FK, channel (email|linkedin), variant,",
-        "  id, lead_id FK, channel (email|linkedin),", 1),
-    expect_in="section 8",
-)
-
-# --- the sender identity ----------------------------------------------------
-#
-# The signature is baked into the Code node at build time. The build used to
-# default the name to "Fatima", so a rebuild from any shell without the
-# variable set silently signed every future draft as the wrong person. There is
-# no default now; this is the case that proves a missing name refuses.
-case(
-    "no sender name in the environment or .env -> build refuses, no default",
-    env_overrides={"NOVASCOUT_SENDER_NAME": None},
-    expect_in="NOVASCOUT_SENDER_NAME is not set",
-)
-
-# --- drafting skill v3 --------------------------------------------------------
-#
-# The one to read twice is the first pair. v3's whole design is "the model
-# composes the whole email from the hook fact plus approved claims". The schema
-# is that rule made physical: it needs a body and an ask of its own, or "exactly
-# one ask" cannot be checked. Either side moving alone refuses.
-case(
-    "the skill goes back to line-picking -> build refuses",
-    mutate_skill=lambda s: s.replace("model composes the whole email from the hook fact plus approved claims",
-                                     "model writes the hook; library lines pasted in verbatim", 1),
-    expect_in="composition rule not found",
-)
-case(
-    "the model schema loses the ask field -> build refuses",
-    mutate_js=lambda s: s.replace('        "email_ask": {"type": "string"},\n', "", 1),
-    js_file="build_workflow.py",
-    expect_in="does not match the drafting skill",
-)
-case(
-    "Assemble Drafts stops requiring a field the schema promises -> build refuses",
-    mutate_js=lambda s: s.replace("const FIELDS = ['email_subject', 'email_body', 'email_ask', 'linkedin_body', 'linkedin_ask'];",
-                                  "const FIELDS = ['email_subject', 'email_body', 'email_ask', 'linkedin_body'];", 1),
-    js_file="code_assemble.js",
-    expect_in="FIELDS do not match",
-)
-case(
-    "the skill changes the subject length -> build refuses",
-    mutate_skill=lambda s: s.replace("**Subject.** 30–55 characters.", "**Subject.** 30–60 characters.", 1),
-    expect_in="subject length drifted",
-)
-case(
-    "the JS loosens the subject floor -> build refuses",
-    mutate_js=lambda s: s.replace("const SUBJECT_MIN_CHARS = 30;", "const SUBJECT_MIN_CHARS = 20;", 1),
-    js_file="code_assemble.js",
-    expect_in="subject length drifted",
-)
-case(
-    "the skill stops forbidding fake-reply subjects the JS checks -> build refuses",
-    mutate_skill=lambda s: s.replace('no "Fwd:"', 'no "Fw:"', 1),
-    expect_in="fake-reply subject prefixes drifted",
-)
-case(
-    "the skill drops the subject's product-name / AI rule -> build refuses loudly",
-    mutate_skill=lambda s: s.replace('Never the product name. Never "AI". No "Re:"', 'No "Re:"', 1),
-    expect_in="no longer say",
-)
-case(
-    "the skill bans an adjective the JS does not -> build refuses",
-    mutate_skill=lambda s: s.replace("No banned adjectives (revolutionary,", "No banned adjectives (disruptive, revolutionary,", 1),
-    expect_in="does not ban",
-)
-case(
-    "the JS stops banning an adjective the skill names -> build refuses",
-    mutate_js=lambda s: s.replace("  'seamless',\n", "", 1),
-    js_file="code_assemble.js",
-    expect_in="does not ban",
-)
-case(
-    "the skill allows the product name twice -> build refuses",
-    mutate_skill=lambda s: s.replace("The name appears at most once, in brackets", "The name appears at most twice, in brackets", 1),
-    expect_in="limits drifted",
-)
-case(
-    "the JS allows \"AI\" twice -> build refuses",
-    mutate_js=lambda s: s.replace("const AI_MAX = 1;", "const AI_MAX = 2;", 1),
-    js_file="code_assemble.js",
-    expect_in="limits drifted",
-)
-case(
-    "the skill's fixed opt-out is paraphrased -> build refuses",
-    mutate_skill=lambda s: s.replace("""- Opt-out: "If this isn't relevant, reply 'no' and I won't follow up.\"""",
-                                     """- Opt-out: "If this isn't relevant, just reply 'no'.\"""", 1),
-    expect_in="fixed opt-out is not Section 5's",
-)
-case(
-    "the Master Ref extends the link-free warm-up -> build refuses",
-    mutate_doc=lambda d: d.replace("**Links:** none in warm-up weeks 1–2", "**Links:** none in warm-up weeks 1–3", 1),
-    expect_in="link-free warm-up drifted",
-)
-case(
-    "the JS shortens the link-free warm-up -> build refuses",
-    mutate_js=lambda s: s.replace("const LINK_FREE_WEEKS = 2;", "const LINK_FREE_WEEKS = 1;", 1),
-    js_file="code_assemble.js",
-    expect_in="link-free warm-up drifted",
-)
-case(
-    "migration 012 allows a slot Assess Grounding never offers -> build refuses",
-    mutate_v3_migration=lambda s: s.replace("CHECK (slot IN ('description', 'angle', 'benefit', 'proof', 'ask', 'link'))",
-                                            "CHECK (slot IN ('description', 'angle', 'benefit', 'proof', 'ask', 'link', 'stat'))", 1),
-    expect_in="claims-library slots drifted",
-)
-case(
-    "Assess Grounding stops resolving a v3 slot -> build refuses",
-    mutate_js=lambda s: s.replace("const LIBRARY_SLOTS = ['description', 'angle', 'benefit', 'proof', 'ask'];",
-                                  "const LIBRARY_SLOTS = ['description', 'angle', 'proof', 'ask'];", 1),
-    expect_in="claims-library slots drifted",
-)
-case(
-    "the skill's worked example is reworded so a narrowing no longer applies -> build refuses",
-    mutate_skill=lambda s: s.replace("collects their study brief", "gathers their study brief", 1),
-    expect_in="EXAMPLE_NARROWINGS",
-)
-case(
-    "the skill's worked example disappears -> build refuses loudly",
-    mutate_skill=lambda s: s.replace("**v3 (same facts, nothing invented):**", "**v3:**", 1),
-    expect_in="worked example not found",
-)
-case(
-    "Section 12's company-size band changes -> build refuses",
-    mutate_doc=lambda d: d.replace("**Company:** 5–100 employees", "**Company:** 5–50 employees", 1),
-    expect_in="small-team band drifted",
-)
-case(
-    "migration 010's countries CHECK loses a Section 12 geography -> build refuses",
-    mutate_migration=lambda s: s.replace("'South Africa', 'Brazil', 'Argentina']", "'South Africa', 'Brazil']", 1),
-    expect_in="claims_countries_are_geographies",
-)
-
-# --- the batch row -> Assess Grounding wiring ---------------------------------
-#
-# Same class as the Ollama-body guard: a column the query stops returning is
-# `undefined` in the Code node, silently. A lost `library` holds every lead back
-# as if the operator's table were empty.
-case(
-    "the batch query stops returning the claims library -> build refuses",
-    mutate_js=lambda s: s.replace("AS library,", "AS claims,", 1),
-    js_file="build_workflow.py",
-    expect_in="returns no such column",
-)
-case(
-    "the batch query stops returning the warm-up week -> build refuses",
-    mutate_js=lambda s: s.replace("AS warmup_week", "AS week", 1),
-    js_file="build_workflow.py",
-    expect_in="returns no such column",
-)
-
-# --- auto-approval (migration 014) -------------------------------------------
-case(
-    "the batch query stops returning auto_approve_email -> build refuses",
-    mutate_js=lambda s: s.replace("AS auto_approve_email", "AS auto_approve", 1),
-    js_file="build_workflow.py",
-    expect_in="returns no such column",
-)
-case(
-    "the claim check moves to a cheaper model than Section 3's -> build refuses",
-    mutate_js=lambda s: s.replace("const CHECK_MODEL = 'claude-sonnet-5-5';", "const CHECK_MODEL = 'claude-haiku-4-5';", 1),
-    js_file="code_approval.js",
-    expect_in="is not Section 3's drafting model",
-)
-case(
-    "Section 3 changes model and the claim check does not follow -> build refuses",
-    mutate_doc=lambda d: d.replace("**Drafting model: `claude-sonnet-5-5`**", "**Drafting model: `claude-test-9`**", 1),
-    mutate_skill=lambda s: s.replace("- Drafting node: `claude-sonnet-5-5`", "- Drafting node: `claude-test-9`", 1),
-    expect_in="is not Section 3's drafting model",
-)
-case(
-    "the claim check sends a sampling parameter -> build refuses",
-    mutate_js=lambda s: s.replace("    model: CHECK_MODEL,\n", "    model: CHECK_MODEL,\n    temperature: 0,\n", 1),
-    js_file="code_approval.js",
-    expect_in="sets a sampling or thinking-budget parameter",
-)
-case(
-    "the Approval Gate stops holding non-email drafts first (Section 6) -> build refuses",
-    mutate_js=lambda s: s.replace("if (!draft || draft.channel !== 'email') {", "if (!draft) {", 1),
-    js_file="code_approval.js",
-    expect_in="LinkedIn is reviewed and sent by hand",
-)
-case(
-    "node-body code moves above code_approval.js's 'Node body' marker -> build refuses",
-    mutate_js=lambda s: s.replace("const KINDS = ['claim', 'prospect', 'none'];",
-                                  "const KINDS = ['claim', 'prospect', 'none'];\nconst early = $input.item.json;", 1),
-    js_file="code_approval.js",
-    expect_in="node-body code has moved",
-)
-case(
-    "the gate reads an approval field Assemble Drafts never builds -> build refuses",
-    mutate_js=lambda s: s.replace("if (ctx.auto_approve !== true)", "if (ctx.auto_approve !== true || ctx.reviewer)", 1),
-    js_file="code_approval.js",
-    expect_in="Assemble Drafts' `approval` has no reviewer",
-)
-case(
-    "Assemble Drafts stops building `approval` -> build refuses",
-    mutate_js=lambda s: s.replace("    approval: {\n      kind: 'first-touch',", "    approval_ctx: {\n      kind: 'first-touch',", 1),
-    js_file="code_assemble.js",
-    expect_in="does not emit ['approval']",
-)
-case(
-    "Write Drafts & Advance reads a decision the gate never sets -> build refuses",
-    mutate_js=lambda s: s.replace("nullif(d->>'hold_reason', ''),", "nullif(d->>'hold_reason', ''), d->>'reviewed_by',", 1),
-    js_file="build_workflow.py",
-    expect_in="neither Approval Gate nor Apply Claim Check sets",
-)
-case(
-    "a draft reaches Write Drafts & Advance without the Approval Gate -> build refuses",
-    mutate_js=lambda s: s.replace(
-        '"Drop Failed Generations": {\n        "main": [[{"node": "Approval Gate", "type": "main", "index": 0}]]',
-        '"Drop Failed Generations": {\n        "main": [[{"node": "Write Drafts & Advance", "type": "main", "index": 0}]]', 1),
-    js_file="build_workflow.py",
-    expect_in="without the Approval Gate",
-)
-case(
-    "the repair goes to a cheaper model than the claim check -> build refuses",
-    mutate_js=lambda s: s.replace("function repairRequest(ctx, flagged) {\n  return {\n    model: CHECK_MODEL,",
-                                  "function repairRequest(ctx, flagged) {\n  return {\n    model: 'claude-haiku-4-5',", 1),
-    js_file="code_approval.js",
-    expect_in="the repair request no longer uses",
-)
-case(
-    "Apply Repair stops reading the Apply Claim Check copy it follows -> build refuses",
-    mutate_js=lambda s: s.replace("const prev = $('__CHECKED__').item.json;", "const prev = $('Apply Claim Check').item.json;", 1),
-    js_file="code_approval_repair.js",
-    expect_in="must read $('__CHECKED__') exactly once",
-)
-case(
-    "MAX_REPAIRS set beyond what the chain is meant to unroll -> build refuses",
-    mutate_js=lambda s: s.replace("const MAX_REPAIRS = 2;", "const MAX_REPAIRS = 9;", 1),
-    js_file="code_approval.js",
-    expect_in="keep it small",
-)
-case(
-    "Assemble Drafts stops handing on the composition the repair edits -> build refuses",
-    mutate_js=lambda s: s.replace("    composition: parsed,\n", "", 1),
-    js_file="code_assemble.js",
-    expect_in="does not emit ['composition']",
-)
-case(
-    "Apply Repair stops setting the hold on a draft it gives up on -> build refuses",
-    mutate_js=lambda s: s.replace("    d.hold_reason = historyText(history);", "    void 0;", 1),
-    js_file="code_approval_repair.js",
-    expect_in="Apply Repair does not set on a held draft",
-)
-case(
-    "a repaired draft reaches Write Drafts & Advance without the gate copy -> build refuses",
-    mutate_js=lambda s: s.replace("    **_chain_conns,\n}", "    **_chain_conns,\n    \"Apply Repair 1\": {\"main\": [[{\"node\": \"Write Drafts & Advance\", \"type\": \"main\", \"index\": 0}]]},\n}", 1),
-    js_file="build_workflow.py",
-    expect_in="without the Approval Gate",
-)
-case(
-    "the drafts INSERT writes an approval column Section 8 does not define -> build refuses",
-    mutate_doc=lambda d: d.replace("  approved_by (auto|human), approved_at, hold_reason, claim_check jsonb\n",
-                                   "  approved_by (auto|human), approved_at, claim_check jsonb\n", 1),
-    expect_in="which Section 8",
-)
-
-# --- Section 12's business-hours clocks (2026-10-07) ------------------------
-#
-# Drafting only needs to know WHICH countries have a clock: a lead in one that
-# does not can never be sent to, so Assess Grounding and the Approval Gate both
-# stop it before any model call. The sendtrack build is what checks the table's
-# numbers; these cases check that drafting reads the same table and refuses when
-# it cannot.
-case(
-    "Section 12's clock table disappears -> build refuses",
-    mutate_doc=lambda d: d.replace("| Country | Standard offset | Weekend | Tier |", "| Country | Offset |", 1),
-    expect_in="no clock table follows",
-)
-case(
-    "the clock heading disappears -> build refuses",
-    mutate_doc=lambda d: d.replace("**Business-hours clocks", "**Business hours, roughly", 1),
-    expect_in="'Business-hours clocks' heading not found",
-)
-case(
-    "a clock row loses a cell -> build refuses rather than guess",
-    mutate_doc=lambda d: d.replace("| India | UTC+5:30 | Sat-Sun | core |", "| India | UTC+5:30 | Sat-Sun |", 1),
-    expect_in="does not have 4 cells",
-)
-case(
-    "a clock row's offset is unreadable -> build refuses",
-    mutate_doc=lambda d: d.replace("| India | UTC+5:30 | Sat-Sun | core |", "| India | +5:30 | Sat-Sun | core |", 1),
-    expect_in="unreadable offset",
-)
-case(
-    "a country is listed twice -> build refuses",
-    mutate_doc=lambda d: d.replace("| India | UTC+5:30 | Sat-Sun | core |",
-                                   "| India | UTC+5:30 | Sat-Sun | core |" + chr(10)
-                                   + "| India | UTC+6:30 | Sat-Sun | core |", 1),
-    expect_in="listed twice",
-)
-case(
-    "Assess Grounding loses the clock placeholder -> build refuses",
-    mutate_js=lambda s: s.replace("const SEND_CLOCK_COUNTRIES = __SEND_CLOCK_COUNTRIES__;",
-                                  "const SEND_CLOCK_COUNTRIES = [];", 1),
-    expect_in="__SEND_CLOCK_COUNTRIES__",
-)
-case(
-    "the Approval Gate loses the clock placeholder -> build refuses",
-    mutate_js=lambda s: s.replace("const SEND_CLOCK_COUNTRIES = __SEND_CLOCK_COUNTRIES__;",
-                                  "const SEND_CLOCK_COUNTRIES = [];", 1),
-    js_file="code_approval.js",
-    expect_in="__SEND_CLOCK_COUNTRIES__",
-)
+case("code_template.js builds a model request -> refuses", "builds a model request",
+     mutate_js=lambda s: one(s, "const AUTO_APPROVE_OFF = ", "const URL_X = 'https://api.anthropic.com/v1/messages';\nconst AUTO_APPROVE_OFF = "))
+case("node-body code moves above the 'Node body' marker -> refuses", "node-body code has moved",
+     mutate_js=lambda s: one(s, "function str(v) {", "const early = $input;\nfunction str(v) {"))
+case("the clock placeholder disappears from code_template.js -> refuses", "exactly once",
+     mutate_js=lambda s: one(s, "const SEND_CLOCK_COUNTRIES = __SEND_CLOCK_COUNTRIES__;", "const SEND_CLOCK_COUNTRIES = [];"))
+case("Build First Touch reads a column Get Draft Batch does not return -> refuses", "returns no such column",
+     mutate_js=lambda s: one(s, "  verified: lead.verified === true,", "  verified: lead.email_verified === true,"))
+case("Build First Touch stops emitting the payload Write Drafts & Advance sends -> refuses", "does not emit",
+     mutate_js=lambda s: one(s, "    payload: {\n      lead_id: lead.lead_id,", "    body_payload: {\n      lead_id: lead.lead_id,"))
+case("Write Drafts & Advance reads a draft field Build First Touch never sets -> refuses", "does not set",
+     mutate_build=lambda s: one(s, "         nullif(d->>'hold_reason', '')\n",
+                                "         nullif(d->>'hold_reason', '') || coalesce(d->>'reviewed_by', '')\n"))
+case("the CT.gov lookup stops returning the sponsors -> refuses (totalCount is a full-text match)", "sponsors",
+     mutate_build=lambda s: one(s, '{"name": "fields", "value": "NCTId,LeadSponsorName,CollaboratorName"}',
+                                '{"name": "fields", "value": "NCTId"}'))
+case("Build First Touch prints totalCount instead of the verified count -> refuses", "company's own trials",
+     mutate_js=lambda s: one(s, "const facts = leadFacts(lead, verifiedTrials(lead.company_name, ct));",
+                             "const facts = leadFacts(lead, ct.totalCount);"))
+case("the batch query stops skipping sites and SMOs -> refuses", "skips sites",
+     mutate_build=lambda s: one(s, "   AND ct.company_type = 'CRO'\n", "\n"))
+case("Drafting reads the claims library again -> refuses", "claims library",
+     mutate_build=lambda s: one(s, "       auto_approve_email_enabled() AS auto_approve_email\n",
+                                "       auto_approve_email_enabled() AS auto_approve_email,\n"
+                                "       (SELECT count(*) FROM claims_library) AS library_rows\n"))
+case("Write Drafts & Advance would insert a LinkedIn draft -> refuses", "email drafts",
+     mutate_build=lambda s: one(s, "   WHERE d->>'channel' = 'email'\n", "\n"))
+case("Write Drafts & Advance would retire LinkedIn drafts -> refuses", "email drafts",
+     mutate_build=lambda s: one(s, "     AND d.channel = 'email'\n     AND d.status IN ('pending', 'approved')\n",
+                                "     AND d.status IN ('pending', 'approved')\n"))
+case("the drafts INSERT writes a column Section 8 does not define -> refuses", "Section 8",
+     mutate_doc=lambda d: one(d, "  approved_by (auto|human), approved_at, hold_reason, claim_check jsonb",
+                              "  approved_by (auto|human), approved_at, claim_check jsonb"))
+case("a node carries the Anthropic credential -> refuses", "Anthropic credential",
+     mutate_build=lambda s: one(s, '        "name": "Build First Touch",\n',
+                                '        "name": "Build First Touch",\n'
+                                '        "credentials": {"anthropicApi": {"id": "novascoutAnthropic01", "name": "x"}},\n'))
+case("Drafting goes to 'every 6 hours' -> refuses (n8n's clock-hour recurrence check)", "recurrenceCheck",
+     mutate_build=lambda s: one(s, '{"field": "minutes", "minutesInterval": 30}', '{"field": "hours", "hoursInterval": 6}'))
+case("Drafting is pinned to a fixed hour -> refuses", "pins triggerAtHour",
+     mutate_build=lambda s: one(s, '{"field": "minutes", "minutesInterval": 30}', '{"field": "days", "daysInterval": 1, "triggerAtHour": 9}'))
 
 
 def clock_list_flows():
-    tmp = tempfile.mkdtemp(prefix="novascout-drift-")
-    try:
-        shutil.copytree(HERE, os.path.join(tmp, "drafting"))
-        stage_companions(tmp)
-        doc_path = os.path.join(tmp, "MasterRef.md")
-        write(doc_path, read(MASTER_REF).replace(
-            "| Germany | UTC+1:00 | Sat-Sun | |" + chr(10), "", 1))
-        rc, err = run_build(tmp, doc_path)
-        if rc != 0:
-            FAILED.append(("dropping a country from the clock table changes what ships", "build refused:" + chr(10)
-                           + err[-400:]))
-            return
-        wf = json.loads(read(os.path.join(tmp, "out", "drafting.json")))
-        for name in ("Assess Grounding", "Approval Gate"):
-            code = [n for n in wf["nodes"] if n["name"] == name][0]["parameters"]["jsCode"]
-            m = re.search("const SEND_CLOCK_COUNTRIES = (" + BS + "[[^" + BS + "]]*" + BS + "]);", code)
-            if not m:
-                FAILED.append(("dropping a country from the clock table changes what ships",
-                               "%s carries no clock list" % name))
-                return
-            names = json.loads(m.group(1))
-            if "Germany" in names or "India" not in names:
-                FAILED.append(("dropping a country from the clock table changes what ships",
-                               "%s still lists Germany, or lost India: %r" % (name, names[:5])))
-                return
-        PASSED.append("dropping a country from the clock table changes what ships -- it is read, not restated")
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    """The positive half of the clock guard: drop a country from Section 12's
+    table and the shipped gate's list follows -- it is read, not restated."""
+    label = "dropping a country from the clock table changes what ships"
+    rc, err, wf = shipped(mutate_doc=lambda d: one(d, "| Germany | UTC+1:00 | Sat-Sun | |\n", ""))
+    if rc != 0:
+        FAILED.append((label, "build refused:\n" + err[-400:]))
+        return
+    code = [n for n in wf["nodes"] if n["name"] == "Build First Touch"][0]["parameters"]["jsCode"]
+    m = re.search("const SEND_CLOCK_COUNTRIES = (" + BS + "[[^" + BS + "]]*" + BS + "]);", code)
+    if not m:
+        FAILED.append((label, "Build First Touch carries no clock list"))
+        return
+    names = json.loads(m.group(1))
+    if "Germany" in names or "India" not in names:
+        FAILED.append((label, "the shipped list still has Germany, or lost India: %r" % names[:5]))
+        return
+    PASSED.append(label + " -- it is read, not restated")
 
 
 clock_list_flows()

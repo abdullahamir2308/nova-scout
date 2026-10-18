@@ -1,4 +1,7 @@
 # Nova Scout — Drafting Skill v3
+
+> **SUPERSEDED on 2026-10-19 — do not follow.** No model writes outreach any more: first touches and follow-ups are fixed templates in the operator's approved wording, filled by code with verified facts, and no LinkedIn DM is drafted (NovaScout_MasterRef.md §9 Workflows 4–6). The Reply Assistant still runs the claim rules this skill describes, through `n8n/drafting/code_assemble.js`, but no build reads this file. Kept for history only.
+
 ## Rules for the drafting model (Workflow 4) — first-touch email and LinkedIn DM
 
 > Companion to NovaScout_MasterRef.md §9 Workflow 4.

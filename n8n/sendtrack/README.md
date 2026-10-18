@@ -9,7 +9,7 @@ Five workflows:
 |---|---|---|
 | `../workflows/send.json` | `send0001` | cron every 10 min → guard → claim → SMTP → log. At most one message per tick. |
 | `../workflows/mailbox-watch.json` | `mailwatch0001` | IMAP on **Sent** (mirror for the ceiling) and on **INBOX** (reply / opt-out / bounce / out-of-office). |
-| `../workflows/follow-ups.json` | `followup0001` | cron every 30 min → follow-up composed by the drafting model, checked by the drafting rules, into the review queue as `pending`; or mark lost. |
+| `../workflows/follow-ups.json` | `followup0001` | cron every 30 min → the fixed follow-up template (#1 or #2), gated like a first touch: approved, or held with its reason; or mark lost. No model call since 2026-10-19. |
 | `../workflows/imap-health.json` | `imaphealth0001` | cron every 20 min → IMAP checker → has Mailbox Watch missed anything? → alert the operator. |
 | `../workflows/daily-digest.json` | `digest0001` | cron every 30 min → once per operator day, from 08:00 PKT: what auto-approved, what was sent, what is held and why → the operator. |
 
@@ -19,26 +19,26 @@ parses the Master Ref and refuses to run when code and doc disagree.
 
 ```
 python build_workflow.py          # regenerate the five workflow JSONs
-node   test_decide.js             # 74 cases -- the send decision and every guard in it
+node   test_decide.js             # 76 cases -- the send decision and every guard in it
 node   test_send_result.js        # 21 cases -- what happens after the SMTP call
-node   test_mailbox.js            # 71 cases -- Sent mirror, reply classification, positive-signal flag, notification
-node   test_followup.js           # 85 cases -- composed follow-ups: the request, every section 8 rule, the frame (cross-checked against the send path), the approval context
-node   test_digest.js             # 19 cases -- the Daily Digest: when it is due, what it says
+node   test_mailbox.js            # 79 cases -- Sent mirror, reply classification, positive-signal flag, notification
+node   test_followup.js           # 22 cases -- template follow-ups: rows to drafts, the gate's holds, sendable by construction
+node   test_digest.js             # 29 cases -- the Daily Digest: when it is due, what it says
 python test_followup_mutations.py # breaks each follow-up rule in turn; test_followup.js must fail every time
 node   test_health.js             # 33 cases -- IMAP Health: problems, when it alerts, what it says
 python test_imap_health.py        # 21 cases -- the checker's answer; Message-ID parity with Mailbox Watch
-python test_drift_guards.py       # 99 cases -- each spec/wiring guard is made to fire
+python test_drift_guards.py       # 104 cases -- each spec/wiring guard is made to fire
 python provision_credentials.py   # n8n SMTP/IMAP credentials from .env (+ the two dry-run ones)
 python sync_settings.py           # the operator's notification address, .env -> the settings table
 python imap_preflight.py          # read-only: IMAP works, and the warm-up state from the real Sent folder
 python dryrun/dryrun.py           # the real send path, end to end, into a scratch DB and an SMTP sink
 python dryrun/health_dryrun.py    # IMAP Health end to end: real checker, scratch DB, SMTP sink
-python dryrun/approval_dryrun.py  # auto-approval end to end: Drafting, Follow-Ups, Send, Digest; real claim check
+python dryrun/template_dryrun.py  # template outreach end to end: Drafting, Follow-Ups, Send; holds, trigger, sink
 python status_now.py              # read-only: what would the send path do right now?
 ```
 
 Migrations `postgres/migrations/007_send_and_track.sql`, `008_settings.sql`,
-`009_mailbox_health.sql` and `014_auto_approval.sql` must be applied first, `sync_settings.py` run once, and
+`009_mailbox_health.sql`, `014_auto_approval.sql` and `020_template_outreach.sql` must be applied first, `sync_settings.py` run once, and
 the `imap-health` service running (`docker compose up -d imap-health`).
 
 ## The warm-up ceiling belongs to the mailbox
@@ -102,9 +102,13 @@ in Decide Send (and the ones marked ★ again inside Claim Send):
 - ★ lead domain and recipient domain not on `blocklist` (exact or subdomain)
 - ★ no reply and no bounce on the lead; ★ first touch only if never emailed (by the workflow or by hand)
 - not a low-context note, even if a human approved it by mistake; has a subject
-- carries Section 5's opt-out sentence **verbatim**, immediately followed by the
-  current signature — a body signed by a previous identity is refused
-  (`stale-signature`) rather than sent under the wrong name
+- carries the sender's **name line followed by the title line**, as whole lines
+  (`NOVASCOUT_SENDER_NAME` / `_TITLE`) — a body signed by a previous identity is
+  refused (`stale-signature`) rather than sent under the wrong name. Both
+  signatures in the queue pass: the template's `Cheers!` / name / title and the
+  name / title / phone of everything written before 2026-10-19. **No opt-out
+  sentence and no phone are required since 2026-10-19** (Section 5, operator
+  decision).
 - at most one URL (Section 5)
 - follow-ups only after a first touch, at most two
 - ★ the body is unchanged since Decide read it (an edit mid-tick aborts the claim)
@@ -125,8 +129,8 @@ draft whose channel is not email. The build refuses if either query loses its
 ## Replies and opt-outs
 
 Classification reads only **what they wrote above the quoted thread**. Every
-reply quotes our email, and our email says "reply 'no'" — classify the whole
-body and every reply is an opt-out. Quote headers are recognised in the leads'
+reply quotes our email, and every email sent before 2026-10-19 says "reply 'no'"
+— classify the whole body and every reply to one is an opt-out. Quote headers are recognised in the leads'
 languages (`wrote:`, `escribió:`, `escreveu:`, `yazdı:`, `napisał:`, `írta:`,
 `a scris:` …), plus Outlook's `From:/Sent:` block, and the opt-out sentence is
 stripped again in case a client quoted it without a marker.
@@ -167,63 +171,37 @@ more entry in that list, not a template rebuild.
 
 ## Follow-ups
 
-**Composed since 2026-10-02 (drafting skill v3 §8), not a template.** Due: six
+**Fixed templates since 2026-10-19 (operator brief), not compositions.** Due: six
 quiet days after the last send or follow-up; at most two, then `lost`. A
-rejected follow-up uses its slot.
+rejected follow-up uses its slot. CRO leads only.
 
 ```
-Find Due Follow-Ups -> Build Follow-Up -> Needs Model? -> Claude Follow-Up -> Assemble Follow-Up -> Drop Failed Generations -> Write Follow-Up
-                                                      \-> (mark-lost) ------------------------------------------------------------> Write Follow-Up
+Find Due Follow-Ups -> Build Follow-Up -> Write Follow-Up      (a mark-lost row carries no draft)
 ```
 
-- **Build Follow-Up** (`code_followup.js`) sends the drafting model (Master Ref
-  §3, same request parameters) the first email exactly as sent — minus greeting,
-  opt-out and signature — plus the approved claims: for #1, only the angles and
-  benefits the first email did not use, and no benefit sharing a capability with
-  one it used; for #2, only the asks. Nothing else about the lead reaches the
-  model, so build rule 6 holds by construction. An email written under an older
-  claims list (leads 7, 91, 104 were emailed under v2) cannot be read off its
-  codes, so the model reports `first_email_covers` and the added line is checked
-  against it.
-- **Assemble Follow-Up** is drafting's `code_assemble.js` — everything above its
-  `// Node body` marker, verbatim — followed by `code_followup_assemble.js`. So a
-  follow-up runs the first touch's own rule functions (ask, product name, "AI",
-  sponsor, every forbidden claim, `claim-repeat`, links, areas, unconfirmed
-  claims), plus section 8's: #1 40–70 words and exactly one new angle or benefit
-  (`short`, `long`, `fu-no-new-claim`, `fu-repeat`), #2 at most 40 words and no
-  new claim (`fu-new-claim`). The build refuses if drafting stops defining a
-  function this body calls, or if node-body code moves above the marker. **Keep
-  `code_assemble.js`'s rules section free of n8n reads (`$(`, `$input`).**
-- The greeting, the Section 5 opt-out, the signature and the quoted first email
-  are appended, never generated; the subject is `Re:` + the first subject.
-  `test_followup.js` runs every composed follow-up through Send's real
-  `ineligibility()`.
-- **Auto-approval (migration 014).** A composed follow-up then goes through
-  Workflow 4's own Approval Gate and claim check (`../drafting/code_approval.js`
-  and `code_approval_apply.js`, embedded verbatim): with the flag on, no rule
-  tag, every claim code confirmed, and a second Sonnet 5.5 call finding every
-  claim supported by a confirmed line and every prospect fact in the enrichment
-  record, it is written `approved` (`approved_by = 'auto'`) and Send sends it in
-  the recipient's business hours like any approved draft. A claim-check hold
-  for widened or unsupported statements is first repaired (the same repair loop
-  as Workflow 4, up to 2 repairs, every rule and the check again on the result;
-  the chain is drafting's `approval_chain.py`). Otherwise it is written
-  `pending` with `hold_reason`, every attempt's reasons listed.
-- **#1's added line is said almost word for word** (skill section 8, 2026-10-03):
-  the prompt no longer says "build the note around it" -- every held follow-up
-  before this was held for a sentence added to that line -- and the build
-  refuses the phrase coming back. Only the note is checked -- the subject
-  is `Re:` + one already sent, and the quoted first email already went out. The
-  enrichment record reaches the checker only, never the composing model. The
-  record holds no trial (Workflow 4 stores none): a follow-up that says
-  something about the trial is held, but one that only mentions it while
-  referring back to the first email passes as a reference (measured
-  2026-10-03, draft 107). Nor is "pharma team" a rule tag -- a note referring
-  back to a 2026-09-22 first email can copy that retired v2 wording (drafts
-  107 and 108 did; `audit_drafts_vs_onepager.py` fails on them).
-- A failed call writes nothing; the lead is due again next run. Write Follow-Up
-  dedupes on the follow-up **number** (`follow-up-1/BEN-DECK.A1+...` and a
-  pre-2026-10-02 bare `follow-up-1` are the same slot).
+- **Build Follow-Up** is drafting's `code_template.js` — everything above its
+  `// Node body` marker, verbatim — followed by `code_followup.js`. So a follow-up
+  is written by the first touch's own functions: the same greeting rules (a role
+  inbox is "Hi there,"), the same cleaned company name, and #1 closes with the
+  lead's own arm's close (lead_id even A, odd B). The wording is Section 9's,
+  byte for byte; `build_workflow.py` renders the constants back through
+  drafting's `template_spec.py` and refuses on any difference.
+- **Threading as before:** the subject is `Re:` + the first subject, and the
+  first email is quoted below `On <date>, Abdullah Amir wrote:`.
+- **The gate is the first touch's** (`gate()` in `code_template.js`): approved
+  (`approved_by = 'auto'`) unless there is no verified deliverable address, the
+  country has no Send clock, a domain is blocklisted, or auto-approval is off —
+  then `pending` with the reason, and the reason's tag on the variant
+  (`follow-up-1/template/A+unverified-address`). Migration 020's trigger
+  re-checks it on the table.
+- `test_followup.js` runs every follow-up and first touch the templates write
+  through Send's real `ineligibility()`, so a template draft is sendable by
+  construction.
+- Write Follow-Up dedupes on the follow-up **number** (`follow-up-1/template/A`,
+  a 2026-10 `follow-up-1/BEN-DECK.A1` and a pre-2026-10-02 bare `follow-up-1`
+  are the same slot).
+- The 40 AI-composed follow-ups approved before the switch were left as they
+  were (their leads had already been emailed) and still send.
 
 **Why every 30 minutes, not every 6 hours.** On 2026-10-02 leads 7, 91 and 104
 had gone 10 days without a follow-up against a 6-day rule. Two causes, both
