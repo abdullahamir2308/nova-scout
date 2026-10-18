@@ -217,38 +217,85 @@ function Invoke-ClaudeTask {
 
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
-    $proc.Start() | Out-Null
+    $proc.EnableRaisingEvents = $true
 
-    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
-    $stderrTask = $proc.StandardError.ReadToEndAsync()
+    # Live console output. Register-ObjectEvent's -Action queues onto the
+    # engine's event queue, which only gets pumped when the main thread
+    # returns control to the PowerShell engine -- a single blocking
+    # WaitForExit(timeout) call never does that, so Write-Host inside the
+    # action would sit buffered and print in one late burst (confirmed
+    # empirically). Draining the queue from a polling loop on the main
+    # thread instead -- WaitForExit(200) repeated -- prints each line within
+    # ~200ms of real arrival, verified against a 5-second test process.
+    $stdoutQueue = New-Object System.Collections.Concurrent.ConcurrentQueue[string]
+    $stderrQueue = New-Object System.Collections.Concurrent.ConcurrentQueue[string]
 
-    $promptBytes = $Utf8NoBom.GetBytes($Prompt)
-    $proc.StandardInput.BaseStream.Write($promptBytes, 0, $promptBytes.Length)
-    $proc.StandardInput.BaseStream.Flush()
-    $proc.StandardInput.Close()
-
-    $finished = $proc.WaitForExit([int]($TimeoutMinutes * 60 * 1000))
-
-    if (-not $finished) {
-        & taskkill /PID $proc.Id /T /F *> $null
-        try { $proc.WaitForExit(5000) } catch {}
-        $stdoutSoFar = ''
-        $stderrSoFar = ''
-        try { if ($stdoutTask.Wait(2000)) { $stdoutSoFar = $stdoutTask.Result } } catch {}
-        try { if ($stderrTask.Wait(2000)) { $stderrSoFar = $stderrTask.Result } } catch {}
-        $content = $stdoutSoFar + "`n[run-all.ps1] TIMEOUT after $TimeoutMinutes minute(s) -- process tree killed.`n"
-        if ($stderrSoFar) { $content += "--- stderr ---`n$stderrSoFar" }
-        [System.IO.File]::WriteAllText($LogPath, $content, $Utf8NoBom)
-        return 124
+    $stdoutJob = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -MessageData $stdoutQueue -Action {
+        if ($null -ne $EventArgs.Data) { $Event.MessageData.Enqueue($EventArgs.Data) }
+    }
+    $stderrJob = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -MessageData $stderrQueue -Action {
+        if ($null -ne $EventArgs.Data) { $Event.MessageData.Enqueue($EventArgs.Data) }
     }
 
-    $stdout = $stdoutTask.Result
-    $stderr = $stderrTask.Result
-    $content = $stdout
-    if ($stderr) { $content += "`n--- stderr ---`n$stderr" }
-    [System.IO.File]::WriteAllText($LogPath, $content, $Utf8NoBom)
+    function Drain-Queues {
+        param($StdoutQueue, $StderrQueue, $StdoutList, $StderrList)
+        $line = $null
+        while ($StdoutQueue.TryDequeue([ref]$line)) {
+            Write-Host $line
+            $StdoutList.Add($line)
+        }
+        while ($StderrQueue.TryDequeue([ref]$line)) {
+            Write-Host $line -ForegroundColor DarkYellow
+            $StderrList.Add($line)
+        }
+    }
 
-    return $proc.ExitCode
+    $stdoutLines = New-Object System.Collections.Generic.List[string]
+    $stderrLines = New-Object System.Collections.Generic.List[string]
+
+    try {
+        $proc.Start() | Out-Null
+        $proc.BeginOutputReadLine()
+        $proc.BeginErrorReadLine()
+
+        $promptBytes = $Utf8NoBom.GetBytes($Prompt)
+        $proc.StandardInput.BaseStream.Write($promptBytes, 0, $promptBytes.Length)
+        $proc.StandardInput.BaseStream.Flush()
+        $proc.StandardInput.Close()
+
+        $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+        $finished = $false
+        while ((Get-Date) -lt $deadline) {
+            if ($proc.WaitForExit(200)) { $finished = $true; break }
+            Drain-Queues -StdoutQueue $stdoutQueue -StderrQueue $stderrQueue -StdoutList $stdoutLines -StderrList $stderrLines
+        }
+
+        if (-not $finished) {
+            & taskkill /PID $proc.Id /T /F *> $null
+            try { $proc.WaitForExit(5000) | Out-Null } catch {}
+            Start-Sleep -Milliseconds 300
+            Drain-Queues -StdoutQueue $stdoutQueue -StderrQueue $stderrQueue -StdoutList $stdoutLines -StderrList $stderrLines
+            $content = ($stdoutLines -join "`n") + "`n[run-all.ps1] TIMEOUT after $TimeoutMinutes minute(s) -- process tree killed.`n"
+            $stderrText = $stderrLines -join "`n"
+            if ($stderrText) { $content += "--- stderr ---`n$stderrText" }
+            [System.IO.File]::WriteAllText($LogPath, $content, $Utf8NoBom)
+            return 124
+        }
+
+        Start-Sleep -Milliseconds 300
+        Drain-Queues -StdoutQueue $stdoutQueue -StderrQueue $stderrQueue -StdoutList $stdoutLines -StderrList $stderrLines
+        $content = $stdoutLines -join "`n"
+        $stderrText = $stderrLines -join "`n"
+        if ($stderrText) { $content += "`n--- stderr ---`n$stderrText" }
+        [System.IO.File]::WriteAllText($LogPath, $content, $Utf8NoBom)
+
+        return $proc.ExitCode
+    } finally {
+        Unregister-Event -SourceIdentifier $stdoutJob.Name -ErrorAction SilentlyContinue
+        Unregister-Event -SourceIdentifier $stderrJob.Name -ErrorAction SilentlyContinue
+        Remove-Job -Job $stdoutJob -Force -ErrorAction SilentlyContinue
+        Remove-Job -Job $stderrJob -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # ---------------------------------------------------------------------------
