@@ -20,12 +20,14 @@
 // ---------------------------------------------------------------------------
 
 // Section 5, warm-up schedule: [week, max sends/day]. The last row is
-// open-ended -- "Week 4+ | 20 (hard ceiling)".
+// open-ended -- "Week 5+ | 50 (hard ceiling)" since 2026-10-19 (operator
+// decision; it was "Week 4+ | 20").
 const WARMUP = [
   [1, 5],
   [2, 10],
   [3, 15],
   [4, 20],
+  [5, 50],
 ];
 
 // Section 5, message rules. Since 2026-10-19 no opt-out sentence and no phone
@@ -45,7 +47,7 @@ const SENDER_UTC_OFFSET_MIN = 300;
 // sender's -- leads span every country ichgcp.net lists, UTC-6 to UTC+12.
 //
 // Approximate on purpose: fixed standard-time offsets, no DST (the operator's
-// call, 2026-09-14 -- at 5-20 sends/day an hour of drift is not worth a tz
+// call, 2026-09-14 -- at 5-50 sends/day an hour of drift is not worth a tz
 // database, and n8n's Code sandbox has no module that would give us one). A
 // country that observes summer time runs one hour LATER than this table for
 // part of the year, so a send the table places at 16:30 lands at 17:30 local:
@@ -407,6 +409,39 @@ function ineligibility(c) {
   return null;
 }
 
+// The safety brake's email (Section 9, Workflow 6; migration 021). Check Brake
+// latched the pauses in `send_pauses`; this tells the operator about every open
+// one not yet alerted, once -- Record Brake Alert stamps alerted_at when SMTP
+// accepts it. Without an operator address there is no one to tell: Send stays
+// paused all the same.
+const BRAKE_LABEL = { 'bounce-rate': 'bounce rate over the brake', 'spam-complaint': 'spam complaint' };
+
+function brakeAlert(pauses, operatorEmail, clock) {
+  const fresh = pauses.filter(function (p) { return !str(p.alerted_at); });
+  const to = str(operatorEmail);
+  const alert = { notify: false, to: to, subject: '', text: '', pause_ids: [] };
+  if (!fresh.length || !EMAIL_RE.test(to)) return alert;
+  const lines = ['Send is paused by the safety brake. Nothing cold goes out -- no first touch, no follow-up -- ' +
+    'until you clear it.', ''];
+  pauses.forEach(function (p) {
+    lines.push('- ' + (BRAKE_LABEL[p.reason] || p.reason) + ' (tripped ' + str(p.tripped_at) + '): ' + str(p.detail));
+  });
+  lines.push('');
+  lines.push('It does not lift on its own. When you have looked, resume with:');
+  lines.push("  UPDATE send_pauses SET cleared_at = now(), cleared_note = 'why' WHERE cleared_at IS NULL;");
+  lines.push('Clearing restarts that count from the moment you clear, so what you just reviewed does not ' +
+    'trip it again. Replies you approve (Send Reply) are not paused.');
+  lines.push('');
+  lines.push('Checked ' + iso(clock) + '.');
+  alert.notify = true;
+  alert.subject = '[Nova Scout] Send paused: ' + pauses.map(function (p) {
+    return BRAKE_LABEL[p.reason] || p.reason;
+  }).join('; ');
+  alert.text = lines.join('\n');
+  alert.pause_ids = fresh.map(function (p) { return Number(p.id); });
+  return alert;
+}
+
 function decide(state, rng) {
   const clock = ms(state.clock);
   if (clock === null) throw new Error('Load Send State returned no clock');
@@ -446,11 +481,23 @@ function decide(state, rng) {
     eligible: eligible,
     excluded: excluded,
     payload: null,
+    alert: null,
   };
   function stop(reason, detail) {
     out.reason = reason;
     out.detail = detail;
     return out;
+  }
+
+  // 0. The safety brake (Section 9, Workflow 6). An open pause stops the tick
+  //    before anything else is weighed; the alert goes out whatever the reason.
+  const pauses = Array.isArray(state.pauses) ? state.pauses : [];
+  out.alert = brakeAlert(pauses, state.operator_email, clock);
+  if (pauses.length) {
+    return stop('send-paused',
+      'The safety brake is on: ' + pauses.map(function (p) {
+        return (BRAKE_LABEL[p.reason] || p.reason) + ' -- ' + str(p.detail);
+      }).join(' | ') + ' Clear send_pauses to resume.');
   }
 
   // 1. Can the count be trusted at all? The ceiling is only as good as the Sent

@@ -13,9 +13,23 @@
 // opt-out sentence is stripped again afterwards in case a client quoted it
 // without a marker.
 //
-// Precedence: bounce > auto-reply > opt-out > reply. A bounce or an
-// out-of-office is not a person answering, so neither sets 'replied' -- an
-// out-of-office must not kill the follow-up sequence.
+// Precedence: complaint report > bounce > auto-reply > opt-out > reply. A
+// bounce or an out-of-office is not a person answering, so neither sets
+// 'replied' -- an out-of-office must not kill the follow-up sequence.
+//
+// Spam complaints (Section 9, Workflow 6, the Send safety brake, operator
+// decision 2026-10-19) set `spam_complaint`, and any one pauses Send until the
+// operator clears it (migration 021). Two kinds:
+//   * a mailbox provider's feedback-loop report (ARF, RFC 5965): a recipient
+//     pressed "report spam". Machine-sent, so not a reply -- but it is that
+//     recipient's opt-out, the strongest there is, so it is classified
+//     'opt-out' and blocklists like one;
+//   * a person saying our email is spam, in what they wrote above the quoted
+//     thread. That is an opt-out too (keyword 'spam-complaint' when they used
+//     none of Section 5's words): left a 'reply', the Reply Assistant would
+//     draft an answer to someone who just called us spam. Narrow on purpose --
+//     "it went to my spam folder, but yes, let's talk" is an interested
+//     prospect, and "is this spam?" is a question.
 
 // Section 5 / Section 9 opt-out words -- parsed from the doc and checked at
 // build time. "no" counts only as the FIRST word of what they wrote ("No,
@@ -51,6 +65,17 @@ const OUTLOOK_NEXT = /^\s*(sent|date|to|subject|enviado|fecha|para|asunto|gesend
 
 const AUTO_SUBJECT = /^(?:auto(?:matic)?[ -]?(?:reply|response|antwort)|out of (?:the )?office|ooo\b|abwesenheit|fuera de (?:la )?oficina|respuesta autom|resposta autom|r[ée]ponse automatique|otomatik yan[ıi]t|automatyczna odpowied|automatick[áa] odpov|automatikus v[áa]lasz|r[ăa]spuns automat)/i;
 const BOUNCE_SUBJECT = /undeliver|delivery status notification|returned mail|failure notice|delivery (?:has )?failed|mail delivery failed|non[- ]?delivery|could not be delivered/i;
+
+// What a person writes when they complain -- about OUR email, in English.
+const COMPLAINT_PHRASES = [
+  /\b(?:this|it|that|your (?:e-?mail|message|mail))(?:['’]s|\s+is|\s+was|\s+looks like)\s+(?:pure\s+|just\s+|total\s+|obvious\s+|blatant\s+)?(?:spam|junk)\b/i,
+  /\bstop\s+spamming\b/i,
+  /\bspamming\s+(?:me|us|my|our)\b/i,
+  /\bspammers?\b/i,
+  /\b(?:report(?:ed|ing)?|flag(?:ged|ging)?|mark(?:ed|ing)?)\s+(?:this|it|you|your\s+(?:e-?mail|message|mail))\s+(?:as|for)\s+(?:spam|junk|abuse)\b/i,
+  /\breport(?:ed|ing)?\s+(?:you|this|it)\s+to\b/i,
+  /\bunsolicited\s+(?:e-?mails?|mails?|messages?|commercial)\b/i,
+];
 
 function str(v) {
   return v === null || v === undefined ? '' : String(v).trim();
@@ -149,6 +174,23 @@ function optOutKeyword(fresh) {
   return null;
 }
 
+// A feedback-loop report: the multipart/report type, or its machine-readable
+// part ("Feedback-Type: abuse") wherever the trigger put it.
+function isComplaintReport(meta, raw) {
+  return /report-type="?feedback-report/i.test(str(meta['content-type'])) ||
+    /^\s*feedback-type:\s*abuse\b/im.test(String(raw || ''));
+}
+
+// The phrase that makes a person's own text a complaint, or null.
+function complaintPhrase(fresh) {
+  const t = String(fresh || '');
+  for (let i = 0; i < COMPLAINT_PHRASES.length; i++) {
+    const m = t.match(COMPLAINT_PHRASES[i]);
+    if (m) return m[0];
+  }
+  return null;
+}
+
 function classify(j) {
   const meta = j.metadata || {};
   const from = str(j.from);
@@ -159,15 +201,21 @@ function classify(j) {
   const fresh = freshText(raw);
 
   const autoSubmitted = str(meta['auto-submitted']).toLowerCase();
-  const isBounce = /mailer-daemon|postmaster|mail delivery (?:subsystem|system)/i.test(from) ||
+  const isReport = isComplaintReport(meta, raw);
+  const isBounce = !isReport && (/mailer-daemon|postmaster|mail delivery (?:subsystem|system)/i.test(from) ||
     BOUNCE_SUBJECT.test(subject) ||
-    /report-type="?delivery-status/i.test(str(meta['content-type']));
-  const isAuto = (autoSubmitted !== '' && autoSubmitted !== 'no') ||
+    /report-type="?delivery-status/i.test(str(meta['content-type'])));
+  const isAuto = !isReport && !isBounce && ((autoSubmitted !== '' && autoSubmitted !== 'no') ||
     str(meta['x-autoreply']) !== '' || str(meta['x-autorespond']) !== '' ||
     /^auto_reply$/i.test(str(meta['precedence'])) ||
-    AUTO_SUBJECT.test(subject);
-  const kw = isBounce || isAuto ? null : optOutKeyword(fresh);
-  const classification = isBounce ? 'bounce' : isAuto ? 'auto-reply' : kw ? 'opt-out' : 'reply';
+    AUTO_SUBJECT.test(subject));
+  const person = !isReport && !isBounce && !isAuto;
+  const kw = person ? optOutKeyword(fresh) : null;
+  const phrase = person ? complaintPhrase(fresh) : null;
+  const classification = isReport ? 'opt-out' : isBounce ? 'bounce' : isAuto ? 'auto-reply'
+    : (kw || phrase) ? 'opt-out' : 'reply';
+  // A report names the message complained about only inside its body.
+  const fromBody = isReport || isBounce;
 
   const threadIds = messageIds(str(meta['in-reply-to']) + ' ' + str(meta['references']));
   const t = new Date(str(j.date)).getTime();
@@ -180,7 +228,9 @@ function classify(j) {
     own_domain: fromDomain === OWN_DOMAIN,
     subject: subject.slice(0, 300),
     classification: classification,
-    opt_out_keyword: kw,
+    opt_out_keyword: isReport ? 'spam-report' : kw || (phrase ? 'spam-complaint' : null),
+    spam_complaint: isReport || phrase !== null,
+    complaint: isReport ? 'feedback-report' : phrase,
     // Stored as received (migration 017): a reply draft has to thread to the
     // conversation it answers, and these were parsed and thrown away until
     // 2026-10-08. `thread_ids` is the parsed array Record Inbound matches a
@@ -188,8 +238,8 @@ function classify(j) {
     // drops its References chain leaves a gap nothing can reconstruct.
     in_reply_to: str(meta['in-reply-to']) || null,
     references_raw: str(meta['references']) || null,
-    thread_ids: isBounce ? threadIds.concat(messageIds(raw)).filter(function (x, i, a) { return a.indexOf(x) === i; }) : threadIds,
-    mentioned_addrs: isBounce ? addresses(raw).filter(function (a) { return domainOf(a) !== OWN_DOMAIN; }) : [],
+    thread_ids: fromBody ? threadIds.concat(messageIds(raw)).filter(function (x, i, a) { return a.indexOf(x) === i; }) : threadIds,
+    mentioned_addrs: fromBody ? addresses(raw).filter(function (a) { return domainOf(a) !== OWN_DOMAIN; }) : [],
     reply_text: fresh.slice(0, 4000),
     body_excerpt: fresh.slice(0, 600),
   };

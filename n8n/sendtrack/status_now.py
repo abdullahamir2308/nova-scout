@@ -32,7 +32,7 @@ code_only = re.sub(r"--[^\n]*", "", sql).upper()
 assert not re.search(r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE)\b", code_only), \
     "Load Send State is expected to be a pure SELECT"
 sql = (sql.replace("$1", "''").replace("$2", str(int(cfg["min_gap_min"])))
-       .replace("$3", repr(float(cfg["send_probability"]))))
+       .replace("$3", repr(float(cfg["send_probability"]))).replace("$4", str(int(cfg["brake_days"]))))
 # Belt and braces: the session is read-only, so even a changed query could not write.
 p = subprocess.run(
     ["docker", "exec", "-i", PG, "psql", "-U", "novascout", "-d", "novascout", "-X", "-q", "-At",
@@ -65,6 +65,12 @@ print("first external send:      %s" % (state["first_external_send_at"] or "none
 print("warm-up:                  history=%s, sender-day %s, day %d, week %d -> ceiling %d/day"
       % (w["history"], w["sender_day"], w["day_index"] + 1, w["week"], w["ceiling"]))
 print("sent today / remaining:   %d / %d" % (w["sent_today"], w["remaining"]))
+b = state.get("brake") or {}
+print("safety brake:             %d sends since %s, %d bounced (over %s%% pauses); %d spam complaint(s); %d open pause(s)"
+      % (b.get("sends", 0), b.get("bounce_from"), b.get("bounced", 0), cfg["brake_bounce_pct"],
+         len(b.get("complaints") or []), len(state.get("pauses") or [])))
+for p_ in state.get("pauses") or []:
+    print("  PAUSED %-16s since %s  %s" % (p_["reason"], p_["tripped_at"], p_["detail"]))
 print("drafts by status:         %s" % json.dumps(state["drafts_by_status"], sort_keys=True))
 print("approved email drafts:    %d" % len(state["candidates"]))
 print("  eligible (all checks):  %d" % len(d["eligible"]))

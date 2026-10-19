@@ -102,8 +102,52 @@ t.check('a send at 20:00 UTC on the 7th is 01:00 PKT on the 8th -> 6 days, week 
   week('2026-09-07T20:00:00Z'), [6, 1, 5]);
 t.check('14 days -> week 3, 15/day', week('2026-08-31T10:00:00Z'), [14, 3, 15]);
 t.check('21 days -> week 4, 20/day', week('2026-08-24T10:00:00Z'), [21, 4, 20]);
-t.check('months in -> still 20, the hard ceiling', week('2026-01-05T10:00:00Z')[2], 20);
-t.check('ceiling by week 1..5 and 52', [1, 2, 3, 4, 5, 52].map(ceilingForWeek), [5, 10, 15, 20, 20, 20]);
+t.check('28 days -> week 5, 50/day (raised 2026-10-19, operator decision)', week('2026-08-17T10:00:00Z'), [28, 5, 50]);
+t.check('months in -> still 50, the hard ceiling', week('2026-01-05T10:00:00Z')[2], 50);
+t.check('ceiling by week 1..6 and 52', [1, 2, 3, 4, 5, 6, 52].map(ceilingForWeek), [5, 10, 15, 20, 50, 50, 50]);
+{
+  // The live mailbox on 2026-10-19: first external send 2026-09-15 -> day 34, week 5.
+  const s = warmupState(st({ first_external_send_at: '2026-09-15T10:09:51.000Z' }), Date.parse('2026-10-19T09:00:00Z'));
+  t.check('the live mailbox on 2026-10-19 is in week 5 -> 50/day', [s.day_index, s.week, s.ceiling], [34, 5, 50]);
+  const full = Array.from({ length: 50 }, (_, i) => at(new Date(Date.parse('2026-09-13T19:05:00Z') + i * 60000).toISOString()));
+  const d50 = decide(st({ first_external_send_at: '2026-08-01T10:00:00Z', recent_sends: full }), ALWAYS);
+  t.check('50 external sends on the sender-day -> ceiling-reached', [d50.send, d50.reason], [false, 'ceiling-reached']);
+  const d49 = decide(st({ first_external_send_at: '2026-08-01T10:00:00Z', recent_sends: full.slice(1) }), ALWAYS);
+  t.check('49 -> the 50th still goes, and the payload carries ceiling 50 for the claim',
+    [d49.send, d49.payload && d49.payload.ceiling], [true, 50]);
+}
+
+// --- the safety brake (Section 9, operator decision 2026-10-19; migration 021) --
+const PAUSE = { id: 7, reason: 'bounce-rate', detail: '2 of the 40 emails sent since 2026-10-16 09:00 UTC bounced (5.0%), over the 3% brake. Bounced: a.com, b.com.',
+  tripped_at: '2026-09-14T14:50:00.000Z', alerted_at: null };
+const COMPLAINT = { id: 8, reason: 'spam-complaint', detail: '1 spam complaint(s): 2026-09-14 from x@y.com "Re: hi".',
+  tripped_at: '2026-09-14T14:55:00.000Z', alerted_at: null };
+d = decide(st({ pauses: [PAUSE], operator_email: 'Operator@Example.com' }), ALWAYS);
+t.check('an open pause stops the tick, though a draft is eligible and in hours', [d.send, d.reason, d.payload], [false, 'send-paused', null]);
+t.check('... the reason names what tripped and how to resume',
+  d.detail.includes('bounce rate over the brake') && d.detail.includes('5.0%') && d.detail.includes('Clear send_pauses'), true);
+t.check('... and the operator is alerted: to, subject, the pause ids',
+  [d.alert.notify, d.alert.to, d.alert.subject, d.alert.pause_ids],
+  [true, 'Operator@Example.com', '[Nova Scout] Send paused: bounce rate over the brake', [7]]);
+t.check('... the alert says what tripped, that it does not lift on its own, and the SQL that resumes it',
+  [d.alert.text.includes(PAUSE.detail), d.alert.text.includes('does not lift on its own'),
+    d.alert.text.includes("UPDATE send_pauses SET cleared_at = now()"), d.alert.text.includes('Send Reply) are not paused')],
+  [true, true, true, true]);
+d = decide(st({ pauses: [Object.assign({}, PAUSE, { alerted_at: '2026-09-14T14:51:00.000Z' })], operator_email: 'op@example.com' }), ALWAYS);
+t.check('an alerted pause still stops the tick -- but no second alert', [d.reason, d.alert.notify, d.alert.pause_ids], ['send-paused', false, []]);
+d = decide(st({ pauses: [Object.assign({}, PAUSE, { alerted_at: '2026-09-14T14:51:00.000Z' }), COMPLAINT],
+  operator_email: 'op@example.com' }), ALWAYS);
+t.check('a new complaint on top of an alerted bounce pause -> one alert for the new one, naming both',
+  [d.reason, d.alert.notify, d.alert.pause_ids, d.alert.subject],
+  ['send-paused', true, [8], '[Nova Scout] Send paused: bounce rate over the brake; spam complaint']);
+d = decide(st({ pauses: [COMPLAINT], operator_email: '' }), ALWAYS);
+t.check('no operator address -> nobody to alert, but Send stays paused', [d.send, d.reason, d.alert.notify], [false, 'send-paused', false]);
+d = decide(st({ pauses: [PAUSE], operator_email: 'op@example.com', sent_mirror_synced_at: null }), ALWAYS);
+t.check('the brake is checked before the Sent mirror: paused wins, and the alert still goes', [d.reason, d.alert.notify], ['send-paused', true]);
+d = decide(st({ pauses: [], operator_email: 'op@example.com' }), ALWAYS);
+t.check('no pause -> sends as before, and no alert', [d.send, d.reason, d.alert.notify], [true, 'send', false]);
+d = decide(st({ operator_email: 'op@example.com' }), ALWAYS);
+t.check('pauses missing from the row (old Load Send State) -> treated as none', [d.send, d.alert.notify], [true, false]);
 
 // --- can the count be trusted? -----------------------------------------------
 d = decide(st({ sent_mirror_synced_at: null }), ALWAYS);

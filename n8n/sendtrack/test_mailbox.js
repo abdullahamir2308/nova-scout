@@ -161,6 +161,56 @@ t.check('a bounce is a bounce, found by sender and subject', ndr.classification,
 t.check("... and carries the original Message-ID from the NDR body, to match the send", ndr.thread_ids, ['<a1b2c3@amitrixlabs.com>']);
 t.check('... and the failed address, never our own', ndr.mentioned_addrs, ['hello@klixar.com']);
 
+// --- spam complaints: the Send safety brake (Section 9, operator decision 2026-10-19) ---
+const complaint = (text, over, meta) => {
+  const x = classify(inbound(text, over, meta));
+  return [x.classification, x.opt_out_keyword, x.spam_complaint];
+};
+const arf = classify(inbound(
+  'This is an email abuse report for an email message received from IP 136.143.188.1.\n\n' +
+  'Feedback-Type: abuse\nUser-Agent: Yahoo!-Mail-Feedback/2.0\nVersion: 1\n\n' +
+  'Message-ID: <a1b2c3@amitrixlabs.com>\nFrom: abdullah@amitrixlabs.com',
+  { from: 'Yahoo! Mail AntiSpam Feedback <feedback@arf.mail.yahoo.com>', subject: 'FW: Klixar + sponsor inquiries' },
+  { 'content-type': 'multipart/report; report-type=feedback-report; boundary="x"', 'in-reply-to': '', references: '' }));
+t.check('a feedback-loop report (ARF) is an opt-out and a spam complaint',
+  [arf.classification, arf.opt_out_keyword, arf.spam_complaint, arf.complaint], ['opt-out', 'spam-report', true, 'feedback-report']);
+t.check("... and carries the complained-about Message-ID from its body, to match the send", arf.thread_ids, ['<a1b2c3@amitrixlabs.com>']);
+t.check('... found by its "Feedback-Type: abuse" part too, without the content-type',
+  complaint('Feedback-Type: abuse\nVersion: 1', { from: 'fbl@isp.example' }, { 'in-reply-to': '', references: '' }),
+  ['opt-out', 'spam-report', true]);
+t.check('... and never read as a bounce, though it is a multipart/report',
+  classify(inbound('Feedback-Type: abuse', { from: 'MAILER-DAEMON@isp.example', subject: 'Undelivered Mail' },
+    { 'content-type': 'multipart/report; report-type=feedback-report' })).classification, 'opt-out');
+[
+  ['This is spam.', ['opt-out', 'spam-complaint', true]],
+  ["It's spam, plain and simple.", ['opt-out', 'spam-complaint', true]],
+  ['Your email is pure spam.', ['opt-out', 'spam-complaint', true]],
+  ['Stop spamming me.', ['opt-out', 'stop', true]],
+  ['Please stop spamming us', ['opt-out', 'stop', true]],
+  ['You people are spammers.', ['opt-out', 'spam-complaint', true]],
+  ['I have reported you as spam.', ['opt-out', 'spam-complaint', true]],
+  ['Marked this as spam.', ['opt-out', 'spam-complaint', true]],
+  ["I'm reporting you to Zoho.", ['opt-out', 'spam-complaint', true]],
+  ['We do not accept unsolicited emails.', ['opt-out', 'spam-complaint', true]],
+  ['Remove me, this is junk.', ['opt-out', 'remove', true]],
+  // Not complaints: an interested prospect, a question, a filter's doing, someone else's spam.
+  ['It went to my spam folder, but yes, let us talk next week.', ['reply', null, false]],
+  ['Is this spam? Who gave you my address?', ['reply', null, false]],
+  ['Your email was marked as spam by our filter. Interested though.', ['reply', null, false]],
+  ['We get so much spam from vendors, but this one is relevant.', ['reply', null, false]],
+  ['This is not spam to us -- tell me more.', ['reply', null, false]],
+].forEach(([text, want]) => t.check(JSON.stringify(text.slice(0, 44)) + ' -> ' + JSON.stringify(want), complaint(text), want));
+t.check('"this is spam" in the QUOTED thread is not a complaint -- only what they wrote counts',
+  complaint('Sounds good, call me Tuesday.\n\nOn Mon, 14 Sep 2026 at 21:05, Abdullah Amir <abdullah@amitrixlabs.com> wrote:\n' +
+    quoted('Is this spam? This is spam.')), ['reply', null, false]);
+t.check('an out-of-office that mentions spam filters is not a complaint',
+  complaint('I am away. This is spam-filtered.', {}, { 'auto-submitted': 'auto-replied' }), ['auto-reply', null, false]);
+t.check('a bounce quoting "this is spam" from a filter is a bounce, not a complaint',
+  complaint('Rejected: this is spam (550 5.7.1).', { from: 'mailer-daemon@zoho.com', subject: 'Undelivered Mail Returned to Sender' }),
+  ['bounce', null, false]);
+t.check('a normal reply carries spam_complaint false, not undefined',
+  classify(inbound('Tell me more.')).spam_complaint, false);
+
 const c = classify(inbound('Tell me more.', {}, { references: '<x@a.com> <a1b2c3@amitrixlabs.com>' }));
 t.check('thread ids: In-Reply-To then References, de-duplicated', c.thread_ids, ['<a1b2c3@amitrixlabs.com>', '<x@a.com>']);
 t.check('reply metadata', [c.message_id, c.received_at, c.from_addr, c.from_domain, c.freemail, c.own_domain],

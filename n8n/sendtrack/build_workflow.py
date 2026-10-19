@@ -392,6 +392,22 @@ def load_health_problems(doc):
     return m.group(1).split("|")
 
 
+def load_brake(doc):
+    """Section 9, Workflow 6's safety brake (operator decision 2026-10-19): the
+    bounce window in days and the bounce share, in percent, that trips it."""
+    m = re.search(r"if bounces over the last (\w+) days exceed (\d+(?:\.\d+)?)% of sends, or any spam complaint "
+                  r"arrives, Send pauses and the operator is alerted", doc)
+    if not m:
+        raise AssertionError(
+            "the Send safety brake not found in Section 9 of %s -- expected 'if bounces over the last N days exceed "
+            "P%% of sends, or any spam complaint arrives, Send pauses and the operator is alerted'" % MASTER_REF)
+    days = _number(m.group(1), "brake window")
+    pct = float(m.group(2))
+    if not (1 <= days <= 30 and 0 < pct < 100):
+        raise AssertionError("the Send safety brake reads %d days / %s%% -- not a usable brake" % (days, pct))
+    return days, (int(pct) if pct == int(pct) else pct)
+
+
 def load_health_interval(doc):
     m = re.search(r"health check runs every (\d+) minutes", doc)
     if not m:
@@ -420,6 +436,7 @@ def load_sender_offset(compose_text):
 
 DOC = _read(MASTER_REF)
 WARMUP = load_warmup(DOC)
+BRAKE_DAYS, BRAKE_BOUNCE_PCT = load_brake(DOC)
 OPT_OUT = load_opt_out(DOC)
 MAX_URLS = load_url_cap(DOC)
 OPT_OUT_KEYWORDS = load_opt_out_keywords(DOC)
@@ -704,6 +721,10 @@ LOAD_STATE_SQL = """-- Load Send State: everything Decide Send needs, in ONE sta
 -- $2 min_gap_min, $3 send_probability -- echoed back so Decide reads nothing but
 --    its own input. A Postgres node replaces the items; whatever Config set is
 --    gone by the time Decide runs (Workflow 4's silent-prompt bug).
+-- $4 brake_days -- the safety brake's window (Section 9, migration 021). Check
+--    Brake latched any pause a moment ago; this reads the open ones, which stop
+--    Decide before anything else, and the numbers, for whoever reads the
+--    execution.
 WITH clk AS (
   SELECT coalesce(nullif($1, '')::timestamptz, now()) AS now
 ),
@@ -751,7 +772,13 @@ SELECT __ISO_CLOCK__ AS clock,
        (SELECT coalesce(json_agg(row_to_json(cand)), '[]'::json) FROM cand) AS candidates,
        (SELECT coalesce(json_object_agg(k, n), '{}'::json)
           FROM (SELECT coalesce(channel, '?') || ':' || coalesce(status, '?') AS k, count(*) AS n
-                  FROM drafts GROUP BY 1) s) AS drafts_by_status;"""
+                  FROM drafts GROUP BY 1) s) AS drafts_by_status,
+       (SELECT coalesce(json_agg(json_build_object('id', sp.id, 'reason', sp.reason, 'detail', sp.detail,
+                                                   'tripped_at', __ISO_TRIPPED__, 'alerted_at', __ISO_ALERTED__)
+                                 ORDER BY sp.id), '[]'::json)
+          FROM send_pauses sp WHERE sp.cleared_at IS NULL) AS pauses,
+       (SELECT send_brake_stats(clk.now, $4::int) FROM clk) AS brake,
+       (SELECT value FROM settings WHERE key = 'operator_email') AS operator_email;"""
 
 LOAD_STATE_SQL = (
     LOAD_STATE_SQL
@@ -762,6 +789,8 @@ LOAD_STATE_SQL = (
     .replace("__ISO_MAX__", iso("max(counted.at)"))
     .replace("__ISO_AT__", iso("counted.at"))
     .replace("__ISO_M__", iso("m.sent_at"))
+    .replace("__ISO_TRIPPED__", iso("sp.tripped_at"))
+    .replace("__ISO_ALERTED__", iso("sp.alerted_at"))
 )
 
 CLAIM_SQL = """-- Claim Send: the last line of defence, in one statement under one lock.
@@ -774,6 +803,7 @@ CLAIM_SQL = """-- Claim Send: the last line of defence, in one statement under o
 --   Section 9   contact verified, domain and recipient domain not blocklisted,
 --               no reply or bounce on this lead
 --   Section 5   today's external sends, re-counted, below the ceiling
+--   Section 9   the safety brake not on: no open send_pauses row (migration 021)
 --
 -- The advisory lock is its own statement on purpose. The Postgres node runs
 -- this text as one multi-statement query, i.e. one implicit transaction; under
@@ -823,6 +853,7 @@ d AS (
      AND (d.variant LIKE 'follow-up-%'
           OR NOT EXISTS (SELECT 1 FROM outreach_log o WHERE o.lead_id = d.lead_id AND o.channel = 'email'))
      AND (SELECT count(*) FROM counted) < (p.p->>'ceiling')::int
+     AND NOT EXISTS (SELECT 1 FROM send_pauses sp WHERE sp.cleared_at IS NULL)
   RETURNING d.id, d.lead_id
 ),
 o AS (
@@ -846,6 +877,86 @@ SELECT (SELECT count(*) FROM d) = 1       AS claimed,
 ).replace(
     "__RCPT_BLOCKED__", BLOCKED_DOMAIN.format(d="lower(split_part(c.email, '@', 2))")
 )
+
+CHECK_BRAKE_SQL = """-- Check Brake: the Send safety brake's latch (Section 9, Workflow 6; operator
+-- decision 2026-10-19; migration 021). "If bounces over the last N days exceed
+-- P% of sends, or any spam complaint arrives, Send pauses and the operator is
+-- alerted." First thing every tick, before Load Send State reads the pauses.
+--
+-- $1 now_override ('' in the shipped workflow), $2 brake_days, $3 brake_bounce_pct
+--
+-- send_brake_stats() is the one definition of the numbers: of the confirmed
+-- emails sent since the later of N days ago and the last cleared bounce-rate
+-- pause, how many came back bounced; and every spam complaint since the last
+-- cleared complaint pause. STRICTLY over P%: at 3%, 3 bounces in 100 sends do
+-- not trip, 4 do. A pause is a row with cleared_at NULL, at most one per reason
+-- (the partial unique index), so a repeated tick writes nothing new and the
+-- detail stays the one the operator was alerted about. Nothing here ever
+-- clears one: only the operator does.
+WITH clk AS (
+  SELECT coalesce(nullif($1, '')::timestamptz, now()) AS now
+),
+s AS (
+  SELECT send_brake_stats(clk.now, $2::int) AS b FROM clk
+),
+v AS (
+  SELECT (s.b->>'sends')::int                  AS sends,
+         (s.b->>'bounced')::int                AS bounced,
+         s.b->'bounced_domains'                AS domains,
+         (s.b->>'bounce_from')::timestamptz    AS bounce_from,
+         s.b->'complaints'                     AS complaints
+    FROM s
+),
+bounce AS (
+  INSERT INTO send_pauses (reason, detail, evidence)
+  SELECT 'bounce-rate',
+         format('%s of the %s emails sent since %s bounced (%s%%), over the %s%% brake. Bounced: %s.',
+                v.bounced, v.sends, to_char(v.bounce_from AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI "UTC"'),
+                round(100.0 * v.bounced / v.sends, 1), $3::numeric,
+                (SELECT string_agg(x, ', ' ORDER BY x) FROM jsonb_array_elements_text(v.domains) x)),
+         jsonb_build_object('sends', v.sends, 'bounced', v.bounced, 'bounce_from', v.bounce_from,
+                            'domains', v.domains, 'window_days', $2::int, 'max_pct', $3::numeric)
+    FROM v
+   WHERE v.sends > 0
+     AND v.bounced * 100.0 > $3::numeric * v.sends
+  ON CONFLICT (reason) WHERE cleared_at IS NULL DO NOTHING
+  RETURNING id
+),
+complaint AS (
+  INSERT INTO send_pauses (reason, detail, evidence)
+  SELECT 'spam-complaint',
+         format('%s spam complaint(s): %s.', jsonb_array_length(v.complaints),
+                (SELECT string_agg(format('%s from %s "%s"', c->>'at', c->>'from', c->>'subject'), '; ')
+                   FROM jsonb_array_elements(v.complaints) c)),
+         jsonb_build_object('complaints', v.complaints)
+    FROM v
+   WHERE jsonb_array_length(v.complaints) > 0
+  ON CONFLICT (reason) WHERE cleared_at IS NULL DO NOTHING
+  RETURNING id
+)
+SELECT (SELECT count(*) FROM bounce)::int    AS tripped_bounce_rate,
+       (SELECT count(*) FROM complaint)::int AS tripped_spam_complaint,
+       v.sends, v.bounced, jsonb_array_length(v.complaints) AS complaints
+  FROM v;"""
+
+RECORD_BRAKE_ALERT_SQL = """-- Record Brake Alert: the pauses this email told the operator about are stamped
+-- alerted_at -- only when SMTP accepted it, so an alert that failed is tried
+-- again on the next tick (the same contract as IMAP Health's Record Health).
+--
+-- $1 Decide Send's alert ({notify, to, subject, text, pause_ids})
+-- $2 Send Brake Alert's output (`accepted` on success, `error` on failure)
+WITH p AS (
+  SELECT $1::jsonb AS a, $2::jsonb AS r
+)
+UPDATE send_pauses sp
+   SET alerted_at = now()
+  FROM p
+ WHERE sp.id IN (SELECT (jsonb_array_elements_text(p.a->'pause_ids'))::bigint)
+   AND sp.alerted_at IS NULL
+   AND p.r->>'error' IS NULL
+   AND jsonb_typeof(p.r->'accepted') = 'array'
+   AND jsonb_array_length(p.r->'accepted') > 0
+RETURNING sp.id, sp.reason;"""
 
 CONFIRM_SQL = """-- Confirm Send: SMTP accepted the message. Record its Message-ID on the claim
 -- (replies thread on it), advance the lead, and put the send in mailbox_sent
@@ -1040,7 +1151,7 @@ hit AS (
 ins AS (
   INSERT INTO inbound_messages (message_id, received_at, from_addr, subject, lead_id, matched_by,
                                 classification, opt_out_keyword, body_excerpt,
-                                in_reply_to, references_raw, thread_ids)
+                                in_reply_to, references_raw, thread_ids, spam_complaint)
   SELECT p.p->>'message_id', (p.p->>'received_at')::timestamptz, p.p->>'from_addr', p.p->>'subject',
          (SELECT lead_id FROM hit), (SELECT how FROM hit),
          CASE WHEN (SELECT lead_id FROM hit) IS NULL THEN 'unmatched' ELSE p.p->>'classification' END,
@@ -1049,7 +1160,10 @@ ins AS (
          -- thread to the conversation it answers and these were parsed and
          -- thrown away until 2026-10-08.
          p.p->>'in_reply_to', p.p->>'references_raw',
-         coalesce(ARRAY(SELECT jsonb_array_elements_text(p.p->'thread_ids')), '{}')
+         coalesce(ARRAY(SELECT jsonb_array_elements_text(p.p->'thread_ids')), '{}'),
+         -- Migration 021: a spam complaint pauses Send (Workflow 6, the brake),
+         -- matched to a lead or not -- "any spam complaint".
+         coalesce((p.p->>'spam_complaint')::boolean, false)
     FROM p
   ON CONFLICT (message_id) DO NOTHING
   RETURNING lead_id, classification, received_at
@@ -2167,7 +2281,8 @@ assert "AND lead_company_type(e.raw_extraction, l.source) = 'CRO'" in FOLLOWUP_D
 assert "claims_library" not in FOLLOWUP_DUE_SQL + FOLLOWUP_WRITE_SQL, (
     "Follow-Ups reads the claims library again. Since 2026-10-19 a follow-up says only the approved template.")
 
-_ALL_SQL = [LOAD_STATE_SQL, CLAIM_SQL, CONFIRM_SQL, REVERT_SQL, MIRROR_SQL, RECORD_INBOUND_SQL,
+_ALL_SQL = [LOAD_STATE_SQL, CLAIM_SQL, CHECK_BRAKE_SQL, RECORD_BRAKE_ALERT_SQL, CONFIRM_SQL, REVERT_SQL,
+            MIRROR_SQL, RECORD_INBOUND_SQL,
             FOLLOWUP_DUE_SQL, FOLLOWUP_WRITE_SQL, COMMAND_CONTEXT_SQL, COMMAND_APPLY_SQL, REPLY_QUEUE_SQL,
             REPLY_WRITE_SQL, REMINDER_DUE_SQL, REMINDER_STAMP_SQL, REPLY_SEND_STATE_SQL, REPLY_CLAIM_SQL]
 for _sql in _ALL_SQL:
@@ -2214,6 +2329,20 @@ _decide = js("code_decide.js")
 _assert_wired("Decide Send (state.*)", _reads(_decide, "state"), final_select_aliases(LOAD_STATE_SQL), "Load Send State")
 _assert_wired("Decide Send (candidate c.*)", _reads(_decide, "c"), [a for _, a in CANDIDATE_COLUMNS], "the candidate query")
 _assert_js_emits("Claim Send", _sql_payload_reads(CLAIM_SQL), _decide, "code_decide.js's payload")
+# The safety brake (Section 9, migration 021): what Decide reads off each pause
+# is what Load Send State builds; what the alert nodes read is what brakeAlert
+# emits; the brake sits before Load Send State and on the claim itself.
+_pauses_obj = re.search(r"json_build_object\(('id', sp\.id.*?)\)\s*ORDER BY sp\.id", LOAD_STATE_SQL, re.S)
+assert _pauses_obj, "Load Send State no longer builds the open pauses (send_pauses) for Decide Send"
+_assert_wired("Decide Send (pause p.*)", _reads(_decide, "p"), set(re.findall(r"'(\w+)',", _pauses_obj.group(1))),
+              "Load Send State's pauses")
+_assert_js_emits("Brake Alert? / Send Brake Alert / Record Brake Alert", {"notify", "to", "subject", "text",
+                                                                          "pause_ids"}, _decide, "code_decide.js")
+assert "AND NOT EXISTS (SELECT 1 FROM send_pauses sp WHERE sp.cleared_at IS NULL)" in CLAIM_SQL, (
+    "Claim Send no longer refuses while the safety brake is on (Section 9, Workflow 6) -- the claim is the last "
+    "line of defence")
+assert "send_brake_stats(clk.now, $2::int)" in CHECK_BRAKE_SQL and "> $3::numeric * v.sends" in CHECK_BRAKE_SQL, (
+    "Check Brake no longer trips on the Section 9 window and share (strictly over)")
 SEND_EMAIL_READS = {"to_addr", "subject", "body"}
 _assert_wired("Send Email", SEND_EMAIL_READS, final_select_aliases(CLAIM_SQL), "Claim Send")
 _check = js("code_check_smtp.js")
@@ -2751,7 +2880,8 @@ def branch(true_target, false_target=None):
 # Workflow: Send
 # ---------------------------------------------------------------------------
 
-SEND_CONFIG = {"now_override": "", "min_gap_min": 20, "send_probability": 0.4}
+SEND_CONFIG = {"now_override": "", "min_gap_min": 20, "send_probability": 0.4,
+               "brake_days": BRAKE_DAYS, "brake_bounce_pct": BRAKE_BOUNCE_PCT}
 
 send_nodes = [
     {
@@ -2771,27 +2901,47 @@ send_nodes = [
             {"id": "nowoverride", "name": "now_override", "value": SEND_CONFIG["now_override"], "type": "string"},
             {"id": "mingap", "name": "min_gap_min", "value": SEND_CONFIG["min_gap_min"], "type": "number"},
             {"id": "prob", "name": "send_probability", "value": SEND_CONFIG["send_probability"], "type": "number"},
+            {"id": "brakedays", "name": "brake_days", "value": SEND_CONFIG["brake_days"], "type": "number"},
+            {"id": "brakepct", "name": "brake_bounce_pct", "value": SEND_CONFIG["brake_bounce_pct"], "type": "number"},
         ]}, "options": {}},
         "name": "Config", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [-880, 130],
         "notes": (
             "Pacing, not policy: a 20-minute floor since the mailbox's last external send, then a 40% "
             "coin flip per 10-minute tick -- irregular gaps of roughly 20-60 minutes (Section 5: 'never a "
             "synchronised burst'). The warm-up ceiling is NOT here; it is parsed from Section 5 into "
-            "Decide Send and re-checked in Claim Send.\n\nnow_override must stay empty. It exists so the "
+            "Decide Send and re-checked in Claim Send.\n\nbrake_days / brake_bounce_pct are the safety "
+            "brake's, parsed from Section 9 (policy, not pacing): the build refuses any other value.\n\n"
+            "now_override must stay empty. It exists so the "
             "dry-run variant can replay a scenario at a fixed instant; the build refuses a shipped "
             "workflow with it set."),
     },
+    pg_node("Check Brake", CHECK_BRAKE_SQL,
+            "={{ [$json.now_override, $json.brake_days, $json.brake_bounce_pct] }}", [-770, 300],
+            "The safety brake (Section 9, operator decision 2026-10-19; migration 021): bounces over the last "
+            "%d days above %s%% of sends, or any spam complaint, latches a send_pauses row. Only the operator "
+            "clears one. Runs before Load Send State, which reads the open pauses." % (BRAKE_DAYS, BRAKE_BOUNCE_PCT)),
     pg_node("Load Send State", LOAD_STATE_SQL,
-            "={{ [$json.now_override, $json.min_gap_min, $json.send_probability] }}", [-660, 130],
+            "={{ [$('Config').first().json.now_override, $('Config').first().json.min_gap_min, "
+            "$('Config').first().json.send_probability, $('Config').first().json.brake_days] }}", [-660, 130],
             "One row, one snapshot: the Sent-folder mirror, today's sends and claims, every approved EMAIL "
             "draft with the facts each guard needs. LinkedIn drafts are not selected -- not filtered later, "
             "never read (Section 6)."),
     code_node("Decide Send", DECIDE_JS, "runOnceForAllItems", [-440, 130],
-              "Every decision, from one row and one clock: Sent mirror trustworthy -> warm-up week and ceiling "
-              "(Section 5, parsed from the doc) -> per-draft checks -> recipient business hours -> pacing. "
-              "Emits exactly one item: send true with one payload, or send false with the reason."),
+              "Every decision, from one row and one clock: safety brake off (Section 9) -> Sent mirror trustworthy "
+              "-> warm-up week and ceiling (Section 5, parsed from the doc) -> per-draft checks -> recipient "
+              "business hours -> pacing. Emits exactly one item: send true with one payload, or send false with "
+              "the reason -- and, whatever the reason, the brake alert to send if a pause is new."),
     if_node("Send Now?", "send", "={{ $json.send }}", [-220, 130],
             "False ends the tick. The reason is in Decide Send's output for anyone reading the execution."),
+    if_node("Brake Alert?", "brakealert", "={{ $json.alert.notify }}", [-220, 320],
+            "True once per pause: an open send_pauses row the operator has not been told about yet."),
+    email_node("Send Brake Alert", "={{ $json.alert.to }}", "={{ $json.alert.subject }}", "={{ $json.alert.text }}",
+               [0, 320],
+               "One email to settings.operator_email: what tripped and how to resume. Operator mail counts toward "
+               "no warm-up slot (Section 9)."),
+    pg_node("Record Brake Alert", RECORD_BRAKE_ALERT_SQL,
+            "={{ [JSON.stringify($('Decide Send').first().json.alert), JSON.stringify($json)] }}", [220, 320],
+            "alerted_at, only when SMTP accepted the alert -- a failed one is sent again next tick."),
     pg_node("Claim Send", CLAIM_SQL, "={{ [JSON.stringify($json.payload)] }}", [0, 40],
             "The last line of defence: channel, approval, unchanged body, verified contact, blocklist, reply "
             "and the Section 5 ceiling, all re-checked in one statement under an advisory lock, and the draft "
@@ -2817,9 +2967,12 @@ send_nodes = [
 send_connections = {
     "Every 10 Minutes": edge("Config"),
     "Manual Trigger": edge("Config"),
-    "Config": edge("Load Send State"),
+    "Config": edge("Check Brake"),
+    "Check Brake": edge("Load Send State"),
     "Load Send State": edge("Decide Send"),
-    "Decide Send": edge("Send Now?"),
+    "Decide Send": edge("Send Now?", "Brake Alert?"),
+    "Brake Alert?": branch("Send Brake Alert"),
+    "Send Brake Alert": edge("Record Brake Alert"),
     "Send Now?": branch("Claim Send"),
     "Claim Send": edge("Claimed?"),
     "Claimed?": branch("Send Email"),
@@ -3652,9 +3805,10 @@ if VARIANTS_OUT:
     got = _node_diff(send_wf, dry_send)
     want = sorted([("Every 10 Minutes", "removed"), ("Config", "config:now_override"),
                    ("Config", "config:min_gap_min"), ("Config", "config:send_probability"),
-                   ("Load Send State", "credentials"), ("Claim Send", "credentials"),
-                   ("Send Email", "credentials"), ("Confirm Send", "credentials"),
-                   ("Revert Claim", "credentials")])
+                   ("Check Brake", "credentials"), ("Load Send State", "credentials"),
+                   ("Claim Send", "credentials"), ("Send Email", "credentials"), ("Confirm Send", "credentials"),
+                   ("Revert Claim", "credentials"), ("Send Brake Alert", "credentials"),
+                   ("Record Brake Alert", "credentials")])
     assert sorted(got) == want, (
         "the dry-run Send variant differs from the shipped workflow in more than credentials, Config "
         "and the schedule trigger -- the dry run would not be testing what ships:\n  %r" % sorted(got))
@@ -3759,6 +3913,8 @@ for _file, _wf in VARIANTS:
 print("  warm-up (Section 5): %s" % ", ".join("week %d%s=%d/day" % (w, "+" if i == len(WARMUP) - 1 else "", n)
                                             for i, (w, n) in enumerate(WARMUP)))
 print("  sender clock: %s (%+d min) -- the day the ceiling counts" % (SENDER_ZONE, SENDER_OFFSET))
+print("  safety brake (Section 9): bounces over %d days > %s%% of sends, or any spam complaint -> send_pauses, "
+      "operator alerted, cleared only by the operator" % (BRAKE_DAYS, BRAKE_BOUNCE_PCT))
 print("  business-hours clocks (Section 12): %d countries -- %d core, %d extended; every one of the %d the index snapshot includes has one"
       % (len(COUNTRY_CLOCKS), len(CLOCK_CORE), len(COUNTRY_CLOCKS) - len(CLOCK_CORE), len(INDEX_COUNTRIES)))
 print("  opt-out keywords (Sections 5+9): %r" % OPT_OUT_KEYWORDS)

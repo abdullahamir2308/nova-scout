@@ -7,8 +7,8 @@ Five workflows:
 
 | File | Id | What it does |
 |---|---|---|
-| `../workflows/send.json` | `send0001` | cron every 10 min → guard → claim → SMTP → log. At most one message per tick. |
-| `../workflows/mailbox-watch.json` | `mailwatch0001` | IMAP on **Sent** (mirror for the ceiling) and on **INBOX** (reply / opt-out / bounce / out-of-office). |
+| `../workflows/send.json` | `send0001` | cron every 10 min → safety brake → guard → claim → SMTP → log. At most one message per tick; a tripped brake pauses it and alerts the operator. |
+| `../workflows/mailbox-watch.json` | `mailwatch0001` | IMAP on **Sent** (mirror for the ceiling) and on **INBOX** (reply / opt-out / bounce / out-of-office; a spam complaint is an opt-out and flags `spam_complaint`). |
 | `../workflows/follow-ups.json` | `followup0001` | cron every 30 min → the fixed follow-up template (#1 or #2), gated like a first touch: approved, or held with its reason; or mark lost. No model call since 2026-10-19. |
 | `../workflows/imap-health.json` | `imaphealth0001` | cron every 20 min → IMAP checker → has Mailbox Watch missed anything? → alert the operator. |
 | `../workflows/daily-digest.json` | `digest0001` | cron every 30 min → once per operator day, from 08:00 PKT: what auto-approved, what was sent, what is held and why → the operator. |
@@ -19,9 +19,9 @@ parses the Master Ref and refuses to run when code and doc disagree.
 
 ```
 python build_workflow.py          # regenerate the five workflow JSONs
-node   test_decide.js             # 76 cases -- the send decision and every guard in it
+node   test_decide.js             # 90 cases -- the send decision and every guard in it, the 50/day ceiling, the brake
 node   test_send_result.js        # 21 cases -- what happens after the SMTP call
-node   test_mailbox.js            # 79 cases -- Sent mirror, reply classification, positive-signal flag, notification
+node   test_mailbox.js            # 103 cases -- Sent mirror, reply classification, spam complaints, positive-signal flag, notification
 node   test_followup.js           # 22 cases -- template follow-ups: rows to drafts, the gate's holds, sendable by construction
 node   test_digest.js             # 29 cases -- the Daily Digest: when it is due, what it says
 python test_followup_mutations.py # breaks each follow-up rule in turn; test_followup.js must fail every time
@@ -29,13 +29,15 @@ node   test_health.js             # 33 cases -- IMAP Health: problems, when it a
 python test_imap_health.py        # 21 cases -- the checker's answer; Message-ID parity with Mailbox Watch
 python test_health_sql.py         # 10 cases -- the shipped Load Health State SQL on a scratch schema copy: what is missed
 python test_health_sql_mutations.py # 9 mutations -- each rule of that query broken in turn; test_health_sql.py must fail
-python test_drift_guards.py       # 106 cases -- each spec/wiring guard is made to fire
+python test_send_brake_sql.py     # 22 cases -- the safety brake's shipped SQL + migration 021 on a scratch schema copy
+python test_send_brake_mutations.py # 25 mutations -- each brake rule broken (SQL, Decide Send, classifier); a test must fail
+python test_drift_guards.py       # 115 cases -- each spec/wiring guard is made to fire
 python provision_credentials.py   # n8n SMTP/IMAP credentials from .env (+ the two dry-run ones)
 python sync_settings.py           # the operator's notification address, .env -> the settings table
 python imap_preflight.py          # read-only: IMAP works, and the warm-up state from the real Sent folder
 python dryrun/dryrun.py           # the real send path, end to end, into a scratch DB and an SMTP sink
 python dryrun/health_dryrun.py    # IMAP Health end to end: real checker, scratch DB, SMTP sink
-python dryrun/template_dryrun.py  # 32 checks -- template outreach end to end: Drafting, Follow-Ups, Send; holds, trigger, retired slot, sink
+python dryrun/template_dryrun.py  # 48 checks -- template outreach end to end: Drafting, Follow-Ups, Send; holds, trigger, retired slot, the brake, sink
 python status_now.py              # read-only: what would the send path do right now?
 ```
 
@@ -78,6 +80,33 @@ statement* — the Postgres node runs the text as one implicit transaction, and
 under READ COMMITTED only a later statement's snapshot sees a concurrent claim
 that committed while it waited. Inside one statement, two overlapping ticks
 could both see 4 of 5.
+
+## The safety brake (operator decision 2026-10-19)
+
+The ceiling went from 20 to 50 a day (Section 5) and the brake came with it
+(Section 9): **if bounces over the last 3 days exceed 3% of sends, or any spam
+complaint arrives, Send pauses and the operator is alerted.**
+
+- **Check Brake** runs first every tick. `send_brake_stats()` (migration 021)
+  counts, of the confirmed emails sent in the window, how many came back
+  bounced, and every `inbound_messages` row flagged `spam_complaint`; over the
+  line (strictly: 3 in 100 does not trip, 4 does), it writes a `send_pauses` row.
+- **While a row is open** (`cleared_at` NULL) Decide Send refuses
+  `send-paused` before every other check, and Claim Send refuses on the table.
+- **One alert** to `settings.operator_email`, from this workflow (Brake Alert? →
+  Send Brake Alert → Record Brake Alert), stamped `alerted_at` only once SMTP
+  accepted it. No warm-up slot.
+- **It never lifts on its own.** Resume with
+  `UPDATE send_pauses SET cleared_at = now(), cleared_note = '…' WHERE cleared_at IS NULL;`
+  — the count for that reason restarts at the clear, so it does not re-trip on
+  what was just reviewed. Replies the operator approves (Send Reply) are not
+  paused.
+- **A spam complaint** is a feedback-loop report (ARF) or a person saying our
+  email is spam above the quoted thread (narrow English phrases; "it went to my
+  spam folder" is not one). Both are classified `opt-out` — blocklisted, no
+  reply drafted — and flagged.
+
+`status_now.py` prints the brake's numbers and any open pause.
 
 ## Claim, then send — at most once
 

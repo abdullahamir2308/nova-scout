@@ -21,7 +21,16 @@ What it proves, through n8n:
      template #1, not #2;
   6. Send finds every auto-approved template draft eligible, and sends a first
      touch and then the follow-up into the SMTP sink -- the three-line
-     sign-off, no opt-out sentence, no phone, Re: threading on the follow-up.
+     sign-off, no opt-out sentence, no phone, Re: threading on the follow-up;
+  7. the safety brake (Section 9, operator decision 2026-10-19; migration 021):
+     a bounce rate over 3% pauses Send, the operator gets exactly one alert in
+     the sink, nothing goes to a prospect, Claim Send refuses on the table too;
+     clearing the pause resumes Send; then a spam complaint -- a real reply run
+     through the shipped classifier and Record Inbound -- pauses it again.
+
+Since the switch itself ran live on 2026-10-19 (08:02 UTC), the copy first sets
+that morning's 30 template first touches aside, so step 1 replays the switch
+from where --apply found it.
 
 REAL: the workflows (built from the same node lists as the shipped ones -- the
 differences are listed and asserted), n8n, every Postgres statement and
@@ -43,12 +52,14 @@ workflows deleted from n8n; --keep leaves them. Exit 1 if any expectation did
 not hold.
 """
 import copy
+import csv
 import datetime
 import email
 import email.policy
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -58,7 +69,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SENDTRACK = os.path.dirname(HERE)
 DRAFTING = os.path.join(SENDTRACK, "..", "drafting")
 REPO = os.path.abspath(os.path.join(SENDTRACK, "..", ".."))
-MIGRATION = os.path.join(REPO, "postgres", "migrations", "020_template_outreach.sql")
+MIGRATIONS = [os.path.join(REPO, "postgres", "migrations", m)
+              for m in ("020_template_outreach.sql", "021_send_brake.sql")]
 N8N = "nova-scout-n8n-1"
 PG = "nova-scout-postgres-1"
 PGUSER = "novascout"
@@ -113,6 +125,8 @@ def fingerprint(db):
       'outreach_log', (SELECT count(*) FROM outreach_log),
       'mailbox_sent', (SELECT count(*) FROM mailbox_sent),
       'max_draft_id', (SELECT max(id) FROM drafts),
+      'send_pauses', (SELECT count(*) FROM send_pauses),
+      'spam_complaints', (SELECT count(*) FROM inbound_messages WHERE spam_complaint),
       'trigger_is_020', (SELECT position('not a template draft' IN prosrc) > 0 FROM pg_proc WHERE proname = 'drafts_approval_rules'));""").strip())
 
 
@@ -164,8 +178,9 @@ def make_base():
     sh(["docker", "exec", PG, "sh", "-c",
         "pg_dump -U %s -d %s --no-owner | psql -U %s -d %s -q -X -v ON_ERROR_STOP=1 >/dev/null"
         % (PGUSER, REAL, PGUSER, BASE)])
-    with io.open(MIGRATION, encoding="utf-8") as fh:
-        psql(BASE, fh.read())
+    for m in MIGRATIONS:
+        with io.open(m, encoding="utf-8") as fh:
+            psql(BASE, fh.read())
     psql(BASE, "UPDATE contacts SET email = replace(lower(email), '@', '.at.') || '@dryrun.invalid' "
                "WHERE email IS NOT NULL AND email <> '';\n"
                "DELETE FROM settings;\n"
@@ -330,15 +345,27 @@ try:
 
     # --- 1. the re-queue, exactly as redraft_with_template.py --apply does it ------------------
     print("\n1. Re-queue the retired leads and draft them")
+    # In the copy only: the switch ran live at 08:02 UTC on 2026-10-19 and the
+    # template first touches were written 08:30-09:30. Those not yet sent are set
+    # aside, so the copy is back where --apply found it; a lead live Send has
+    # already emailed is no longer --apply's to re-queue, and is left out.
+    undone = psql(DRY, "UPDATE drafts SET status = 'rejected', reject_reason = 'bad draft' "
+                       "WHERE variant LIKE 'template/%%' AND created_at >= '2026-10-19 08:00+00' "
+                       "AND status IN ('approved', 'pending') RETURNING id;").split()
+    print("     (copy only: %d of this morning's template first touches set aside to replay the switch)" % len(undone))
     retired = rows(DRY, "SELECT DISTINCT d.lead_id FROM drafts d WHERE d.status = 'rejected' "
                         "AND position('%s' IN coalesce(d.hold_reason, '')) > 0 ORDER BY 1" % redraft.RETIRED_MARK)
-    retired_ids = [r["lead_id"] for r in retired]
-    expect("the copy carries the 30 leads retired on 2026-10-19", len(retired_ids) == 30, str(retired_ids))
+    emailed = {r["lead_id"] for r in rows(DRY, "SELECT DISTINCT lead_id FROM outreach_log WHERE channel = 'email'")}
+    expect("the copy carries the 30 leads retired on 2026-10-19", len(retired) == 30, str(retired))
+    retired_ids = [r["lead_id"] for r in retired if r["lead_id"] not in emailed]
+    print("     %d of them not yet emailed live -- the ones --apply re-queues" % len(retired_ids))
+    if NO_CLOCK_LEAD not in retired_ids:
+        NO_CLOCK_LEAD = [i for i in retired_ids if i not in (14, 55, 538)][0]
     linkedin_before = rows(DRY, "SELECT id, status FROM drafts WHERE channel = 'linkedin' AND lead_id IN (%s) ORDER BY id"
                            % ",".join(map(str, retired_ids)))
     psql(DRY, "UPDATE leads SET country = '%s' WHERE id = %d;" % (NO_CLOCK_COUNTRY, NO_CLOCK_LEAD))
     requeued = psql(DRY, "BEGIN;\n" + redraft.REQUEUE_SQL + "\nCOMMIT;\n").split()
-    expect("redraft_with_template.py's re-queue puts exactly those 30 back to contact_found",
+    expect("redraft_with_template.py's re-queue puts exactly those back to contact_found",
            sorted(int(x) for x in requeued) == retired_ids, str(requeued))
     max_before = int(psql(DRY, "SELECT max(id) FROM drafts;").strip())
 
@@ -509,6 +536,142 @@ try:
                      "\n".join("     " + ln for ln in body.split("\n")[:12])))
         else:
             expect("the sink captured the follow-up", False, str(log))
+
+    # --- 7. The safety brake (Section 9, operator decision 2026-10-19; migration 021) ------------------
+    print("\n7. The safety brake: a bounce rate over the line, then a spam complaint")
+
+    def bind(sql, params):
+        # $n -> dollar-quoted literals. Comments are left alone: the statements carry
+        # ' -- ' inside string literals, and a JSON literal never spans a line.
+        return re.sub(r"\$(\d+)\b", lambda m: "$q$" + params[int(m.group(1)) - 1] + "$q$", sql)
+
+    def csv_row(db, sql):
+        out = sh(["docker", "exec", "-i", PG, "psql", "-U", PGUSER, "-d", db, "-X", "-q", "--csv",
+                  "-v", "ON_ERROR_STOP=1"], stdin=sql)
+        got = list(csv.DictReader(io.StringIO(out)))
+        return got[-1] if got else {}
+
+    def classify_js(msg):
+        js = ("const { extractFunctions } = require(%s);\n"
+              "const { classify } = extractFunctions(%s, '// Node body', ['classify'], "
+              "(s) => s.replace('__OWN_DOMAIN__', JSON.stringify('amitrixlabs.com')));\n"
+              "process.stdout.write(JSON.stringify(classify(JSON.parse(require('fs').readFileSync(0, 'utf8')))));\n"
+              % (json.dumps(os.path.join(SENDTRACK, "harness.js")),
+                 json.dumps(os.path.join(SENDTRACK, "code_classify_reply.js"))))
+        return json.loads(sh(["node", "-e", js], stdin=json.dumps(msg)))
+
+    def operator_mail(log):
+        return [x for x in log if any(r.strip("<>") == OPERATOR for r in x["rcpt_to"])]
+
+    def prospect_mail(log):
+        return [x for x in log if not any(r.strip("<>") == OPERATOR for r in x["rcpt_to"])]
+
+    send_nodes = {n["name"]: n for n in load("variants", "send-dryrun.json")["nodes"]}
+    # Every approved first touch this run wrote, back in the queue (step 6 set them aside).
+    spare = [d["id"] for d in approved if d["id"] != sent_id]
+    psql(DRY, "UPDATE drafts SET status = 'approved', approved_by = 'auto', reject_reason = NULL "
+              "WHERE id IN (%s) AND status = 'rejected';" % ",".join(map(str, spare)))
+    # One bounce, on a send already in the window before this run -- so clearing the
+    # pause (at the real clock, which is before the dry-run clock) leaves it behind.
+    bounced = rows(DRY, "SELECT o.id, o.lead_id FROM outreach_log o WHERE o.channel = 'email' AND o.message_id IS NOT NULL "
+                        "AND o.sent_at >= timestamptz '%s' - interval '3 days' AND o.sent_at < now() "
+                        "ORDER BY o.sent_at DESC LIMIT 1" % CLOCK)
+    psql(DRY, "UPDATE outreach_log SET outcome = 'bounced' WHERE id = %d;" % bounced[0]["id"])
+    stats = json.loads(psql(DRY, "SELECT send_brake_stats(timestamptz '%s', 3);" % CLOCK).strip())
+    print("     window as of the dry-run clock: %d sends, %d bounced (%.1f%%)"
+          % (stats["sends"], stats["bounced"], 100.0 * stats["bounced"] / max(1, stats["sends"])))
+    expect("the copy is over the line: 1 bounce in %d sends is more than 3%%" % stats["sends"],
+           stats["bounced"] == 1 and stats["bounced"] * 100.0 > 3 * stats["sends"], json.dumps(stats))
+    log0 = sink_log()
+
+    run = execute("send0001dry")
+    decision = out_items(run, "Decide Send")[0]
+    pauses = rows(DRY, "SELECT id, reason, detail, alerted_at, cleared_at FROM send_pauses ORDER BY id")
+    log1 = sink_log()
+    expect("Check Brake latched one bounce-rate pause",
+           [p["reason"] for p in pauses] == ["bounce-rate"] and "1 of the %d emails sent since" % stats["sends"] in pauses[0]["detail"],
+           json.dumps(pauses))
+    expect("Send paused: Decide refused before anything else, with eligible in-hours drafts waiting (%d)"
+           % len([e for e in decision["eligible"] if e["in_window"]]),
+           decision["send"] is False and decision["reason"] == "send-paused"
+           and any(e["in_window"] for e in decision["eligible"]), decision.get("reason"))
+    expect("nothing went to a prospect", len(prospect_mail(log1)) == len(prospect_mail(log0)), str(log1[len(log0):]))
+    new_ops = operator_mail(log1)[len(operator_mail(log0)):]
+    expect("exactly one alert reached the operator (%s)" % OPERATOR, len(new_ops) == 1, str(new_ops))
+    if new_ops:
+        msg = sink_message(new_ops[0]["file"])
+        body = msg.get_content().replace("\r\n", "\n")
+        expect("... subject and text say what tripped and how to resume",
+               msg["Subject"] == "[Nova Scout] Send paused: bounce rate over the brake"
+               and pauses[0]["detail"] in body and "UPDATE send_pauses SET cleared_at = now()" in body, msg["Subject"])
+        print("\n     --- the alert (to %s) ---\n     Subject: %s\n%s\n     ---"
+              % (OPERATOR, msg["Subject"], "\n".join("     " + ln for ln in body.strip().split("\n"))))
+    expect("... and the pause is stamped alerted once SMTP accepted it",
+           rows(DRY, "SELECT alerted_at IS NOT NULL AS a FROM send_pauses WHERE reason = 'bounce-rate'")[0]["a"] is True)
+
+    run = execute("send0001dry")
+    decision = out_items(run, "Decide Send")[0]
+    log2 = sink_log()
+    expect("the next tick: still paused, and no second alert",
+           decision["reason"] == "send-paused" and decision["alert"]["notify"] is False and len(log2) == len(log1),
+           "%s / %d -> %d" % (decision["reason"], len(log1), len(log2)))
+
+    # Claim Send refuses on the table too: the last line of defence, called directly
+    # with exactly the payload Decide would have built for the oldest in-hours draft.
+    pick = [e for e in decision["eligible"] if e["in_window"]][0]
+    dr = rows(DRY, "SELECT d.id, d.lead_id, d.subject, coalesce(d.edited_body, d.body) AS body, c.email FROM drafts d "
+                   "JOIN contacts c ON c.lead_id = d.lead_id WHERE d.id = %d" % pick["draft_id"])[0]
+    payload = {"draft_id": dr["id"], "lead_id": dr["lead_id"], "to_addr": dr["email"], "subject": dr["subject"],
+               "body": dr["body"].strip(), "raw_body": dr["body"], "clock": CLOCK,
+               "day_start": "2026-10-19T19:00:00.000Z", "day_end": "2026-10-20T19:00:00.000Z", "ceiling": 50}
+    claim = csv_row(DRY, bind(send_nodes["Claim Send"]["parameters"]["query"], [json.dumps(payload)]))
+    still = rows(DRY, "SELECT status FROM drafts WHERE id = %d" % dr["id"])[0]["status"]
+    expect("Claim Send refuses the draft while the pause is open (claimed=%s), and it stays approved" % claim.get("claimed"),
+           claim.get("claimed") == "f" and still == "approved", json.dumps(claim))
+
+    # The operator clears it. Send resumes on the next tick.
+    psql(DRY, "UPDATE send_pauses SET cleared_at = now(), cleared_note = 'dry run: reviewed' WHERE cleared_at IS NULL;")
+    run = execute("send0001dry")
+    decision = out_items(run, "Decide Send")[0]
+    log3 = sink_log()
+    resumed = decision.get("payload") or {}
+    expect("cleared -> the next tick sends again: %s" % decision.get("detail"),
+           decision["send"] is True and len(prospect_mail(log3)) == len(prospect_mail(log2)) + 1, decision.get("reason"))
+    expect("... the bounce just reviewed did not trip it again",
+           [p["reason"] for p in rows(DRY, "SELECT reason FROM send_pauses WHERE cleared_at IS NULL")] == [])
+
+    # A spam complaint: the reply to that email, through the shipped classifier and Record Inbound.
+    mid = rows(DRY, "SELECT message_id FROM outreach_log WHERE draft_id = %d" % resumed.get("draft_id", -1))
+    reply = {"from": "Prospect <%s>" % resumed.get("to_addr"), "to": "abdullah@amitrixlabs.com",
+             "subject": "Re: " + str(resumed.get("subject")), "date": "Tue, 20 Oct 2026 15:20:00 +0000",
+             "textPlain": "This is spam. Stop emailing us.\n\nOn Tue, 20 Oct 2026, Abdullah Amir wrote:\n> Hi there,",
+             "textHtml": "",
+             "metadata": {"message-id": "<complaint-dryrun-1@cro.example>",
+                          "in-reply-to": mid[0]["message_id"] if mid else "", "references": mid[0]["message_id"] if mid else ""}}
+    payload = classify_js(reply)
+    expect("the classifier reads the reply as an opt-out and a spam complaint",
+           [payload["classification"], payload["opt_out_keyword"], payload["spam_complaint"]] == ["opt-out", "stop", True],
+           json.dumps({k: payload[k] for k in ("classification", "opt_out_keyword", "spam_complaint")}))
+    mw = load("shipped", "mailbox-watch.json")
+    record = [n for n in mw["nodes"] if n["name"] == "Record Inbound"][0]["parameters"]["query"]
+    psql(DRY, bind(record, [json.dumps(payload)]))
+    got = rows(DRY, "SELECT lead_id, classification, spam_complaint, matched_by FROM inbound_messages "
+                    "WHERE message_id = '<complaint-dryrun-1@cro.example>'")
+    expect("Record Inbound stores it matched to the lead, spam_complaint true",
+           got and got[0]["lead_id"] == resumed.get("lead_id") and got[0]["spam_complaint"] is True
+           and got[0]["classification"] == "opt-out", json.dumps(got))
+    run = execute("send0001dry")
+    decision = out_items(run, "Decide Send")[0]
+    log4 = sink_log()
+    new_ops = operator_mail(log4)[len(operator_mail(log3)):]
+    expect("the complaint pauses Send on the next tick", decision["reason"] == "send-paused"
+           and [p["reason"] for p in rows(DRY, "SELECT reason FROM send_pauses WHERE cleared_at IS NULL")] == ["spam-complaint"],
+           decision.get("reason"))
+    expect("... nothing went to a prospect, and one alert reached the operator",
+           len(prospect_mail(log4)) == len(prospect_mail(log3)) and len(new_ops) == 1, str(log4[len(log3):]))
+    if new_ops:
+        msg = sink_message(new_ops[0]["file"])
+        expect("... subject: spam complaint", msg["Subject"] == "[Nova Scout] Send paused: spam complaint", msg["Subject"])
 finally:
     stop_sink()
     if not KEEP:

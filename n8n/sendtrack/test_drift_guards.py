@@ -231,10 +231,46 @@ case("doc lowers week 1 to 4/day and the JS does not follow -> refuses", "warm-u
      mutate_doc=lambda d: d.replace("| Week 1 | 5 |", "| Week 1 | 4 |", 1))
 case("JS raises week 1 to 6/day -> refuses", "warm-up schedule drifted",
      mutate_file=("code_decide.js", lambda s: s.replace("  [1, 5],", "  [1, 6],", 1)))
-case("JS drops the open-ended week 4+ row -> refuses", "warm-up schedule drifted",
-     mutate_file=("code_decide.js", lambda s: s.replace("  [4, 20],\n", "", 1)))
+case("JS drops the open-ended week 5+ row -> refuses", "warm-up schedule drifted",
+     mutate_file=("code_decide.js", lambda s: s.replace("  [5, 50],\n", "", 1)))
+case("the doc lowers week 5+ to 40/day and the JS does not follow -> refuses", "warm-up schedule drifted",
+     mutate_doc=lambda d: d.replace("| Week 5+ | 50 (hard ceiling) |", "| Week 5+ | 40 (hard ceiling) |", 1))
+case("the JS keeps the old 20/day hard ceiling -> refuses", "warm-up schedule drifted",
+     mutate_file=("code_decide.js", lambda s: s.replace("  [5, 50],\n", "  [5, 20],\n", 1)))
 case("the warm-up table disappears -> refuses loudly", "warm-up table not found",
-     mutate_doc=lambda d: d.replace("| Week ", "| Wk ", 4))
+     mutate_doc=lambda d: d.replace("| Week ", "| Wk ", 5))
+
+# --- Section 9: the Send safety brake (operator decision 2026-10-19) --------
+case("Section 9 loses the safety brake -> refuses loudly", "Send safety brake not found",
+     mutate_doc=lambda d: d.replace("if bounces over the last 3 days exceed 3% of sends",
+                                    "if bounces are high", 1))
+positive(
+    "Section 9's brake window and share flow straight into the Send Config",
+    lambda tmp: None if {a["name"]: a["value"] for a in node(load(tmp, "send.json"), "Config")["parameters"]
+                         ["assignments"]["assignments"]}.get("brake_bounce_pct") == 5
+    and {a["name"]: a["value"] for a in node(load(tmp, "send.json"), "Config")["parameters"]
+         ["assignments"]["assignments"]}.get("brake_days") == 7
+    else "brake_days/brake_bounce_pct did not follow the doc",
+    mutate_doc=lambda d: d.replace("if bounces over the last 3 days exceed 3% of sends",
+                                   "if bounces over the last 7 days exceed 5% of sends", 1),
+)
+case("Claim Send stops refusing while a pause is open -> refuses", "no longer refuses while the safety brake is on",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "     AND NOT EXISTS (SELECT 1 FROM send_pauses sp WHERE sp.cleared_at IS NULL)\n  RETURNING d.id, d.lead_id",
+         "  RETURNING d.id, d.lead_id", 1)))
+case("Check Brake trips AT the share instead of over it -> refuses", "strictly over",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "     AND v.bounced * 100.0 > $3::numeric * v.sends", "     AND v.bounced * 100.0 >= $3::numeric * v.sends", 1)))
+case("Load Send State stops building the open pauses -> refuses", "no longer builds the open pauses",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "json_build_object('id', sp.id, 'reason', sp.reason,", "json_build_object('pause', sp.id, 'reason', sp.reason,", 1)))
+case("Decide Send reads a pause field Load Send State does not build -> refuses", "does not produce",
+     mutate_file=("code_decide.js", lambda s: s.replace("!str(p.alerted_at)", "!str(p.alerted)", 1)))
+case("Decide Send's alert stops carrying the pause ids Record Brake Alert stamps -> refuses", "never emits",
+     mutate_file=("code_decide.js", lambda s: s.replace(
+         "const alert = { notify: false, to: to, subject: '', text: '', pause_ids: [] };",
+         "const alert = { notify: false, to: to, subject: '', text: '' };", 1).replace(
+         "  alert.pause_ids = fresh.map(function (p) { return Number(p.id); });\n", "", 1)))
 case("a middle row made open-ended -> refuses as ambiguous", "only the last row may be open-ended",
      mutate_doc=lambda d: d.replace("| Week 2 | 10 |", "| Week 2+ | 10 |", 1))
 

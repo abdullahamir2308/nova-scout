@@ -275,8 +275,9 @@ build()
 send_wf = import_wf("send-dryrun.json")
 fu_wf = import_wf("followups-dryrun.json")
 smtp_nodes = [n for n in send_wf["nodes"] if n["type"] == "n8n-nodes-base.emailSend"]
-expect("the dry-run Send workflow's only SMTP node uses the SINK credential",
-       [n["credentials"]["smtp"]["id"] for n in smtp_nodes] == ["novascoutSmtpDry01"])
+expect("the dry-run Send workflow's SMTP nodes (Send Email, and since 2026-10-19 Send Brake Alert) use the SINK credential",
+       sorted(n["name"] for n in smtp_nodes) == ["Send Brake Alert", "Send Email"]
+       and {n["credentials"]["smtp"]["id"] for n in smtp_nodes} == {"novascoutSmtpDry01"})
 expect("... and every Postgres node the scratch DB",
        {n["credentials"]["postgres"]["id"] for n in send_wf["nodes"] if n["type"] == "n8n-nodes-base.postgres"} == {"novascoutPgDry01"})
 CLAIM = claim_sql(send_wf)
