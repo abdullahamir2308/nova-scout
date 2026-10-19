@@ -574,6 +574,14 @@ case("Assess Health stops emitting a state field Record Health writes -> refuses
 case("Load Health State's payload expression drops grace_min -> refuses", "never sets it",
      mutate_file=("build_workflow.py", lambda s: s.replace(
          "\"grace_min: $('Config').first().json.grace_min })] }}\"", "\"})] }}\"", 1)))
+case("Load Health State stops counting an operator command as recorded (the 2026-10-18 false alarm) -> refuses",
+     "recorded in operator_commands as recorded",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "     AND NOT EXISTS (SELECT 1 FROM operator_commands c WHERE c.message_id = i.message_id)\n", "", 1)))
+case("Load Health State stops counting a prospect's mail as recorded -> refuses",
+     "recorded in inbound_messages as recorded",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "     AND NOT EXISTS (SELECT 1 FROM inbound_messages m WHERE m.message_id = i.message_id)\n", "", 1)))
 case("Section 8 adds a health problem code the JS does not know -> refuses", "problem codes drifted",
      mutate_doc=lambda d: d.replace("inbox-missed|sent-missed)", "inbox-missed|sent-missed|smtp-failed)", 1))
 case("Section 8 drops a mailbox_health column Record Health writes -> refuses", "does not define",

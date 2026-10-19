@@ -1860,6 +1860,12 @@ HEALTH_LOAD_SQL = with_iso("""-- Load Health State: the IMAP checker's Message-I
 -- whole on every activation, so every Sent message is expected -- except the ones
 -- the pre-flight already leaves out (no Message-ID, or no usable Date header,
 -- which the mirror skips as undated).
+--
+-- An INBOX message is RECORDED when either table has it: Mailbox Watch writes
+-- mail from anyone else to inbound_messages, and the operator's own command
+-- mail (APPROVE / REJECT / EDIT with a code) to operator_commands. Read from
+-- inbound_messages alone, every command looked missed for the checker's 48
+-- hours -- 2026-10-18 16:13 UTC, "still waiting: JSS Medical Research".
 WITH p AS (
   SELECT $1::jsonb AS p
 ),
@@ -1888,6 +1894,7 @@ missed_inbox AS (
    WHERE i.at <= clk.now - clk.grace
      AND i.at >= watch.started_at
      AND NOT EXISTS (SELECT 1 FROM inbound_messages m WHERE m.message_id = i.message_id)
+     AND NOT EXISTS (SELECT 1 FROM operator_commands c WHERE c.message_id = i.message_id)
 ),
 missed_sent AS (
   SELECT s.* FROM sent s, clk
@@ -2265,6 +2272,16 @@ _assert_wired("Assess Health (check.*)", _reads(_health, "check") - {"error"},
 _assert_wired("Load Health State (x->>'...')", set(re.findall(r"x->>'(\w+)'", HEALTH_LOAD_SQL)),
               set(re.findall(r'"(\w+)":', _preflight)), "imap_preflight.py --ids-json")
 _assert_js_emits("Record Health", _sql_payload_reads(HEALTH_RECORD_SQL, prefix="p.s"), _health, "code_health.js")
+# Every table Mailbox Watch records INBOX mail in must count as recorded, or
+# IMAP Health alerts on mail that was handled (operator commands, 2026-10-18).
+_missed_inbox = re.search(r"missed_inbox AS \((.*?)\n\),", HEALTH_LOAD_SQL, re.S)
+for _table in ("inbound_messages", "operator_commands"):
+    assert _missed_inbox and re.search(
+        r"AND NOT EXISTS \(SELECT 1 FROM %s \w+ WHERE \w+\.message_id = i\.message_id\)" % _table,
+        _missed_inbox.group(1)), (
+        "Load Health State no longer counts an INBOX message recorded in %s as recorded -- Mailbox Watch writes "
+        "INBOX mail to inbound_messages and operator commands to operator_commands, so IMAP Health would alert "
+        "on mail that was handled (Section 9, Workflow 6)" % _table)
 HEALTH_EMAIL_READS = {"notify", "notify_to", "subject", "text"}
 _assert_js_emits("Alert? / Send Alert", HEALTH_EMAIL_READS, _health, "code_health.js")
 

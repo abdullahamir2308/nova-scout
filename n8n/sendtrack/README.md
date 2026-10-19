@@ -27,7 +27,9 @@ node   test_digest.js             # 29 cases -- the Daily Digest: when it is due
 python test_followup_mutations.py # breaks each follow-up rule in turn; test_followup.js must fail every time
 node   test_health.js             # 33 cases -- IMAP Health: problems, when it alerts, what it says
 python test_imap_health.py        # 21 cases -- the checker's answer; Message-ID parity with Mailbox Watch
-python test_drift_guards.py       # 104 cases -- each spec/wiring guard is made to fire
+python test_health_sql.py         # 10 cases -- the shipped Load Health State SQL on a scratch schema copy: what is missed
+python test_health_sql_mutations.py # 9 mutations -- each rule of that query broken in turn; test_health_sql.py must fail
+python test_drift_guards.py       # 106 cases -- each spec/wiring guard is made to fire
 python provision_credentials.py   # n8n SMTP/IMAP credentials from .env (+ the two dry-run ones)
 python sync_settings.py           # the operator's notification address, .env -> the settings table
 python imap_preflight.py          # read-only: IMAP works, and the warm-up state from the real Sent folder
@@ -262,9 +264,16 @@ first day.
 2. **Has Mailbox Watch missed anything?** With `--ids-json`, the pre-flight
    also lists the Message-ID of every INBOX and Sent message from the last 48
    hours. Anything that landed more than 15 minutes ago without a row in
-   `inbound_messages` (INBOX, from Mailbox Watch's first run) or `mailbox_sent`
-   (Sent) was missed. A login only proves the mailbox is reachable. This proves
-   the triggers are listening. `test_imap_health.py` checks that the pre-flight
+   `inbound_messages` or `operator_commands` (INBOX, from Mailbox Watch's first
+   run) or `mailbox_sent` (Sent) was missed. A login only proves the mailbox is
+   reachable. This proves the triggers are listening. **Both INBOX tables count**
+   (2026-10-19): Mailbox Watch records the operator's command mail in
+   `operator_commands`, and until then every command looked missed for 48 hours
+   (the 2026-10-18 16:13 UTC JSS Medical Research APPROVE). `test_health_sql.py`
+   runs the shipped Load Health State query against a scratch copy of the
+   schema and proves a handled command is not missed and a message in neither
+   table still alerts; `test_health_sql_mutations.py` breaks each rule of the
+   query in turn. `test_imap_health.py` checks that the pre-flight
    derives each key exactly as both Code nodes do. If it didn't, every message
    would look missed.
 
