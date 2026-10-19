@@ -58,6 +58,8 @@ const SMYKM_TRIALS_B = "{company} has {n} trial(s) recruiting right now. Each sp
 const SMYKM_AREAS_A = "{company} covers {areas} from {phases}, so sponsors visiting your website arrive with very different questions, and each one is a lead worth capturing.";
 const SMYKM_AREAS_B = "A sponsor planning a {area1} study will usually check {company}'s website before they ever email you. That visit is a lead worth capturing.";
 const SMYKM_CITY = "Sponsors looking for a CRO in {city} will find {company}'s website, and every one of those visits is a potential study worth turning into a conversation.";
+// The fourth line (operator, 2026-10-19): needs only the company, so every lead has one.
+const SMYKM_COMPANY = "Sponsors evaluating {company} will usually start on your website, and every one of those visits is a potential study worth turning into a conversation.";
 
 const PITCH_LINE = "That's precisely what we do at Amitrix Labs. We build AI agents for CRO websites that answer sponsor and visitor questions, collect their details, and turn more of your visitors into qualified leads, so you win more studies.";
 
@@ -82,7 +84,7 @@ const FOLLOW_UP_2_LINE = "I'll keep this short and won't follow up again after t
 const ARM_BY_PARITY = { even: 'A', odd: 'B' };
 
 // "SMYKM line: first fact the lead has, in this order".
-const SMYKM_ORDER = ['trials', 'areas', 'city'];
+const SMYKM_ORDER = ['trials', 'areas', 'city', 'company'];
 
 // "at most two areas, lowercase, joined with 'and'".
 const MAX_AREAS = 2;
@@ -374,6 +376,7 @@ function pickSmykm(facts) {
     if (kind === 'trials' && Number.isInteger(facts.trials) && facts.trials > 0) return 'trials';
     if (kind === 'areas' && facts.areas && facts.areas.length) return 'areas';
     if (kind === 'city' && str(facts.city)) return 'city';
+    if (kind === 'company') return 'company';
   }
   return 'none';
 }
@@ -450,7 +453,10 @@ function fill(template, v) {
   if (s.indexOf('{n} recruiting trial(s)') !== -1) {
     s = s.split('{n} recruiting trial(s)').join(v.n + ' recruiting ' + plural(v.n, 'trial', 'trials'));
   }
+  // "from" only pairs with a range ("from Phase I to III"); a single phase, or
+  // a gap, reads "in Phase II" (operator, 2026-10-19).
   if (s.indexOf(" from {phases}") !== -1 && !v.phases) s = s.split(' from {phases}').join('');
+  if (s.indexOf(" from {phases}") !== -1 && !/ to /.test(v.phases)) s = s.split(' from {phases}').join(' in {phases}');
   s = s.split("{company}'s").join(v.company !== undefined ? possessive(v.company) : "{company}'s");
   const keys = ['company', 'areas', 'area1', 'phases', 'city', 'n', 'fact', 'first_name'];
   keys.forEach(function (k) {
@@ -514,6 +520,7 @@ function smykmLine(kind, arm, company, facts) {
     });
   }
   if (kind === 'city') return fill(SMYKM_CITY, { company: company, city: facts.city });
+  if (kind === 'company') return fill(SMYKM_COMPANY, { company: company });
   return null;
 }
 

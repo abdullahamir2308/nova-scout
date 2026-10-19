@@ -205,7 +205,13 @@ case("the doc stops saying 'Hi there,' for a role inbox -> refuses", "Hi there",
 case("the doc flips the arms and the JS does not follow -> refuses", "selection rules drifted",
      mutate_doc=lambda d: one(d, "Two arms, assigned by lead_id: even = A, odd = B.", "Two arms, assigned by lead_id: even = B, odd = A."))
 case("the JS reorders the SMYKM facts -> refuses", "selection rules drifted",
-     mutate_js=lambda s: one(s, "const SMYKM_ORDER = ['trials', 'areas', 'city'];", "const SMYKM_ORDER = ['areas', 'trials', 'city'];"))
+     mutate_js=lambda s: one(s, "const SMYKM_ORDER = ['trials', 'areas', 'city', 'company'];",
+                             "const SMYKM_ORDER = ['areas', 'trials', 'city', 'company'];"))
+case("the doc drops the company line from the SMYKM order -> refuses", "selection rules drifted",
+     mutate_doc=lambda d: one(d, "in this order: `trials`, `areas`, `city`, `company`;", "in this order: `trials`, `areas`, `city`;"))
+case("a word of the company line changed in the doc -> refuses", "approved template text drifted",
+     mutate_doc=lambda d: one(d, "company: Sponsors evaluating {company} will usually start on your website,",
+                              "company: Sponsors evaluating {company} will often start on your website,"))
 case("the doc allows three areas -> refuses", "selection rules drifted",
      mutate_doc=lambda d: one(d, 'At most two areas, lowercase, joined with "and"', 'At most three areas, lowercase, joined with "and"'))
 case("the doc loses the arm sentence -> refuses loudly", "no longer states",

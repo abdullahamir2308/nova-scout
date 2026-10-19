@@ -591,8 +591,8 @@ nodes = [
         "notes": (
             "The fixed first-touch template (Section 9, Workflow 4, LOCKED wording, approved 2026-10-19), filled "
             "by code: the arm by lead_id (even A, odd B), the SMYKM line from the first fact the lead has "
-            "(recruiting trials, therapeutic areas, city, or none), and every formatting rule -- plural, at most "
-            "two areas in lowercase, 'Phase I to III', legal suffixes stripped, ALL-CAPS fixed, honorifics "
+            "(recruiting trials, therapeutic areas, city, or else the company line), and every formatting rule -- "
+            "plural, at most two areas in lowercase, 'from Phase I to III' / 'in Phase II', legal suffixes stripped, ALL-CAPS fixed, honorifics "
             "skipped, a role inbox greeted 'Hi there,'. No model call.\n\n"
             "Then the gate (Section 9, Workflow 5): the email approves itself unless it has no deliverable "
             "verified address, its country has no Send clock, or a domain is blocklisted -- or the operator has "

@@ -43,7 +43,7 @@ def js_rules(src):
 
 REQUIRED = ["SUBJECT_WITH_FACT", "SUBJECT_NO_FACT", "SUBJECT_FACT_TRIALS", "SUBJECT_FACT_AREAS", "SUBJECT_FACT_CITY",
             "GREETING_NAMED", "GREETING_UNNAMED", "INTRO_LINE", "SMYKM_TRIALS_A", "SMYKM_TRIALS_B", "SMYKM_AREAS_A",
-            "SMYKM_AREAS_B", "SMYKM_CITY", "PITCH_LINE", "CLOSE_A", "CLOSE_B", "SIGN_OFF", "FOLLOW_UP_1_LINE",
+            "SMYKM_AREAS_B", "SMYKM_CITY", "SMYKM_COMPANY", "PITCH_LINE", "CLOSE_A", "CLOSE_B", "SIGN_OFF", "FOLLOW_UP_1_LINE",
             "FOLLOW_UP_2_LINE"]
 
 
@@ -84,7 +84,8 @@ def smykm_block(c):
         "areas subject: " + c["SUBJECT_FACT_AREAS"],
         "city: " + c["SMYKM_CITY"],
         "city subject: " + c["SUBJECT_FACT_CITY"],
-        "none subject: " + c["SUBJECT_NO_FACT"],
+        "company: " + c["SMYKM_COMPANY"],
+        "company subject: " + c["SUBJECT_NO_FACT"],
     ])
 
 

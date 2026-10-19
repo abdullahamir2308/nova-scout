@@ -33,7 +33,7 @@ python sync_settings.py           # the operator's notification address, .env ->
 python imap_preflight.py          # read-only: IMAP works, and the warm-up state from the real Sent folder
 python dryrun/dryrun.py           # the real send path, end to end, into a scratch DB and an SMTP sink
 python dryrun/health_dryrun.py    # IMAP Health end to end: real checker, scratch DB, SMTP sink
-python dryrun/template_dryrun.py  # template outreach end to end: Drafting, Follow-Ups, Send; holds, trigger, sink
+python dryrun/template_dryrun.py  # 32 checks -- template outreach end to end: Drafting, Follow-Ups, Send; holds, trigger, retired slot, sink
 python status_now.py              # read-only: what would the send path do right now?
 ```
 
@@ -200,8 +200,13 @@ Find Due Follow-Ups -> Build Follow-Up -> Write Follow-Up      (a mark-lost row 
 - Write Follow-Up dedupes on the follow-up **number** (`follow-up-1/template/A`,
   a 2026-10 `follow-up-1/BEN-DECK.A1` and a pre-2026-10-02 bare `follow-up-1`
   are the same slot).
-- The 40 AI-composed follow-ups approved before the switch were left as they
-  were (their leads had already been emailed) and still send.
+- **A retired follow-up uses no slot.** The 41 unsent AI-composed follow-ups
+  (drafts 262–303 but the sent 299) were retired on 2026-10-19 as `rejected`
+  with the variant prefixed `retired/` — so it matches neither the
+  `follow-up-%` count nor the dedupe above, and the lead got the template
+  follow-up of the same number. A plain reject would have skipped each to #2.
+  `dryrun/template_dryrun.py` proves it on a lead whose only follow-up is its
+  retired #1.
 
 **Why every 30 minutes, not every 6 hours.** On 2026-10-02 leads 7, 91 and 104
 had gone 10 days without a follow-up against a 6-day rule. Two causes, both

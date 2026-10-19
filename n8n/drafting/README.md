@@ -10,8 +10,8 @@ them verbatim into `../workflows/drafting.json`, and the spec-drift guards parse
 
 ```
 python build_workflow.py              # regenerate the workflow JSON
-node   test_template.js               # 171 cases -- the wording, the SMYKM line, every formatting rule, the A/B split, the gate
-python test_template_mutations.py     # 52 mutations -- every template rule broken in turn; test_template.js must fail
+node   test_template.js               # 181 cases -- the wording, the SMYKM line, every formatting rule, the A/B split, the gate
+python test_template_mutations.py     # 57 mutations -- every template rule broken in turn; test_template.js must fail
 python test_drift_guards.py           # 41 cases -- each guard is made to fire
 python redraft_with_template.py       # the 2026-10-19 switch: retire AI first touches, re-queue their leads (see below)
 node   test_assemble.js               # 159 cases -- the Reply Assistant's claim rules (code_assemble.js, see below)
@@ -42,15 +42,15 @@ functions:
 |---|---|
 | Wording | Section 9's blocks, byte for byte. `template_spec.py` renders the JS constants back into the doc's block format and both builds refuse on any difference |
 | Arm | lead_id even = A, odd = B (`ARM_BY_PARITY`); the close and the SMYKM sentence follow it |
-| SMYKM line | the first fact the lead has: recruiting trials, therapeutic areas, city (`SMYKM_ORDER`); none omits the line and its blank line |
+| SMYKM line | the first fact the lead has: recruiting trials, therapeutic areas, city, else the company line, which needs only the name (`SMYKM_ORDER`; the fourth line added by the operator 2026-10-19) |
 | Trials | only the studies whose lead sponsor or a collaborator **is** the company (below); never `query.spons`' raw `totalCount` |
 | Areas | the locked taxonomy, case-insensitively, `Other` and free text dropped; at most two, lowercase, joined with "and", taxonomy order (oncology first) |
-| Phases | "Phase I to III" for a full run, "Phase I and III" for a gap, "Phase II" alone; Bioequivalence is not a phase; none drops "from {phases}" |
+| Phases | "from Phase I to III" for a full run; "in Phase II" alone and "in Phase I and III" for a gap ("from" only before a range, operator 2026-10-19); Bioequivalence is not a phase; none drops "from {phases}" |
 | Grammar | "1 trial" / "3 trials"; "an" before a vowel in "a {area1}"; an apostrophe alone after a name ending in s |
 | Company | legal forms stripped from the end (S.A., Ltd, s.r.o., GmbH, Sp. z o.o., Pvt Ltd, S.A. de C.V., Inc., LLC, …), a trailing parenthetical, Romania's leading S.C.; an ALL-CAPS name fixed unless a word is an acronym (three letters or fewer, or at most one vowel) |
 | Greeting | "Hi {first_name}," only when the address is that person's (a token overlap with the contact's name); a role inbox, an unattributed address or no name is "Hi there,"; honorifics, credentials after a comma and bare initials skipped |
 | Gate | approved by auto unless no deliverable verified address (`no-address`, `unverified-address`), no Send clock (`no-send-clock`) or a blocklisted domain (`blocklisted`) — or `settings.auto_approve_email` off |
-| Variant | `template/<arm>/<trials\|areas\|city\|none>/<named\|role-inbox\|unnamed\|unaddressed>`, hold tags after `+` |
+| Variant | `template/<arm>/<trials\|areas\|city\|company>/<named\|role-inbox\|unnamed\|unaddressed>`, hold tags after `+` |
 
 **Sites and SMOs are not drafted.** Get Draft Batch selects only
 `lead_company_type() = 'CRO'`, so a site or SMO waits at `contact_found`
@@ -105,6 +105,12 @@ until the new one is published — could act on them. `--apply` re-queues them t
 `contact_found` (and retires any AI first touch written since), and refuses until
 the published Drafting version is the template build. With no flag it changes
 nothing and says what it would do.
+
+It ran once the first template build was published (2026-10-18, 22:00–22:29
+UTC). The operator then amended the template — the `company` SMYKM line,
+"in Phase II" for a single phase — before that build had drafted any of the 30,
+so they were put back to `drafted` at 22:29:28 UTC. `--apply` now also refuses
+until the published Drafting carries the amendment (`FIX_MARKER`).
 
 ## A role inbox is not a person
 

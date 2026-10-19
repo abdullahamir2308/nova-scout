@@ -116,11 +116,40 @@ function first(over, trials) {
 }
 {
   const d = first({ therapeutic_areas: ['pharma', 'Other'], phases: [], city: '' }, 0);
-  t.check('no fact: the SMYKM line AND its blank line are omitted', d.body, [
-    'Hi there,', '', INTRO, '', PITCH, '', CLOSE_A, '', SIGN,
+  t.check('no other fact: the company line, the whole body byte for byte', d.body, [
+    'Hi there,', '', INTRO, '',
+    'Sponsors evaluating Atlant Clinical will usually start on your website, and every one of those visits is a ' +
+      'potential study worth turning into a conversation.', '',
+    PITCH, '', CLOSE_A, '', SIGN,
   ].join('\n'));
-  t.check('no fact: the subject has no fact', d.subject, 'Atlant Clinical + sponsor inquiries');
-  t.check('no fact: variant', d.variant, 'template/A/none/role-inbox');
+  t.check('no other fact: the subject has no fact', d.subject, 'Atlant Clinical + sponsor inquiries');
+  t.check('no other fact: variant', d.variant, 'template/A/company/role-inbox');
+  const b = first({ lead_id: 105, therapeutic_areas: [], phases: [], city: '' }, 0);
+  t.check('company line: one sentence for both arms', b.body.split('\n\n')[2], d.body.split('\n\n')[2]);
+  t.check('company line: arm B keeps its own close', b.body.split('\n\n')[4], 'Worth a look for Atlant Clinical?');
+  t.check('company line: variant B', b.variant, 'template/B/company/role-inbox');
+}
+{
+  const d = first({ company_name: 'MEDTRIALS S.A.', therapeutic_areas: [], phases: [], city: '' }, 0);
+  t.check('company line: the cleaned company name', d.body.split('\n\n')[2].slice(0, 41),
+    'Sponsors evaluating Medtrials will usuall');
+}
+{
+  const d = first({ phases: ['Phase II'] }, 0);
+  t.check('arm A, areas with a single phase: "in Phase II", not "from"', d.body.split('\n\n')[2],
+    'Atlant Clinical covers oncology and cardiovascular in Phase II, so sponsors visiting your website arrive ' +
+    'with very different questions, and each one is a lead worth capturing.');
+}
+{
+  const d = first({ phases: ['Phase I', 'Phase III'] }, 0);
+  t.check('arm A, areas with a gap: "in Phase I and III" -- "from" only before a range', d.body.split('\n\n')[2],
+    'Atlant Clinical covers oncology and cardiovascular in Phase I and III, so sponsors visiting your website ' +
+    'arrive with very different questions, and each one is a lead worth capturing.');
+}
+{
+  const d = first({ phases: ['Phase II', 'Phase III'] }, 0);
+  t.check('arm A, areas with a two-phase range: "from Phase II to III"', d.body.split('\n\n')[2].indexOf(
+    'Atlant Clinical covers oncology and cardiovascular from Phase II to III, so') === 0, true);
 }
 
 // --- 2. The A/B split -------------------------------------------------------------
@@ -143,7 +172,7 @@ t.check('arm B closes with "Worth a look for {company}?"',
 t.check('trials beat areas and city', F.pickSmykm({ trials: 2, areas: ['oncology'], city: 'Istanbul' }), 'trials');
 t.check('no trials -> areas', F.pickSmykm({ trials: 0, areas: ['oncology'], city: 'Istanbul' }), 'areas');
 t.check('no trials, no areas -> city', F.pickSmykm({ trials: 0, areas: [], city: 'Istanbul' }), 'city');
-t.check('nothing -> none', F.pickSmykm({ trials: 0, areas: [], city: '' }), 'none');
+t.check('nothing else -> company', F.pickSmykm({ trials: 0, areas: [], city: '' }), 'company');
 t.check('a missing count is not a trial', F.pickSmykm({ trials: null, areas: [], city: 'Rome' }), 'city');
 
 // --- 4. Formatting rules ------------------------------------------------------------
@@ -163,6 +192,9 @@ t.check('phases: a gap among three', F.formatPhases(['Phase I', 'Phase II', 'Pha
 t.check('phases: Bioequivalence alone is no phase', F.formatPhases(['Bioequivalence']), null);
 t.check('phases: lowercase and arabic numerals read too', F.formatPhases(['phase ii', 'Phase 3']), 'Phase II to III');
 t.check('phases: none', F.formatPhases(null), null);
+t.check('fill: a single phase -> "in"', F.fill('x from {phases}.', { phases: 'Phase II' }), 'x in Phase II.');
+t.check('fill: a range keeps "from"', F.fill('x from {phases}.', { phases: 'Phase I to III' }), 'x from Phase I to III.');
+t.check('fill: no phase drops "from {phases}"', F.fill('x from {phases}.', { phases: null }), 'x.');
 t.check('plural: 1 trial', F.fill('{n} trial(s)', { n: 1 }), '1 trial');
 t.check('plural: 2 trials', F.fill('{n} trial(s)', { n: 2 }), '2 trials');
 t.check('plural in the subject: 1 recruiting trial', F.fill('{n} recruiting trial(s)', { n: 1 }), '1 recruiting trial');
@@ -339,9 +371,9 @@ t.check('auto-approval off -> held, no tag (it is not about the draft)', F.gate(
     hold_reason: 'auto-approve-off: settings.auto_approve_email is off, so every email waits for a person' });
 t.check('only a literal true approves: a missing flag holds', F.gate(ctx({ auto_approve: undefined }), CLOCK_KEYS).status, 'pending');
 t.check('only a literal true verifies', F.gate(ctx({ verified: 't' }), CLOCK_KEYS).tags, ['unverified-address']);
-t.check('tags go after + in the variant', F.withTags('template/A/none/unaddressed', ['no-address', 'blocklisted']),
-  'template/A/none/unaddressed+no-address,blocklisted');
-t.check('no tags, no +', F.withTags('template/A/none/named', []), 'template/A/none/named');
+t.check('tags go after + in the variant', F.withTags('template/A/company/unaddressed', ['no-address', 'blocklisted']),
+  'template/A/company/unaddressed+no-address,blocklisted');
+t.check('no tags, no +', F.withTags('template/A/company/named', []), 'template/A/company/named');
 
 // --- 8. The node body ---------------------------------------------------------------------
 

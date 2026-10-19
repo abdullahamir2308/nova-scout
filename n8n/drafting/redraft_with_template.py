@@ -26,6 +26,13 @@ Master Ref Section 9 Workflow 4). Two steps, because of how n8n publishes:
 
 Never touched: sent drafts, follow-ups, replies, LinkedIn drafts, and every lead
 that has ever been emailed (outreach_log or the Sent-folder mirror).
+
+Run twice. --apply first ran once the first template build was published
+(2026-10-18 ~22:00-22:29 UTC); before that build had drafted any of the 30, the
+operator amended the template (a fourth SMYKM line for a lead with no other
+fact, "in Phase II" for a single phase), so the 30 were put back to 'drafted'
+at 22:29 UTC. --apply now also requires the published Drafting to carry that
+amendment (FIX_MARKER), so none of them is drafted in the superseded wording.
 """
 import json
 import subprocess
@@ -37,6 +44,9 @@ RETIRED_MARK = "retired 2026-10-19: replaced by the fixed template (Section 9, W
 # The node the template build carries and the composing build does not.
 TEMPLATE_NODE = "Build First Touch"
 COMPOSER_NODE = "Claude Draft"
+# The 2026-10-19 amendment (the company SMYKM line). A published template build
+# without it would write the superseded wording.
+FIX_MARKER = "SMYKM_COMPANY"
 
 # A first-touch email draft that is still live and is not a template draft.
 LIVE_AI_FIRST_TOUCH = """
@@ -94,10 +104,11 @@ def template_drafting_published():
     """(ok, why). Published means the version n8n activated is the template build."""
     got = rows("n8n", """SELECT w.active, w."activeVersionId" AS version,
                                 position('%s' IN h.nodes::text) > 0 AS template,
-                                position('%s' IN h.nodes::text) > 0 AS composer
+                                position('%s' IN h.nodes::text) > 0 AS composer,
+                                position('%s' IN h.nodes::text) > 0 AS amended
                            FROM workflow_entity w
                            LEFT JOIN workflow_history h ON h."versionId" = w."activeVersionId"
-                          WHERE w.id = 'drafting0001'""" % (TEMPLATE_NODE, COMPOSER_NODE))
+                          WHERE w.id = 'drafting0001'""" % (TEMPLATE_NODE, COMPOSER_NODE, FIX_MARKER))
     if not got:
         return False, "workflow drafting0001 does not exist in n8n"
     w = got[0]
@@ -106,6 +117,10 @@ def template_drafting_published():
     if w["composer"] or not w["template"]:
         return False, ("the published Drafting version %s is the model-composing build, not the template build "
                        "-- import the new drafting.json and publish it in the n8n UI first" % w["version"])
+    if not w["amended"]:
+        return False, ("the published Drafting version %s is the first template build, without the 2026-10-19 "
+                       "amendment (the company SMYKM line, 'in Phase II') -- publish the rebuilt drafting.json in "
+                       "the n8n UI first" % w["version"])
     return True, "published version %s is the template build" % w["version"]
 
 

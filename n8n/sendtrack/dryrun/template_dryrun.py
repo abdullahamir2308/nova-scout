@@ -16,7 +16,9 @@ What it proves, through n8n:
      country has no Send clock is held (no-send-clock);
   4. the trigger refuses, on the table, a model-written draft's auto-approval,
      a no-address template draft forced to auto, and a template draft for a site;
-  5. a template follow-up is written by Follow-Ups and approves itself;
+  5. a template follow-up is written by Follow-Ups and approves itself, and an
+     AI follow-up retired with the 'retired/' prefix uses no slot: the lead gets
+     template #1, not #2;
   6. Send finds every auto-approved template draft eligible, and sends a first
      touch and then the follow-up into the SMTP sink -- the three-line
      sign-off, no opt-out sentence, no phone, Re: threading on the follow-up.
@@ -31,9 +33,10 @@ novascout with every contact address rewritten to ...@dryrun.invalid and the
 operator address replaced by operator@dryrun.invalid. SMTP goes to the sink on
 127.0.0.1:2525 inside the n8n container; the dry-run credential's host is read
 back and checked before anything runs. The real novascout is only read
-(pg_dump); its fingerprint is printed before and after. In the copy, the 40
-AI-composed follow-ups approved before the switch are set aside (rejected, and
-one deleted) so Send's oldest-first pick reaches the template drafts.
+(pg_dump); its fingerprint is printed before and after. In the copy, the
+follow-ups the live Follow-Ups wrote are set aside (rejected, and lead 1748's
+deleted, leaving it only its retired AI #1) so Send's oldest-first pick reaches
+the drafts this run writes.
 
 Afterwards the scratch databases are dropped, the sink stopped and the test
 workflows deleted from n8n; --keep leaves them. Exit 1 if any expectation did
@@ -69,7 +72,7 @@ TEST_IDS = ["drafting0001t", "followup0001dry", "send0001dry"]
 # A Tuesday, 15:00 UTC: 10:00 in the USA, 12:00 in Argentina, 16:00 in Europe.
 CLOCK = "2026-10-20T15:00:00.000Z"
 NO_CLOCK_LEAD, NO_CLOCK_COUNTRY = 1917, "Atlantis"
-FOLLOW_UP_LEAD = 1748      # emailed 2026-10-09; its AI follow-up is removed in the copy only
+FOLLOW_UP_LEAD = 1748      # emailed 2026-10-09; AI #1 retired live; its template #1 is removed in the copy only
 SITE_LEAD = 3132           # a Trialsites site at contact_found
 OPT_OUT = "If this isn't relevant, reply 'no' and I won't follow up."
 SIGN_OFF = "Cheers!\nAbdullah Amir\nFounder, Amitrix Labs"
@@ -410,26 +413,34 @@ try:
     expect("a no-address template draft forced to auto is turned back into a hold",
            forced.startswith("pending | db-guard:") and "no verified deliverable address" in forced, forced)
     site_try = psql(DRY, """INSERT INTO drafts (lead_id, channel, variant, subject, body, status, approved_by)
-                           VALUES (%d, 'email', 'template/A/none/role-inbox', 's', 'b', 'approved', 'auto')
+                           VALUES (%d, 'email', 'template/A/company/role-inbox', 's', 'b', 'approved', 'auto')
                            RETURNING status || ' | ' || coalesce(hold_reason, '');""" % SITE_LEAD).strip()
     expect("a template draft for a site cannot approve itself", "not a CRO" in site_try, site_try)
     psql(DRY, "DELETE FROM drafts WHERE id > (SELECT max(id) FROM drafts) - 2 AND variant IN "
-              "('role-inbox/D1.ANG-HOURS.BEN-247.PR-BOTH.A1', 'template/A/none/role-inbox') AND subject = 's';")
+              "('role-inbox/D1.ANG-HOURS.BEN-247.PR-BOTH.A1', 'template/A/company/role-inbox') AND subject = 's';")
 
     # --- 5. a template follow-up ------------------------------------------------------------------------
-    print("\n5. Follow-Ups writes a template follow-up")
-    # In the copy only: the 40 AI follow-ups approved before the switch are set
-    # aside, and lead %d's is removed so the lead is due for its first one.
+    print("\n5. Follow-Ups writes a template follow-up; a retired AI follow-up uses no slot")
+    # Live, 2026-10-19: the 41 unsent AI follow-ups were retired -- rejected, the
+    # variant prefixed 'retired/' -- and Follow-Ups wrote each lead its template
+    # follow-up. In the copy only: lead 1748's template #1 is removed, so all it
+    # has is its retired AI #1, and every other open follow-up is set aside.
+    old = rows(DRY, "SELECT variant, status FROM drafts WHERE lead_id = %d AND variant LIKE 'retired/follow-up-%%'"
+                    % FOLLOW_UP_LEAD)
+    expect("lead %d's AI follow-up #1 is retired: rejected, variant prefixed retired/" % FOLLOW_UP_LEAD,
+           len(old) == 1 and old[0]["status"] == "rejected" and old[0]["variant"].startswith("retired/follow-up-1/"),
+           str(old))
     psql(DRY, "DELETE FROM drafts WHERE lead_id = %d AND variant LIKE 'follow-up-%%' AND status IN ('approved', 'pending');\n"
               "UPDATE drafts SET status = 'rejected', reject_reason = 'bad draft' "
-              "WHERE channel = 'email' AND status IN ('approved', 'pending') AND variant LIKE 'follow-up-%%' "
-              "AND variant NOT LIKE 'follow-up-%%/template/%%';" % FOLLOW_UP_LEAD)
+              "WHERE channel = 'email' AND status IN ('approved', 'pending') AND variant LIKE 'follow-up-%%';"
+              % FOLLOW_UP_LEAD)
     fu_max = int(psql(DRY, "SELECT max(id) FROM drafts;").strip())
     run = execute("followup0001dry")
     fus = rows(DRY, "SELECT id, lead_id, status, approved_by, variant, subject, body FROM drafts WHERE id > %d "
                     "AND variant LIKE 'follow-up-%%' ORDER BY id" % fu_max)
     mine = [f for f in fus if f["lead_id"] == FOLLOW_UP_LEAD]
-    expect("lead %d got template follow-up #1, approved by auto" % FOLLOW_UP_LEAD,
+    expect("lead %d got template follow-up #1 -- not #2: the retired AI #1 used no slot -- approved by auto"
+           % FOLLOW_UP_LEAD,
            len(mine) == 1 and mine[0]["variant"] == "follow-up-1/template/A" and mine[0]["status"] == "approved"
            and mine[0]["approved_by"] == "auto", str(mine[:1]))
     expect("every follow-up written is a template follow-up (%d written)" % len(fus),
@@ -438,6 +449,13 @@ try:
 
     # --- 6. Send ------------------------------------------------------------------------------------------
     print("\n6. Send")
+    # In the copy only: its Sent mirror is a snapshot of the live mailbox, which
+    # this run never reads, so a live send the live mirror has not seen yet
+    # (Mailbox Watch down) would make Send refuse sent-mirror-behind here.
+    unseen = psql(DRY, "UPDATE mailbox_sent SET seen_in_sent_folder = true WHERE source = 'workflow' "
+                       "AND NOT seen_in_sent_folder RETURNING message_id;").split()
+    if unseen:
+        print("     (copy only: %d live send(s) the live mirror has not seen marked seen)" % len(unseen))
     run = execute("send0001dry")
     decision = out_items(run, "Decide Send")[0]
     template_ids = {d["id"] for d in approved} | ({fu["id"]} if fu else set())
@@ -463,7 +481,8 @@ try:
         print("\n     --- sent to the sink (draft %d, lead %d) ---\n     Subject: %s\n%s\n     ---"
               % (sent_id, d["lead_id"], msg["Subject"], "\n".join("     " + ln for ln in body.split("\n"))))
     st = rows(DRY, "SELECT d.status, l.status AS lead_status, o.message_id IS NOT NULL AS confirmed FROM drafts d "
-                   "JOIN leads l ON l.id = d.lead_id JOIN outreach_log o ON o.draft_id = d.id WHERE d.id = %s" % sent_id)
+                   "JOIN leads l ON l.id = d.lead_id JOIN outreach_log o ON o.draft_id = d.id WHERE d.id = %s"
+              % sent_id) if sent_id is not None else []
     expect("the draft is sent, the lead is sent, the claim carries the sink's Message-ID",
            st and st[0] == {"status": "sent", "lead_status": "sent", "confirmed": True}, str(st))
 

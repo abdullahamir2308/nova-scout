@@ -1704,6 +1704,11 @@ FOLLOWUP_DUE_SQL = """-- Find Due Follow-Ups -- Section 9: "if no reply after N 
 -- same afternoon. A rejected follow-up still uses its slot: the reviewer
 -- decided against it, and writing another would ask again.
 --
+-- A RETIRED follow-up is not one. Its variant is prefixed 'retired/' (the 41
+-- unsent AI-composed follow-ups, 2026-10-19), so it matches neither
+-- 'follow-up-%' below nor Write Follow-Up's dedupe: it uses no slot and
+-- restarts no clock, and the lead gets the template follow-up of that number.
+--
 -- Since 2026-10-19 the follow-up is a fixed template (Section 9, Workflow 6),
 -- so each due row carries what the template and the gate need and nothing
 -- else: the first email as sent and its subject (it is quoted, and "Re:"
