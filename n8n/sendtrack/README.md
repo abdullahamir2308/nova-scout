@@ -136,8 +136,10 @@ an auto-approval, until a person enters a working address.
 - A delay is still `outcome = 'bounced'`, so it still stops that lead's
   follow-ups (unchanged; Master Ref Section 13 has it as an open decision).
 - `backfill_bounce_kind.py` does the same for bounces recorded with no kind:
-  the five from before the migration (2026-10-23), and any the old in-memory
-  Mailbox Watch records between an import and the restart.
+  the five from before the migration (2026-10-23), and any bounce an older
+  Mailbox Watch version recorded. (On n8n 2.44.6 an import stops the running
+  workflow, so there is no gap in which an old version keeps recording —
+  Mailbox Watch is simply off until it is published.)
 
 ## Claim, then send — at most once
 
