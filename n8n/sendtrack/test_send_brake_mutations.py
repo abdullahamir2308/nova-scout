@@ -3,15 +3,21 @@
     python n8n/sendtrack/test_send_brake_mutations.py
 
 Section 9, Workflow 6 (operator decision 2026-10-19), with the warm-up ceiling
-raised to 50 the same day. The brake lives in four places, and each mutation
-breaks one rule in one of them; a test must then fail:
+raised to 50 the same day; only permanent bounces count since 2026-10-24
+(migration 022). The brake lives in four places, and each mutation breaks one
+rule in one of them; a test must then fail:
 
-  * the SQL -- migration 021's send_brake_stats() and the shipped Check Brake,
-    Load Send State and Record Brake Alert -> test_send_brake_sql.py, on one
-    scratch database (a mutation that makes a statement error counts as caught:
-    the workflow would fail the tick, and the test says so);
+  * the SQL -- send_brake_stats() (made by migration 021, last replaced by 022,
+    which is the file mutated here) and the shipped Check Brake, Load Send
+    State and Record Brake Alert -> test_send_brake_sql.py, on one scratch
+    database (a mutation that makes a statement error counts as caught: the
+    workflow would fail the tick, and the test says so);
   * Decide Send (code_decide.js) -> test_decide.js;
-  * the classifier (code_classify_reply.js) -> test_mailbox.js.
+  * the classifier (code_classify_reply.js: complaints, and permanent or
+    transient) and the notification (code_notify.js) -> test_mailbox.js.
+
+Record Inbound and migration 022's contact rule have their own:
+test_hard_bounce_mutations.py.
 
 Claim Send's own refusal is a build guard (test_drift_guards.py makes it fire).
 Exits non-zero if any mutation survives, or if a suite fails unmutated.
@@ -51,6 +57,15 @@ SQL_MUTATIONS = [
     ("an alert counts only once SMTP accepted it", "record", "   AND p.r->>'error' IS NULL\n", ""),
     ("an alert stamps only the pauses it told the operator about", "record",
      " WHERE sp.id IN (SELECT (jsonb_array_elements_text(p.a->'pause_ids'))::bigint)\n", " WHERE true\n"),
+    # Migration 022 (operator decision 2026-10-24): only a permanent bounce counts.
+    ("a delay warning is not a bounce for the brake", "migration",
+     "    SELECT * FROM sends WHERE outcome = 'bounced' AND bounce_kind IS DISTINCT FROM 'transient'\n",
+     "    SELECT * FROM sends WHERE outcome = 'bounced'\n"),
+    ("an unlabelled bounce (an older Mailbox Watch) still counts", "migration",
+     "AND bounce_kind IS DISTINCT FROM 'transient'\n", "AND bounce_kind = 'permanent'\n"),
+    ("Load Send State sees the delays counted apart", "migration",
+     "    'delayed',     (SELECT count(*) FROM sends WHERE outcome = 'bounced' AND bounce_kind = 'transient'),",
+     "    'delayed',     0,"),
 ]
 
 # JS: (label, file, old, new, the suite that must fail)
@@ -87,6 +102,43 @@ JS_MUTATIONS = [
      "  const t = String(fresh || '');\n  for (let i = 0; i < COMPLAINT_PHRASES.length; i++) {",
      "  const t = String(j_raw_for_mutation || fresh || '');\n  for (let i = 0; i < COMPLAINT_PHRASES.length; i++) {",
      "test_mailbox.js"),
+    # Permanent or transient (migration 022, operator decision 2026-10-24).
+    ("a report that says it is final is permanent", "code_classify_reply.js",
+     "  if (BOUNCE_PERMANENT.some(function (re) { return re.test(t); })) return 'permanent';\n", "", "test_mailbox.js"),
+    ("a report that says it is a delay is transient", "code_classify_reply.js",
+     "  if (BOUNCE_TRANSIENT.some(function (re) { return re.test(t); })) return 'transient';\n", "", "test_mailbox.js"),
+    ("the verdict is read before the delay wording (lead 44's 421 'permanent error')", "code_classify_reply.js",
+     "  if (BOUNCE_PERMANENT.some(function (re) { return re.test(t); })) return 'permanent';\n"
+     "  if (BOUNCE_TRANSIENT.some(function (re) { return re.test(t); })) return 'transient';\n",
+     "  if (BOUNCE_TRANSIENT.some(function (re) { return re.test(t); })) return 'transient';\n"
+     "  if (BOUNCE_PERMANENT.some(function (re) { return re.test(t); })) return 'permanent';\n", "test_mailbox.js"),
+    ("any 5.x.x code is permanent, before a 4.x.x", "code_classify_reply.js",
+     "  if (classes.indexOf('5') !== -1) return 'permanent';\n  if (classes.indexOf('4') !== -1) return 'transient';\n",
+     "  if (classes.indexOf('4') !== -1) return 'transient';\n  if (classes.indexOf('5') !== -1) return 'permanent';\n",
+     "test_mailbox.js"),
+    ("a report that says neither is a failure", "code_classify_reply.js",
+     "  return 'permanent';\n}\n\nfunction classify(", "  return 'transient';\n}\n\nfunction classify(", "test_mailbox.js"),
+    ("'fatal errors' decides nothing (Zoho's delay warning lists them)", "code_classify_reply.js",
+     "const BOUNCE_PERMANENT = [\n", "const BOUNCE_PERMANENT = [\n  /\\bfatal\\s+errors?\\b/i,\n", "test_mailbox.js"),
+    ("a future 'can't be delivered' is a delay's promise, not a verdict", "code_classify_reply.js",
+     r"(?:couldn['’]t|could\s+not)\s+be\s+delivered", r"(?:couldn['’]t|could\s+not|can['’]t|cannot)\s+be\s+delivered",
+     "test_mailbox.js"),
+    ("reports wrap their text anywhere", "code_classify_reply.js",
+     r"(?:couldn['’]t|could\s+not)\s+be\s+delivered", r"(?:couldn['’]t|could not) be delivered", "test_mailbox.js"),
+    ("an IP address is not a status code", "code_classify_reply.js",
+     r"const STATUS_CODE = /(?:^|[^\d.])([245])\.\d{1,3}\.\d{1,3}(?![\d.])/g;",
+     r"const STATUS_CODE = /([245])\.\d{1,3}\.\d{1,3}/g;", "test_mailbox.js"),
+    ("only a bounce carries a kind", "code_classify_reply.js",
+     "    bounce_kind: isBounce ? bounceKind(subject, raw) : null,", "    bounce_kind: bounceKind(subject, raw),",
+     "test_mailbox.js"),
+    ("a delay is labelled DELIVERY DELAY for the operator", "code_notify.js",
+     "r.classification === 'bounce' && r.bounce_kind === 'transient' ? 'DELIVERY DELAY'", "false ? 'DELIVERY DELAY'",
+     "test_mailbox.js"),
+    ("a delay is not reported as a permanent bounce", "code_notify.js",
+     "  } else if (r.classification === 'bounce' && r.bounce_kind === 'transient') {",
+     "  } else if (false) {", "test_mailbox.js"),
+    ("the operator is told whether the contact was unverified", "code_notify.js",
+     "    lines.push(r.contact_unverified\n", "    lines.push(true\n", "test_mailbox.js"),
 ]
 
 

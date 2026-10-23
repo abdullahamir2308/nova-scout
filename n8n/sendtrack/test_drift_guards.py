@@ -585,6 +585,20 @@ case("a Code node carries a literal email address -> refuses", "literal email ad
 case("Record Inbound stops returning the operator address -> refuses", "does not produce",
      mutate_file=("build_workflow.py", lambda s: s.replace(
          "AS operator_email\n  FROM p", "AS operator_address\n  FROM p", 1)))
+
+# --- permanent and transient bounces (migration 022, operator decision 2026-10-24) ---
+case("Record Inbound stops storing the bounce kind on the bounce row -> refuses", "no permanent bounce would unverify",
+     mutate_file=("build_workflow.py", lambda s: s.replace("THEN p.p->>'bounce_kind' END", "THEN NULL END", 1)))
+case("Record Inbound lets a delay warning downgrade a permanent bounce on the send -> refuses", "downgrade a permanent",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "                            WHEN o.bounce_kind = 'permanent' THEN 'permanent'\n", "", 1)))
+case("the classifier stops emitting the bounce kind Record Inbound reads -> refuses", "never emits",
+     mutate_file=("code_classify_reply.js", lambda s: s.replace(
+         "    bounce_kind: isBounce ? bounceKind(subject, raw) : null,\n", "", 1)))
+case("the notification reads a bounce field Record Inbound does not return -> refuses", "does not produce",
+     mutate_file=("code_notify.js", lambda s: s.replace("r.contact_unverified", "r.contact_flagged", 1)))
+case("Section 8 drops outreach_log.bounce_kind, which Record Inbound writes -> refuses", "Section 8 does not define",
+     mutate_doc=lambda d: d.replace("reply_body, outcome,\n  bounce_kind (permanent|transient)", "reply_body, outcome", 1))
 case("Normalise Sent reads a field Load Settings does not return -> refuses", "does not produce",
      mutate_file=("code_mirror_sent.js", lambda s: s.replace("settings.operator_email", "settings.operator", 1)))
 case("Normalise Sent reads its messages from a node that is not there -> refuses", "no node named",

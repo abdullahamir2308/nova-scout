@@ -86,8 +86,9 @@ t.check('the shipped node body: messages from the trigger, the address from Load
 
 // --- inbound classification -----------------------------------------------------
 const CLASSIFY = path.join(__dirname, 'code_classify_reply.js');
-const { classify, freshText, optOutKeyword } = extractFunctions(
-  CLASSIFY, '// Node body', ['classify', 'freshText', 'optOutKeyword'], ownDomain);
+const { classify, freshText, optOutKeyword, bounceKind, BOUNCE_PERMANENT, BOUNCE_TRANSIENT, STATUS_CODE } = extractFunctions(
+  CLASSIFY, '// Node body',
+  ['classify', 'freshText', 'optOutKeyword', 'bounceKind', 'BOUNCE_PERMANENT', 'BOUNCE_TRANSIENT', 'STATUS_CODE'], ownDomain);
 
 const OURS = 'Hello,\n\nYour site lists oncology work. Nova is an assistant trained on your own SOPs.\n\n' +
   OPT + '\n\nAbdullah Amir\nFounder, Amitrix Labs';
@@ -160,6 +161,91 @@ const ndr = classify(inbound(
 t.check('a bounce is a bounce, found by sender and subject', ndr.classification, 'bounce');
 t.check("... and carries the original Message-ID from the NDR body, to match the send", ndr.thread_ids, ['<a1b2c3@amitrixlabs.com>']);
 t.check('... and the failed address, never our own', ndr.mentioned_addrs, ['hello@klixar.com']);
+t.check('... and is a permanent one ("failed permanently")', ndr.bounce_kind, 'permanent');
+t.check('anything but a bounce carries no bounce kind', classify(inbound('Tell me more.')).bounce_kind, null);
+
+// --- permanent or transient (operator decision 2026-10-24, migration 022) --------
+// Only a permanent bounce counts toward the Send safety brake, and a permanent
+// one unverifies the contact. The first five are the wording of the five real
+// bounces in inbound_messages (addresses swapped for .example ones).
+const ZOHO = 'Mail Delivery Subsystem <mailer-daemon@mail.zoho.com>';
+const bounce = (subject, text, from) => classify(inbound(text, { from: from || ZOHO, subject: subject },
+  { 'in-reply-to': '', references: '' }));
+const ZOHO_DELAY = 'This message was created automatically by mail delivery system.\n\nTHIS IS A WARNING MESSAGE ONLY.\n\n' +
+  'YOU DO NOT NEED TO RESEND YOUR MESSAGE.\n\nThe original message was received at Tue, 06 Oct 2026 04:45:38 -0700\n' +
+  ' from abdullah@amitrixlabs.com [abdullah@amitrixlabs.com] \n\n    ----- The following addresses had fatal errors -----    \n' +
+  '   [info@cro-a.example]\n\nMessage will be retried for 4 more day(s)';
+const ZOHO_FINAL = (line) => 'This message was created automatically by mail delivery software.\n A message that you sent could ' +
+  'not be delivered to one or more of its recipients. This is a permanent error. \n\n' + line;
+[
+  ['Zoho delay warning (lead 44, 2026-10-06): "fatal errors" yet retried for 4 more days',
+    'Mail Delivery Status Notification (Delay)', ZOHO_DELAY, null, 'transient'],
+  ['Zoho final report (lead 44, 2026-10-10): an SMTP 421 the report itself calls permanent',
+    'Undelivered Mail Returned to Sender', ZOHO_FINAL('info@cro-a.example, ERROR CODE :421 - Host not reachable.'), null, 'permanent'],
+  ['Zoho final report (lead 1378): 550 5.4.1',
+    'Undelivered Mail Returned to Sender', ZOHO_FINAL('someone@cro-b.example, ERROR CODE :550 - 5.4.1 Recipient address ' +
+      'rejected: Access denied. For more information see https://aka.ms/EXOSmtpErrors [OS3PEPF0000003D.JPNP286.PROD.OUTLOOK.COM ' +
+      '2026-10-09T00:30:56.592Z 08DF25390417C375]'), null, 'permanent'],
+  ['Office 365 NDR (lead 16): "couldn\'t be delivered", no code in the readable part',
+    'Undeliverable: Oncology and metabolic disorders', 'Your message to office@cro-c.example couldn\'t be delivered.\n' +
+      'office wasn\'t found at cro-c.example.\nAction Required                 Recipient\nUnknown To address',
+    'postmaster@cro-c.example', 'permanent'],
+  ['Gmail delay: "temporary problem", and its "if the delivery fails permanently" is a promise, not a verdict',
+    'Delivery Status Notification (Delay)', 'Delivery incomplete\n\nThere was a temporary problem delivering your message ' +
+      'to someone@cro-d.example. Gmail will retry for 46 more hours. You\'ll be notified if the delivery fails permanently.',
+    'Mail Delivery Subsystem <mailer-daemon@googlemail.com>', 'transient'],
+  ['Gmail failure: "Address not found"',
+    'Delivery Status Notification (Failure)', 'Address not found\n\nYour message wasn\'t delivered to someone@cro-d.example ' +
+      'because the address couldn\'t be found, or is unable to receive mail.\n\nThe response was:\n\n550 5.1.1 The email ' +
+      'account that you tried to reach does not exist.', 'Mail Delivery Subsystem <mailer-daemon@googlemail.com>', 'permanent'],
+  ['Exchange delay: its "if the message can\'t be delivered by that time" is a promise too',
+    'Delivery delayed:Klixar + sponsor inquiries', 'Delivery is delayed to these recipients or groups:\n\nsomeone@cro-e.example\n\n' +
+      'This message hasn\'t been delivered yet. Delivery will continue to be attempted.\n\nThe server will keep trying to ' +
+      'deliver this message for the next 1 days, 19 hours and 51 minutes. You\'ll be notified if the message can\'t be ' +
+      'delivered by that time.', 'postmaster@cro-e.example', 'transient'],
+  ['Postfix delay: "THIS IS A WARNING ONLY"',
+    'Delayed Mail (still being retried)', '####### THIS IS A WARNING ONLY.  YOU DO NOT NEED TO RESEND YOUR MESSAGE. #######\n\n' +
+      'Delivery to the following recipient has been delayed:\n\n    someone@cro-f.example\n\nReporting-MTA: dns; mx.example\n' +
+      'Action: delayed\nStatus: 4.4.1', 'MAILER-DAEMON@mx.example', 'transient'],
+  ['Postfix final after giving up on a 4.x.x: the verdict ("could not be delivered", wrapped) beats its "Temporary failure"',
+    'Undelivered Mail Returned to Sender', "I'm sorry to have to inform you that your message could not\nbe delivered to " +
+      'one or more recipients.\n\n<someone@cro-f.example>: host mx.cro-f.example said: 451 4.3.0 Temporary failure, ' +
+      'please try again later', 'MAILER-DAEMON@mx.example', 'permanent'],
+  ['RFC 3464 fields alone: Action: failed with a 4.4.7 (gave up) is permanent',
+    'Returned mail', 'Final-Recipient: rfc822; someone@cro-g.example\nAction: failed\nStatus: 4.4.7', null, 'permanent'],
+  ['RFC 3464 fields alone: Action: delayed is transient',
+    'Returned mail', 'Final-Recipient: rfc822; someone@cro-g.example\nAction: delayed\nStatus: 4.4.1', null, 'transient'],
+  ['no wording, a 5.x.x code -> permanent', 'Returned mail', "Remote Server returned '550 5.1.10 RESOLVER.ADR.RecipientNotFound'",
+    null, 'permanent'],
+  ['no wording, only a 4.x.x code -> transient', 'Returned mail', 'Remote server said: 452 4.2.2 Mailbox full', null, 'transient'],
+  ['no wording, a 4.x.x and then a 5.x.x -> permanent: any 5.x.x decides',
+    'Returned mail', 'First attempt: 421 4.4.2 timeout.\nLast attempt: 550 5.1.1 User unknown', null, 'permanent'],
+  ['an IP address is not a status code: 10.5.1.1 beside a 4.x.x stays transient', 'Returned mail',
+    'Connected to 10.5.1.1; it said 421 4.4.2 timeout', null, 'transient'],
+  ['no wording and no code at all -> permanent (a delay always says it is one; the brake errs towards pausing)',
+    'Undelivered Mail Returned to Sender', 'The mail system\n\n<someone@cro-h.example>: host mx.cro-h.example refused to talk to me',
+    'MAILER-DAEMON@mx.example', 'permanent'],
+].forEach(([label, subject, text, from, want]) => t.check(label, bounce(subject, text, from).bounce_kind, want));
+
+// Our own email rides along in many reports. Its words must never decide: the
+// three LOCKED templates (Section 9), quoted, change no verdict.
+const TEMPLATES = '> We have yet to be properly introduced, but I\'m Abdullah Amir and I\'m the Founder of Amitrix Labs.\n' +
+  '> That\'s precisely what we do at Amitrix Labs. We build AI agents for CRO websites that answer sponsor and visitor ' +
+  'questions, collect their details, and turn more of your visitors into qualified leads, so you win more studies.\n' +
+  '> Do you have time over the next week or two to learn more? Let me know what works for you, and I\'ll send a ' +
+  'calendar invite along accordingly.\n> Just bringing this back to the top of your inbox in case it got buried. Every ' +
+  'sponsor who visits Klixar\'s website is a potential study, and we help make sure those visits turn into conversations.\n' +
+  '> I\'ll keep this short and won\'t follow up again after this. If turning more of Klixar\'s website visitors into ' +
+  'qualified leads is ever on your list, just reply and I\'ll send over the details.\n> Cheers!\n> Abdullah Amir';
+STATUS_CODE.lastIndex = 0;
+t.check('our quoted templates hold no bounce wording of either kind, and no status code',
+  [BOUNCE_PERMANENT.filter((re) => re.test(TEMPLATES)).map(String), BOUNCE_TRANSIENT.filter((re) => re.test(TEMPLATES)).map(String),
+    STATUS_CODE.test(TEMPLATES)], [[], [], false]);
+STATUS_CODE.lastIndex = 0;
+t.check('... so a delay quoting them stays a delay',
+  bounce('Mail Delivery Status Notification (Delay)', ZOHO_DELAY + '\n\n' + TEMPLATES).bounce_kind, 'transient');
+t.check('... and a bare 5.x.x quoting them stays permanent',
+  bounce('Returned mail', '550 5.1.1 User unknown\n\n' + TEMPLATES).bounce_kind, 'permanent');
 
 // --- spam complaints: the Send safety brake (Section 9, operator decision 2026-10-19) ---
 const complaint = (text, over, meta) => {
@@ -308,6 +394,20 @@ t.check('the address is trimmed and lower-cased', note({ operator_email: ' Ops@E
 t.check('a message already recorded once -> no second notification', note({ notify: false }).notify, false);
 n = note({ classification: 'reply', opt_out_keyword: null });
 t.check('a plain reply is labelled REPLY', [n.subject, /follow-ups are stopped/.test(n.text)], ['[Nova Scout] REPLY from KLIXAR', true]);
+
+// Bounces by kind (migration 022): the operator is told which one it was, and
+// whether the contact was unverified.
+n = note({ classification: 'bounce', opt_out_keyword: null, bounce_kind: 'permanent', contact_unverified: true });
+t.check('a permanent bounce: labelled BOUNCE, counted by the brake, the contact unverified',
+  [n.subject, /bounced permanently/.test(n.text), /counts toward the safety brake/.test(n.text),
+    /now marked unverified \(contacts\.verified = false\)/.test(n.text)], ['[Nova Scout] BOUNCE from KLIXAR', true, true, true]);
+n = note({ classification: 'bounce', opt_out_keyword: null, bounce_kind: 'permanent', contact_unverified: false });
+t.check('... and when the bounce does not name the address on file, it says the contact was not changed',
+  [/was not changed/.test(n.text), /now marked unverified/.test(n.text)], [true, false]);
+n = note({ classification: 'bounce', opt_out_keyword: null, bounce_kind: 'transient', contact_unverified: false });
+t.check('a delay warning: labelled DELIVERY DELAY, not counted by the brake, contact untouched',
+  [n.subject, /does not count toward the safety brake/.test(n.text), /unverified/.test(n.text)],
+  ['[Nova Scout] DELIVERY DELAY from KLIXAR', true, false]);
 
 // --- notification content: reply text, the positive/neutral flag, and assets ----
 n = note({ classification: 'reply', opt_out_keyword: null, body_excerpt: 'Yes, sounds great -- send it over.',

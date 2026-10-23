@@ -1151,7 +1151,7 @@ hit AS (
 ins AS (
   INSERT INTO inbound_messages (message_id, received_at, from_addr, subject, lead_id, matched_by,
                                 classification, opt_out_keyword, body_excerpt,
-                                in_reply_to, references_raw, thread_ids, spam_complaint)
+                                in_reply_to, references_raw, thread_ids, spam_complaint, bounce_kind)
   SELECT p.p->>'message_id', (p.p->>'received_at')::timestamptz, p.p->>'from_addr', p.p->>'subject',
          (SELECT lead_id FROM hit), (SELECT how FROM hit),
          CASE WHEN (SELECT lead_id FROM hit) IS NULL THEN 'unmatched' ELSE p.p->>'classification' END,
@@ -1163,10 +1163,15 @@ ins AS (
          coalesce(ARRAY(SELECT jsonb_array_elements_text(p.p->'thread_ids')), '{}'),
          -- Migration 021: a spam complaint pauses Send (Workflow 6, the brake),
          -- matched to a lead or not -- "any spam complaint".
-         coalesce((p.p->>'spam_complaint')::boolean, false)
+         coalesce((p.p->>'spam_complaint')::boolean, false),
+         -- Migration 022: permanent or transient, on a bounce matched to a lead
+         -- (an unmatched one is no send's bounce). A permanent one fires the
+         -- table's trigger, which unverifies the contact the bounce names.
+         CASE WHEN (SELECT lead_id FROM hit) IS NOT NULL AND p.p->>'classification' = 'bounce'
+              THEN p.p->>'bounce_kind' END
     FROM p
   ON CONFLICT (message_id) DO NOTHING
-  RETURNING lead_id, classification, received_at
+  RETURNING lead_id, classification, received_at, bounce_kind, thread_ids
 ),
 last_send AS (
   SELECT o.id
@@ -1187,7 +1192,12 @@ logged AS (
                         WHEN 'opt-out' THEN 'opt-out:' || (p.p->>'opt_out_keyword')
                         WHEN 'reply'   THEN coalesce(o.outcome, 'replied')
                         WHEN 'bounce'  THEN 'bounced'
-                        ELSE o.outcome END
+                        ELSE o.outcome END,
+         -- Migration 022: the send's bounce kind, which the brake counts by. A
+         -- permanent report sticks -- a later delay warning cannot downgrade it.
+         bounce_kind = CASE WHEN i.classification <> 'bounce' THEN o.bounce_kind
+                            WHEN o.bounce_kind = 'permanent' THEN 'permanent'
+                            ELSE i.bounce_kind END
     FROM ins i, p
    WHERE o.id = (SELECT id FROM last_send)
      AND i.classification IN ('reply', 'opt-out', 'bounce')
@@ -1242,6 +1252,13 @@ SELECT ((SELECT count(*) FROM ins) = 1
        p.p->>'body_excerpt'                                                     AS body_excerpt,
        coalesce((SELECT array_agg(domain ORDER BY domain) FROM blocked), '{}')  AS blocklisted,
        (SELECT lead_id FROM ins)                                                AS lead_id,
+       -- Migration 022: what the bounce is, and whether the trigger on the table
+       -- unverifies the contact for it. The same function decides both; the write
+       -- of the trigger lands after the snapshot this SELECT reads.
+       (SELECT bounce_kind FROM ins)                                            AS bounce_kind,
+       coalesce((SELECT i.bounce_kind = 'permanent' AND c.verified
+                        AND bounce_names_address(i.thread_ids, p.p->>'body_excerpt', c.email)
+                   FROM ins i), false)                                          AS contact_unverified,
        (SELECT count(*) FROM logged)::int                                       AS outreach_updated,
        (SELECT count(*) FROM advanced)::int                                     AS lead_updated,
        (SELECT value FROM settings WHERE key = 'operator_email')                AS operator_email
@@ -2356,6 +2373,19 @@ _assert_js_emits("Mirror Sent", _sql_payload_reads(MIRROR_SQL) | set(re.findall(
                  _mirror, "code_mirror_sent.js")
 _classify = js("code_classify_reply.js")
 _assert_js_emits("Record Inbound", _sql_payload_reads(RECORD_INBOUND_SQL), _classify, "code_classify_reply.js")
+# Migration 022 (operator decision 2026-10-24): only a permanent bounce counts
+# toward the brake, and a permanent one unverifies the contact. Record Inbound is
+# what carries the classifier's kind onto the bounce row (which fires the
+# contact trigger) and onto the send (which the brake counts by) -- drop either
+# and every bounce silently counts, or no contact is ever unverified.
+assert re.search(r"thread_ids, spam_complaint, bounce_kind\)", RECORD_INBOUND_SQL) and \
+    "THEN p.p->>'bounce_kind' END" in RECORD_INBOUND_SQL, (
+    "Record Inbound no longer stores the bounce kind on inbound_messages (migration 022) -- no permanent bounce would "
+    "unverify its contact")
+assert re.search(r"bounce_kind = CASE WHEN i\.classification <> 'bounce' THEN o\.bounce_kind\s+"
+                 r"WHEN o\.bounce_kind = 'permanent' THEN 'permanent'\s+ELSE i\.bounce_kind END", RECORD_INBOUND_SQL), (
+    "Record Inbound no longer writes the bounce kind onto the send, permanent sticking (migration 022) -- the brake "
+    "would count delay warnings again, or a delay would downgrade a permanent bounce")
 _detect_signal = js("code_detect_signal.js")
 _assert_wired("Detect Positive Signal (r.*)", _reads(_detect_signal, "r"), final_select_aliases(RECORD_INBOUND_SQL),
               "Record Inbound")

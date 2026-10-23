@@ -55,15 +55,27 @@ function operatorAddress(r) {
 
 function notification(r) {
   const to = operatorAddress(r);
-  const what = LABEL[r.classification] || str(r.classification).toUpperCase();
+  const what = r.classification === 'bounce' && r.bounce_kind === 'transient' ? 'DELIVERY DELAY'
+    : LABEL[r.classification] || str(r.classification).toUpperCase();
   const who = str(r.company_name) || str(r.domain) || str(r.from_addr);
   const lines = [];
   if (r.classification === 'opt-out') {
     const blocked = Array.isArray(r.blocklisted) && r.blocklisted.length ? r.blocklisted.join(', ') : 'nothing new (already listed)';
     lines.push('Opt-out detected -- matched "' + str(r.opt_out_keyword) + '". Blocklisted: ' + blocked + '.');
     lines.push('Nothing more will be sent to this domain. If they did not mean it, delete the row from `blocklist` by hand.');
+  } else if (r.classification === 'bounce' && r.bounce_kind === 'transient') {
+    // Migration 022: a delay warning. Not counted by the safety brake -- but it is
+    // still a bounce on the send, so the follow-ups stop as before.
+    lines.push('Delivery delayed: the receiving server has not accepted the message yet and says it will keep trying. ' +
+      'This does not count toward the safety brake. Its follow-ups are stopped; if a final failure follows, it ' +
+      'arrives as its own notification.');
   } else if (r.classification === 'bounce') {
-    lines.push('A send to this lead bounced. Its follow-ups are stopped; the contact address needs checking.');
+    lines.push('A send to this lead bounced permanently. Its follow-ups are stopped, and it counts toward the safety brake.');
+    lines.push(r.contact_unverified
+      ? 'The contact address is now marked unverified (contacts.verified = false), so nothing for this lead approves ' +
+        'itself or sends until a person enters a working address and sets it verified.'
+      : 'The contact on file was not changed: this bounce does not name its address (or it was already unverified) -- ' +
+        'check it by hand.');
   } else {
     lines.push('A lead replied. Its follow-ups are stopped and it is in the replied_queue view in NocoDB.');
   }

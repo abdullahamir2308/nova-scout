@@ -23,7 +23,10 @@ What it proves, through n8n:
      touch and then the follow-up into the SMTP sink -- the three-line
      sign-off, no opt-out sentence, no phone, Re: threading on the follow-up;
   7. the safety brake (Section 9, operator decision 2026-10-19; migration 021):
-     a bounce rate over 3% pauses Send, the operator gets exactly one alert in
+     a delay warning, through the shipped classifier and Record Inbound, does
+     not count (migration 022, 2026-10-24); its final report does, unverifies
+     the contact, and takes the bounce rate over 3%, which pauses Send, the
+     operator gets exactly one alert in
      the sink, nothing goes to a prospect, Claim Send refuses on the table too;
      clearing the pause resumes Send; then a spam complaint -- a real reply run
      through the shipped classifier and Record Inbound -- pauses it again.
@@ -70,7 +73,7 @@ SENDTRACK = os.path.dirname(HERE)
 DRAFTING = os.path.join(SENDTRACK, "..", "drafting")
 REPO = os.path.abspath(os.path.join(SENDTRACK, "..", ".."))
 MIGRATIONS = [os.path.join(REPO, "postgres", "migrations", m)
-              for m in ("020_template_outreach.sql", "021_send_brake.sql")]
+              for m in ("020_template_outreach.sql", "021_send_brake.sql", "022_hard_bounces.sql")]
 N8N = "nova-scout-n8n-1"
 PG = "nova-scout-postgres-1"
 PGUSER = "novascout"
@@ -571,13 +574,48 @@ try:
     spare = [d["id"] for d in approved if d["id"] != sent_id]
     psql(DRY, "UPDATE drafts SET status = 'approved', approved_by = 'auto', reject_reason = NULL "
               "WHERE id IN (%s) AND status = 'rejected';" % ",".join(map(str, spare)))
-    # One bounce, on a send already in the window before this run -- so clearing the
-    # pause (at the real clock, which is before the dry-run clock) leaves it behind.
+    # One bounce, on a send already in the window before the dry-run clock -- so
+    # clearing the pause just before that clock leaves it behind. Every time in this
+    # section is anchored to CLOCK, never to now(): CLOCK was in the future when this
+    # was written (2026-10-19) and is in the past now, and a real send made after it
+    # (2026-10-23) is outside the window as of CLOCK.
     bounced = rows(DRY, "SELECT o.id, o.lead_id FROM outreach_log o WHERE o.channel = 'email' AND o.message_id IS NOT NULL "
-                        "AND o.sent_at >= timestamptz '%s' - interval '3 days' AND o.sent_at < now() "
-                        "ORDER BY o.sent_at DESC LIMIT 1" % CLOCK)
-    psql(DRY, "UPDATE outreach_log SET outcome = 'bounced' WHERE id = %d;" % bounced[0]["id"])
+                        "AND o.sent_at >= timestamptz '%s' - interval '3 days' AND o.sent_at < timestamptz '%s' "
+                        "ORDER BY o.sent_at DESC LIMIT 1" % (CLOCK, CLOCK))
+    # The bounce arrives as mail (migration 022, operator decision 2026-10-24): first
+    # Zoho's delay warning, which must not count, then its final report -- lead 44's
+    # "421 Host not reachable" that the report calls permanent -- which must. Both
+    # through the shipped classifier and the shipped Record Inbound.
+    record = [n for n in load("shipped", "mailbox-watch.json")["nodes"] if n["name"] == "Record Inbound"][0]["parameters"]["query"]
+    staged = rows(DRY, "SELECT o.message_id, c.id AS contact_id, c.email FROM outreach_log o "
+                       "JOIN contacts c ON c.lead_id = o.lead_id WHERE o.id = %d" % bounced[0]["id"])[0]
+
+    def dsn(subject, text, mid):
+        return {"from": "Mail Delivery Subsystem <mailer-daemon@mail.zoho.com>", "to": "abdullah@amitrixlabs.com",
+                "subject": subject, "date": "Tue, 20 Oct 2026 14:00:00 +0000",
+                "textPlain": text + "\n\nOriginal message headers:\nMessage-ID: " + staged["message_id"], "textHtml": "",
+                "metadata": {"message-id": mid, "in-reply-to": "", "references": ""}}
+
+    delay = classify_js(dsn("Mail Delivery Status Notification (Delay)",
+                            "THIS IS A WARNING MESSAGE ONLY.\n\nYOU DO NOT NEED TO RESEND YOUR MESSAGE.\n\n"
+                            "   [%s]\n\nMessage will be retried for 4 more day(s)" % staged["email"], "<delay-dryrun-1@zoho>"))
+    psql(DRY, bind(record, [json.dumps(delay)]))
     stats = json.loads(psql(DRY, "SELECT send_brake_stats(timestamptz '%s', 3);" % CLOCK).strip())
+    kept = rows(DRY, "SELECT verified FROM contacts WHERE id = %d" % staged["contact_id"])[0]["verified"]
+    expect("a delay warning on that send (classified %s): not counted by the brake (%d bounced, %d delayed), contact kept"
+           % (delay["bounce_kind"], stats["bounced"], stats["delayed"]),
+           delay["bounce_kind"] == "transient" and [stats["bounced"], stats["delayed"]] == [0, 1] and kept is True,
+           json.dumps(stats))
+    final = classify_js(dsn("Undelivered Mail Returned to Sender",
+                            "A message that you sent could not be delivered to one or more of its recipients. "
+                            "This is a permanent error.\n\n%s, ERROR CODE :421 - Host not reachable." % staged["email"],
+                            "<final-dryrun-1@zoho>"))
+    psql(DRY, bind(record, [json.dumps(final)]))
+    stats = json.loads(psql(DRY, "SELECT send_brake_stats(timestamptz '%s', 3);" % CLOCK).strip())
+    kept = rows(DRY, "SELECT verified FROM contacts WHERE id = %d" % staged["contact_id"])[0]["verified"]
+    expect("... then its final report (an SMTP 421 it calls %s): the send now counts, and the contact is unverified"
+           % final["bounce_kind"], final["bounce_kind"] == "permanent" and stats["bounced"] == 1 and kept is False,
+           json.dumps(stats))
     print("     window as of the dry-run clock: %d sends, %d bounced (%.1f%%)"
           % (stats["sends"], stats["bounced"], 100.0 * stats["bounced"] / max(1, stats["sends"])))
     expect("the copy is over the line: 1 bounce in %d sends is more than 3%%" % stats["sends"],
@@ -629,8 +667,12 @@ try:
     expect("Claim Send refuses the draft while the pause is open (claimed=%s), and it stays approved" % claim.get("claimed"),
            claim.get("claimed") == "f" and still == "approved", json.dumps(claim))
 
-    # The operator clears it. Send resumes on the next tick.
-    psql(DRY, "UPDATE send_pauses SET cleared_at = now(), cleared_note = 'dry run: reviewed' WHERE cleared_at IS NULL;")
+    # The operator clears it -- a minute before the dry-run clock, after the bounce it
+    # reviewed (tripped_at moved before it too: Check Brake stamped the real now()).
+    # Send resumes on the next tick.
+    psql(DRY, "UPDATE send_pauses SET tripped_at = timestamptz '%s' - interval '2 minutes', "
+              "cleared_at = timestamptz '%s' - interval '1 minute', cleared_note = 'dry run: reviewed' "
+              "WHERE cleared_at IS NULL;" % (CLOCK, CLOCK))
     run = execute("send0001dry")
     decision = out_items(run, "Decide Send")[0]
     log3 = sink_log()
@@ -655,6 +697,9 @@ try:
     mw = load("shipped", "mailbox-watch.json")
     record = [n for n in mw["nodes"] if n["name"] == "Record Inbound"][0]["parameters"]["query"]
     psql(DRY, bind(record, [json.dumps(payload)]))
+    # Recorded at the real now(); the brake counts complaints as of the dry-run clock.
+    psql(DRY, "UPDATE inbound_messages SET processed_at = timestamptz '%s' - interval '30 seconds' "
+              "WHERE message_id = '<complaint-dryrun-1@cro.example>';" % CLOCK)
     got = rows(DRY, "SELECT lead_id, classification, spam_complaint, matched_by FROM inbound_messages "
                     "WHERE message_id = '<complaint-dryrun-1@cro.example>'")
     expect("Record Inbound stores it matched to the lead, spam_complaint true",

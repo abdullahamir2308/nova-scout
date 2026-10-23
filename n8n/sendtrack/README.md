@@ -21,7 +21,7 @@ parses the Master Ref and refuses to run when code and doc disagree.
 python build_workflow.py          # regenerate the five workflow JSONs
 node   test_decide.js             # 90 cases -- the send decision and every guard in it, the 50/day ceiling, the brake
 node   test_send_result.js        # 21 cases -- what happens after the SMTP call
-node   test_mailbox.js            # 103 cases -- Sent mirror, reply classification, spam complaints, positive-signal flag, notification
+node   test_mailbox.js            # 127 cases -- Sent mirror, reply classification, spam complaints, permanent/transient bounces, positive-signal flag, notification
 node   test_followup.js           # 22 cases -- template follow-ups: rows to drafts, the gate's holds, sendable by construction
 node   test_digest.js             # 29 cases -- the Daily Digest: when it is due, what it says
 python test_followup_mutations.py # breaks each follow-up rule in turn; test_followup.js must fail every time
@@ -29,20 +29,24 @@ node   test_health.js             # 33 cases -- IMAP Health: problems, when it a
 python test_imap_health.py        # 21 cases -- the checker's answer; Message-ID parity with Mailbox Watch
 python test_health_sql.py         # 10 cases -- the shipped Load Health State SQL on a scratch schema copy: what is missed
 python test_health_sql_mutations.py # 9 mutations -- each rule of that query broken in turn; test_health_sql.py must fail
-python test_send_brake_sql.py     # 22 cases -- the safety brake's shipped SQL + migration 021 on a scratch schema copy
-python test_send_brake_mutations.py # 25 mutations -- each brake rule broken (SQL, Decide Send, classifier); a test must fail
-python test_drift_guards.py       # 115 cases -- each spec/wiring guard is made to fire
+python test_send_brake_sql.py     # 27 cases -- the safety brake's shipped SQL + migration 022's send_brake_stats() on a scratch schema copy
+python test_send_brake_mutations.py # 41 mutations -- each brake rule broken (SQL, Decide Send, classifier, notification); a test must fail
+python test_hard_bounce_sql.py    # 27 cases -- migration 022: shipped classifier + Record Inbound + trigger + backfill on a scratch schema copy
+python test_hard_bounce_mutations.py # 17 mutations -- each rule of Record Inbound / migration 022 broken; test_hard_bounce_sql.py must fail
+python test_drift_guards.py       # 120 cases -- each spec/wiring guard is made to fire
+python backfill_bounce_kind.py    # classify bounces recorded with no kind (dry run; --apply in one transaction)
 python provision_credentials.py   # n8n SMTP/IMAP credentials from .env (+ the two dry-run ones)
 python sync_settings.py           # the operator's notification address, .env -> the settings table
 python imap_preflight.py          # read-only: IMAP works, and the warm-up state from the real Sent folder
 python dryrun/dryrun.py           # the real send path, end to end, into a scratch DB and an SMTP sink
 python dryrun/health_dryrun.py    # IMAP Health end to end: real checker, scratch DB, SMTP sink
-python dryrun/template_dryrun.py  # 48 checks -- template outreach end to end: Drafting, Follow-Ups, Send; holds, trigger, retired slot, the brake, sink
+python dryrun/template_dryrun.py  # 50 checks -- template outreach end to end: Drafting, Follow-Ups, Send; holds, trigger, retired slot, delay vs final bounce, the brake, sink
 python status_now.py              # read-only: what would the send path do right now?
 ```
 
 Migrations `postgres/migrations/007_send_and_track.sql`, `008_settings.sql`,
-`009_mailbox_health.sql`, `014_auto_approval.sql` and `020_template_outreach.sql` must be applied first, `sync_settings.py` run once, and
+`009_mailbox_health.sql`, `014_auto_approval.sql`, `020_template_outreach.sql`, `021_send_brake.sql` and
+`022_hard_bounces.sql` must be applied first, `sync_settings.py` run once, and
 the `imap-health` service running (`docker compose up -d imap-health`).
 
 ## The warm-up ceiling belongs to the mailbox
@@ -107,6 +111,33 @@ complaint arrives, Send pauses and the operator is alerted.**
   reply drafted — and flagged.
 
 `status_now.py` prints the brake's numbers and any open pause.
+
+### Permanent or transient (operator decision 2026-10-24, migration 022)
+
+Only a **permanent** bounce counts toward the 3%, and a permanent bounce marks
+the contact it bounced from **unverified** — so Drafting's and Follow-Ups' gate
+hold anything new for it, Send refuses it, and migration 020's trigger refuses
+an auto-approval, until a person enters a working address.
+
+- `bounceKind()` in Classify Inbound reads the report's subject and whole text:
+  a final verdict ("This is a permanent error", `Action: failed`, "couldn't be
+  delivered") → permanent; a delay ("WARNING MESSAGE ONLY", "will be retried",
+  `Action: delayed`) → transient; then status codes (any 5.x.x permanent, else
+  4.x.x transient); neither → permanent. **The report's verdict beats the code
+  in it** — Zoho called lead 44's SMTP "421 Host not reachable" a permanent
+  error, and it counts. "Fatal", "can't be delivered" and "fails permanently"
+  decide nothing (Zoho's, Exchange's and Gmail's *delay* notices use them).
+- Record Inbound stores the kind on the bounce row and on the send
+  (`outreach_log.bounce_kind`; permanent sticks). `send_brake_stats()` skips a
+  `transient` send; a NULL one (an older Mailbox Watch) still counts.
+- The table's trigger unverifies the lead's contact only when the bounce names
+  that address — a recipient of the sent message it threads to, or the address
+  in the report's text — so a contact whose address changed is left alone.
+- A delay is still `outcome = 'bounced'`, so it still stops that lead's
+  follow-ups (unchanged; Master Ref Section 13 has it as an open decision).
+- `backfill_bounce_kind.py` does the same for bounces recorded with no kind:
+  the five from before the migration (2026-10-23), and any the old in-memory
+  Mailbox Watch records between an import and the restart.
 
 ## Claim, then send — at most once
 

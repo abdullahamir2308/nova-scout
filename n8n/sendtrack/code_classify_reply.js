@@ -77,6 +77,46 @@ const COMPLAINT_PHRASES = [
   /\bunsolicited\s+(?:e-?mails?|mails?|messages?|commercial)\b/i,
 ];
 
+// Is a bounce final, or only a warning? (Section 9, Workflow 6; operator
+// decision 2026-10-24, migration 022.) Only a permanent bounce counts toward the
+// Send safety brake, and a permanent one marks the contact unverified. The
+// report's own verdict wins over any status code inside it: Zoho's final report
+// for lead 44 called an SMTP "421 Host not reachable" "a permanent error", and
+// its delay warning for the same send listed "fatal errors" while promising four
+// more days of retries -- so "fatal" decides nothing. Phrases about the future
+// ("You'll be notified if the message can't be delivered", Exchange; "if the
+// delivery fails permanently", Gmail) are a delay's, so "can't" and "fails" are
+// not here. Reports wrap their text anywhere ("could not\nbe delivered",
+// Postfix), so words are joined by \s+, never by one space.
+const BOUNCE_PERMANENT = [
+  /\bpermanent(?:ly)?\s+(?:error|failure|fatal\s+error|failed)\b/i,     // Zoho, Exim: "This is a permanent error."
+  /\bfailed\s+permanently\b/i,                                          // Gmail
+  /^\s*action:\s*failed\b/im,                                           // RFC 3464, when the delivery-status part is in the text
+  /\bdelivery\s+status\s+notification\s+\(failure\)/i,                  // Gmail's subject
+  /\b(?:couldn['’]t|could\s+not)\s+be\s+delivered\b/i,                  // Exchange / Office 365, Postfix, Exim
+  /\b(?:wasn['’]t|was\s+not)\s+delivered\s+to\b/i,                      // Gmail: "Your message wasn't delivered to ..."
+  /\baddress\s+not\s+found\b/i,                                         // Gmail
+];
+const BOUNCE_TRANSIENT = [
+  /\bwarning\s+(?:message\s+)?only\b/i,                                 // Zoho, Sendmail; Postfix "WARNING ONLY"
+  /\bdo\s+not\s+need\s+to\s+resend\b/i,
+  /\bwill\s+(?:be\s+)?retr(?:y|ied)\b/i,                                // "will be retried for 4 more day(s)", "Gmail will retry"
+  /\bwill\s+(?:keep|continue)\s+(?:trying|to\s+try)\b/i,                // Sendmail
+  /\bcontinue\s+to\s+be\s+attempted\b/i,                                // Exchange
+  /^\s*action:\s*delayed\b/im,                                          // RFC 3464
+  /\bdelivery\s+status\s+notification\s+\(delay\)/i,                    // Zoho's and Gmail's subject
+  /\bdelivery\s+(?:has\s+been\s+|is\s+)?delayed\b/i,                    // Exchange
+  /\bhas\s+been\s+delayed\b/i,                                          // Postfix: "Delivery to ... has been delayed"
+  /\bdelivery\s+incomplete\b/i,                                         // Gmail
+  /\bhas\s+not\s+yet\s+been\s+delivered\b/i,                            // Exim
+  /\b(?:hasn['’]t|has\s+not)\s+been\s+delivered\s+yet\b/i,              // Exchange
+  /\btemporary\s+(?:problem|failure|error)\b/i,                         // Gmail: "There was a temporary problem delivering"
+  /\bstill\s+undelivered\b/i,
+];
+// RFC 3463 enhanced status codes ("550 5.4.1", "Status: 4.4.7"), never inside a
+// longer dotted number such as an IP address.
+const STATUS_CODE = /(?:^|[^\d.])([245])\.\d{1,3}\.\d{1,3}(?![\d.])/g;
+
 function str(v) {
   return v === null || v === undefined ? '' : String(v).trim();
 }
@@ -191,6 +231,24 @@ function complaintPhrase(fresh) {
   return null;
 }
 
+// 'permanent' or 'transient' for a bounce, read from its subject and its whole
+// text. In order: the report says it is final; it says it is only a delay; its
+// status codes (any 5.x.x is permanent, otherwise a 4.x.x is a delay); and a
+// report that says neither is a failure -- a delay warning always says it is
+// one, so the brake keeps erring towards pausing.
+function bounceKind(subject, text) {
+  const t = str(subject) + '\n' + String(text || '');
+  if (BOUNCE_PERMANENT.some(function (re) { return re.test(t); })) return 'permanent';
+  if (BOUNCE_TRANSIENT.some(function (re) { return re.test(t); })) return 'transient';
+  const classes = [];
+  let m;
+  STATUS_CODE.lastIndex = 0;
+  while ((m = STATUS_CODE.exec(t)) !== null) classes.push(m[1]);
+  if (classes.indexOf('5') !== -1) return 'permanent';
+  if (classes.indexOf('4') !== -1) return 'transient';
+  return 'permanent';
+}
+
 function classify(j) {
   const meta = j.metadata || {};
   const from = str(j.from);
@@ -228,6 +286,9 @@ function classify(j) {
     own_domain: fromDomain === OWN_DOMAIN,
     subject: subject.slice(0, 300),
     classification: classification,
+    // Migration 022: what Record Inbound stores, the brake counts and the
+    // contact trigger acts on. NULL on everything but a bounce.
+    bounce_kind: isBounce ? bounceKind(subject, raw) : null,
     opt_out_keyword: isReport ? 'spam-report' : kw || (phrase ? 'spam-complaint' : null),
     spam_complaint: isReport || phrase !== null,
     complaint: isReport ? 'feedback-report' : phrase,

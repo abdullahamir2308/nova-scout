@@ -66,8 +66,9 @@ print("warm-up:                  history=%s, sender-day %s, day %d, week %d -> c
       % (w["history"], w["sender_day"], w["day_index"] + 1, w["week"], w["ceiling"]))
 print("sent today / remaining:   %d / %d" % (w["sent_today"], w["remaining"]))
 b = state.get("brake") or {}
-print("safety brake:             %d sends since %s, %d bounced (over %s%% pauses); %d spam complaint(s); %d open pause(s)"
-      % (b.get("sends", 0), b.get("bounce_from"), b.get("bounced", 0), cfg["brake_bounce_pct"],
+print("safety brake:             %d sends since %s, %d bounced (over %s%% pauses; %d delay warning(s) not counted); "
+      "%d spam complaint(s); %d open pause(s)"
+      % (b.get("sends", 0), b.get("bounce_from"), b.get("bounced", 0), cfg["brake_bounce_pct"], b.get("delayed", 0),
          len(b.get("complaints") or []), len(state.get("pauses") or [])))
 for p_ in state.get("pauses") or []:
     print("  PAUSED %-16s since %s  %s" % (p_["reason"], p_["tripped_at"], p_["detail"]))

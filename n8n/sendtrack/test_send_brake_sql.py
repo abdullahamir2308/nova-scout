@@ -9,9 +9,10 @@ open pause; this proves the pauses. The statements are the SHIPPED ones (Check
 Brake, Load Send State and Record Brake Alert, read out of
 ../workflows/send.json, with Config's own brake values), against a scratch
 database created from the live schema (pg_dump --schema-only of novascout)
-with migration 021 applied -- so send_brake_stats() is the migration's too.
-Fixtures only; the real novascout database is only read (the schema dump), and
-the scratch database is dropped afterwards.
+with migration 022 applied -- so send_brake_stats() is the migration's too:
+021 made it, 022 (operator decision 2026-10-24) stopped it counting a delay
+warning. Fixtures only; the real novascout database is only read (the schema
+dump), and the scratch database is dropped afterwards.
 
 test_send_brake_mutations.py breaks each rule in turn and requires a check here
 (or in test_decide.js / test_mailbox.js) to fail.
@@ -25,7 +26,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 WORKFLOW = os.path.join(HERE, "..", "workflows", "send.json")
-MIGRATION = os.path.join(REPO, "postgres", "migrations", "021_send_brake.sql")
+# The latest definition of send_brake_stats(): 021 created it, 022 replaced it.
+MIGRATION = os.path.join(REPO, "postgres", "migrations", "022_hard_bounces.sql")
 PG = "nova-scout-postgres-1"
 PGUSER = "novascout"
 SCRATCH = "novascout_brakesql_test_%d" % os.getpid()
@@ -83,16 +85,19 @@ def reset():
                   "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;")
 
 
-def sends(n, bounced, ago="1 hour", confirmed=True, first_lead=1):
-    """n emails sent `ago`, the first `bounced` of them bounced; one lead each."""
+def sends(n, bounced, ago="1 hour", confirmed=True, first_lead=1, kind=None):
+    """n emails sent `ago`, the first `bounced` of them bounced -- with bounce_kind `kind` (migration 022; None is a
+    bounce no classifier has labelled, as an older Mailbox Watch wrote it); one lead each."""
     psql(SCRATCH, """
 INSERT INTO leads (id, domain, status) OVERRIDING SYSTEM VALUE
 SELECT g, 'cro' || g || '.example', 'sent' FROM generate_series(%(a)d, %(b)d) g ON CONFLICT (id) DO NOTHING;
-INSERT INTO outreach_log (lead_id, channel, sent_at, message_id, outcome)
-SELECT g, 'email', now() - interval '%(ago)s', %(mid)s, CASE WHEN g < %(a)d + %(k)d THEN 'bounced' END
+INSERT INTO outreach_log (lead_id, channel, sent_at, message_id, outcome, bounce_kind)
+SELECT g, 'email', now() - interval '%(ago)s', %(mid)s, CASE WHEN g < %(a)d + %(k)d THEN 'bounced' END,
+       CASE WHEN g < %(a)d + %(k)d THEN %(kind)s END
   FROM generate_series(%(a)d, %(b)d) g;
 """ % {"a": first_lead, "b": first_lead + n - 1, "ago": ago, "k": bounced,
-       "mid": "'<m' || g || '@amitrixlabs.example>'" if confirmed else "NULL"})
+       "mid": "'<m' || g || '@amitrixlabs.example>'" if confirmed else "NULL",
+       "kind": "'%s'" % kind if kind else "NULL"})
 
 
 def complaint(mid, ago="5 minutes", flagged=True):
@@ -156,6 +161,36 @@ def checks(s):
     r2 = run_check(s["check"], cfg)
     expect("a second tick latches nothing new: still one open pause, detail unchanged",
            len(pauses()) == 1 and pauses()[0]["detail"] == p[0]["detail"] and r2["tripped_bounce_rate"] == 0, pauses())
+
+    # 2b. Only a permanent bounce counts (migration 022, operator decision 2026-10-24). Case 2's bounces carry no
+    #     kind at all -- what a Mailbox Watch older than the migration writes -- and they trip it: an unlabelled
+    #     bounce is no proof of a delay.
+    reset()
+    sends(100, 4, kind="transient")
+    r = run_check(s["check"], cfg)
+    expect("4 delay warnings in 100 sends -> no pause: a delay is not a bounce for the brake",
+           open_reasons() == [] and [r["sends"], r["bounced"], r["tripped_bounce_rate"]] == [100, 0, 0], [r, open_reasons()])
+    reset()
+    sends(100, 4, kind="permanent")
+    r = run_check(s["check"], cfg)
+    expect("4 permanent bounces in 100 sends -> a pause", open_reasons() == ["bounce-rate"] and r["bounced"] == 4,
+           [r, open_reasons()])
+    reset()
+    sends(100, 3, kind="permanent")
+    sends(5, 5, kind="transient", first_lead=101)
+    r = run_check(s["check"], cfg)
+    expect("3 permanent + 5 delays in 105 sends -> no pause (3 of 105; the delays are sends, not bounces)",
+           open_reasons() == [] and [r["sends"], r["bounced"]] == [105, 3], [r, open_reasons()])
+    row = json.loads(psql(SCRATCH, "SELECT row_to_json(t) FROM (\n" + bind(s["load"], ["", cfg["min_gap_min"],
+                                                                                        cfg["send_probability"],
+                                                                                        cfg["brake_days"]]) + "\n) t;"))
+    expect("... and Load Send State shows the delays apart from the bounces",
+           [row["brake"]["bounced"], row["brake"]["delayed"]] == [3, 5]
+           and sorted(row["brake"]["bounced_domains"]) == ["cro1.example", "cro2.example", "cro3.example"], row["brake"])
+    sends(1, 1, kind="permanent", first_lead=201)
+    r = run_check(s["check"], cfg)
+    expect("... one more permanent bounce (4 of 106) -> a pause", open_reasons() == ["bounce-rate"] and r["bounced"] == 4,
+           [r, open_reasons()])
 
     # 3. The window is the last N days.
     reset()
