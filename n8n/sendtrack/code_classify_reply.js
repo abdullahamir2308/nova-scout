@@ -113,6 +113,17 @@ const BOUNCE_TRANSIENT = [
   /\btemporary\s+(?:problem|failure|error)\b/i,                         // Gmail: "There was a temporary problem delivering"
   /\bstill\s+undelivered\b/i,
 ];
+// A DMARC report (RFC 7489) is mail to the address in the domain's DMARC record,
+// never a person answering: an aggregate report ("Report Domain: amitrixlabs.com
+// Submitter: google.com Report-ID: ...", the subject §7.2.1.1 asks for, which
+// Microsoft prefixes with "[Preview]") or a failure report (ARF, "Feedback-Type:
+// auth-failure"). Microsoft's says "Please remove your email address from the
+// 'rua' tag", and on 2026-09-24 that read as an opt-out ("remove"); it matched
+// no lead, so nothing was blocklisted. A report sent from a prospect's own mail
+// server would match that lead by domain -- and one sent from postmaster@ would
+// read as a bounce, which the Send brake counts. So it is decided first, and
+// recorded like an out-of-office: never a reply, an opt-out or a bounce.
+const DMARC_SUBJECT = /^\s*(?:\[[^\]]*\]\s*)?report\s+domain:\s*\S+\s+submitter:|\bdmarc\s+(?:aggregate|failure|forensic)\s+report\b/i;
 // RFC 3463 enhanced status codes ("550 5.4.1", "Status: 4.4.7"), never inside a
 // longer dotted number such as an IP address.
 const STATUS_CODE = /(?:^|[^\d.])([245])\.\d{1,3}\.\d{1,3}(?![\d.])/g;
@@ -231,6 +242,10 @@ function complaintPhrase(fresh) {
   return null;
 }
 
+function isDmarcReport(subject, raw) {
+  return DMARC_SUBJECT.test(str(subject)) || /^\s*feedback-type:\s*auth-failure\b/im.test(String(raw || ''));
+}
+
 // 'permanent' or 'transient' for a bounce, read from its subject and its whole
 // text. In order: the report says it is final; it says it is only a delay; its
 // status codes (any 5.x.x is permanent, otherwise a 4.x.x is a delay); and a
@@ -260,10 +275,11 @@ function classify(j) {
 
   const autoSubmitted = str(meta['auto-submitted']).toLowerCase();
   const isReport = isComplaintReport(meta, raw);
-  const isBounce = !isReport && (/mailer-daemon|postmaster|mail delivery (?:subsystem|system)/i.test(from) ||
+  const isDmarc = !isReport && isDmarcReport(subject, raw);
+  const isBounce = !isReport && !isDmarc && (/mailer-daemon|postmaster|mail delivery (?:subsystem|system)/i.test(from) ||
     BOUNCE_SUBJECT.test(subject) ||
     /report-type="?delivery-status/i.test(str(meta['content-type'])));
-  const isAuto = !isReport && !isBounce && ((autoSubmitted !== '' && autoSubmitted !== 'no') ||
+  const isAuto = !isReport && !isBounce && (isDmarc || (autoSubmitted !== '' && autoSubmitted !== 'no') ||
     str(meta['x-autoreply']) !== '' || str(meta['x-autorespond']) !== '' ||
     /^auto_reply$/i.test(str(meta['precedence'])) ||
     AUTO_SUBJECT.test(subject));
@@ -292,6 +308,7 @@ function classify(j) {
     opt_out_keyword: isReport ? 'spam-report' : kw || (phrase ? 'spam-complaint' : null),
     spam_complaint: isReport || phrase !== null,
     complaint: isReport ? 'feedback-report' : phrase,
+    dmarc_report: isDmarc,
     // Stored as received (migration 017): a reply draft has to thread to the
     // conversation it answers, and these were parsed and thrown away until
     // 2026-10-08. `thread_ids` is the parsed array Record Inbound matches a

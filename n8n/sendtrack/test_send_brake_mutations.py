@@ -13,8 +13,9 @@ rule in one of them; a test must then fail:
     database (a mutation that makes a statement error counts as caught: the
     workflow would fail the tick, and the test says so);
   * Decide Send (code_decide.js) -> test_decide.js;
-  * the classifier (code_classify_reply.js: complaints, and permanent or
-    transient) and the notification (code_notify.js) -> test_mailbox.js.
+  * the classifier (code_classify_reply.js: complaints, permanent or
+    transient, and DMARC reports -- never a bounce the brake counts, an opt-out
+    or a reply) and the notification (code_notify.js) -> test_mailbox.js.
 
 Record Inbound and migration 022's contact rule have their own:
 test_hard_bounce_mutations.py.
@@ -131,6 +132,23 @@ JS_MUTATIONS = [
     ("only a bounce carries a kind", "code_classify_reply.js",
      "    bounce_kind: isBounce ? bounceKind(subject, raw) : null,", "    bounce_kind: bounceKind(subject, raw),",
      "test_mailbox.js"),
+    # DMARC reports (2026-10-24): machine mail, never an opt-out, a reply or a
+    # bounce the brake counts.
+    ("a DMARC report is recognised at all", "code_classify_reply.js",
+     "  const isDmarc = !isReport && isDmarcReport(subject, raw);", "  const isDmarc = false;", "test_mailbox.js"),
+    ("a DMARC report is decided before a bounce (postmaster@)", "code_classify_reply.js",
+     "  const isBounce = !isReport && !isDmarc && (", "  const isBounce = !isReport && (", "test_mailbox.js"),
+    ("a DMARC report is machine mail, not a person", "code_classify_reply.js",
+     "  const isAuto = !isReport && !isBounce && (isDmarc || (", "  const isAuto = !isReport && !isBounce && ((",
+     "test_mailbox.js"),
+    ("Microsoft's '[Preview]' subject prefix is allowed", "code_classify_reply.js",
+     r"/^\s*(?:\[[^\]]*\]\s*)?report\s+domain:", r"/^\s*report\s+domain:", "test_mailbox.js"),
+    ("'DMARC aggregate report' subjects are recognised", "code_classify_reply.js",
+     r"submitter:|\bdmarc\s+(?:aggregate|failure|forensic)\s+report\b/i;", r"submitter:/i;", "test_mailbox.js"),
+    ("a failure report (auth-failure) is recognised", "code_classify_reply.js",
+     r" || /^\s*feedback-type:\s*auth-failure\b/im.test(String(raw || ''));", ";", "test_mailbox.js"),
+    ("the payload says it was a DMARC report", "code_classify_reply.js",
+     "    dmarc_report: isDmarc,", "    dmarc_report: false,", "test_mailbox.js"),
     ("a delay is labelled DELIVERY DELAY for the operator", "code_notify.js",
      "r.classification === 'bounce' && r.bounce_kind === 'transient' ? 'DELIVERY DELAY'", "false ? 'DELIVERY DELAY'",
      "test_mailbox.js"),

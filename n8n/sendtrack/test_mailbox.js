@@ -153,6 +153,42 @@ t.check('an out-of-office is not a reply, even when it says "no access"',
 t.check('... also recognised by subject', kind('Back Monday.', { subject: 'Automatic reply: question about your protocol docs' }), 'auto-reply');
 t.check('"Auto-Submitted: no" is a person', kind('Tell me more.', {}, { 'auto-submitted': 'no' }), 'reply');
 
+// DMARC reports -- the two real ones Mailbox Watch recorded, as stored in
+// inbound_messages (subject, sender, the text it read). Microsoft's asks to
+// "remove" an address from the rua tag; on 2026-09-24 it was recorded with
+// opt_out_keyword 'remove'.
+const NO_THREAD = { 'in-reply-to': '', references: '', 'message-id': '<r@report.example>' };
+const GOOGLE_DMARC = { from: 'noreply-dmarc-support@google.com',
+  subject: 'Report domain: amitrixlabs.com Submitter: google.com Report-ID: 17022299783852949353' };
+const MS_DMARC = { from: 'dmarcreport@microsoft.com',
+  subject: '[Preview] Report Domain: amitrixlabs.com Submitter: enterprise.protection.outlook.com Report-ID: 0a8dc2598f5e458fa04240ca471d7654' };
+const MS_DMARC_TEXT = 'This is a DMARC aggregate report from Microsoft Corporation. For Emails received between ' +
+  '2026-09-22 00:00:00 UTC to 2026-09-23 00:00:00 UTC.\n\nYou\'re receiving this email because you have included ' +
+  'your email address in the \'rua\' tag of your DMARC record in DNS for amitrixlabs.com. Please remove your email ' +
+  'address from the \'rua\' tag if you don\'t want to receive this email.\n\nPlease do not respond to this e-mail. ' +
+  'This mailbox is not monitored and you will not receive a response. For any feedback/suggestions, kindly mail to ' +
+  'dmarcreportfeedback@microsoft.com.\n\nMicrosoft respects your privacy. Review';
+const dmarc = (text, over, meta) => {
+  const c = classify(inbound(text, over, Object.assign({}, NO_THREAD, meta || {})));
+  return [c.classification, c.opt_out_keyword, c.spam_complaint, c.bounce_kind, c.dmarc_report];
+};
+const MACHINE = ['auto-reply', null, false, null, true];
+t.check("Google's real DMARC aggregate report (empty body) is machine mail", dmarc('', GOOGLE_DMARC), MACHINE);
+t.check("Microsoft's real report is NOT an opt-out, though it says \"Please remove\"", dmarc(MS_DMARC_TEXT, MS_DMARC), MACHINE);
+t.check("... nor when a prospect's own mail server sends it (it would match that lead by domain)",
+  dmarc(MS_DMARC_TEXT, Object.assign({}, MS_DMARC, { from: 'dmarc-reports@klixar.com' })), MACHINE);
+t.check('... nor a bounce when it comes from postmaster@ (the brake counts bounces)',
+  dmarc(MS_DMARC_TEXT, Object.assign({}, MS_DMARC, { from: 'postmaster@klixar.com' })), MACHINE);
+t.check('a DMARC failure report (ARF auth-failure) quoting our email is machine mail, not "no"',
+  dmarc('Feedback-Type: auth-failure\nAuth-Failure: dmarc\n\nNo\n' + OURS, { from: 'dmarc@isp.example', subject: 'FW: question' }), MACHINE);
+t.check('"DMARC aggregate report" in a subject is recognised too',
+  dmarc('', { from: 'reports@mimecast.example', subject: 'DMARC Aggregate Report for amitrixlabs.com' }), MACHINE);
+t.check('a person who mentions DMARC still opts out with "No thanks"',
+  kind('No thanks.', { subject: 'Re: DMARC report setup' }), 'opt-out:no');
+t.check('... and "remove" in a reply about a report domain is still an opt-out',
+  kind('Please remove me. Our report domain is elsewhere.'), 'opt-out:remove');
+t.check('... and an ordinary reply carries dmarc_report false', classify(inbound('Tell me more.')).dmarc_report, false);
+
 const ndr = classify(inbound(
   'Delivery to the following recipient failed permanently:\n\n    hello@klixar.com\n\n' +
   '----- Original message -----\nMessage-ID: <a1b2c3@amitrixlabs.com>\nFrom: abdullah@amitrixlabs.com',
