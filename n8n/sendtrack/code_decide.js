@@ -59,7 +59,7 @@ const SENDER_UTC_OFFSET_MIN = 300;
 // what this table carries. Egypt IS on the list -- it brought summer time back
 // in 2023. Morocco drifts the other way: permanently UTC+1, stepping back to
 // UTC+0 for Ramadan, so the window lands an hour EARLY that month. It never sends before 09:00 local, and never on a
-// weekend.
+// statutory weekend day other than Saturday or Sunday (WEEKEND_SEND_DAYS below).
 //
 // `weekend` is each country's statutory weekend, 0=Sunday .. 6=Saturday:
 // Friday-Saturday across the Gulf and most of the Arab world plus Israel,
@@ -239,6 +239,12 @@ function clockFor(country) {
 const BUSINESS_START_MIN = 9 * 60;
 const BUSINESS_END_MIN = 17 * 60;
 
+// Section 9, Workflow 6, "Weekend sending" (operator decision 2026-10-24):
+// Saturday and Sunday are sending days everywhere, in the same 09:00-17:00
+// local window. A statutory weekend day that is neither (Friday in the
+// Friday-Saturday countries) still sends nothing. 0=Sunday .. 6=Saturday.
+const WEEKEND_SEND_DAYS = [6, 0];
+
 // A workflow send the Sent-folder mirror has not seen after this long means the
 // mirror is not reading the folder. Zoho files a submitted message into Sent
 // within seconds; fifteen minutes is generous.
@@ -351,7 +357,7 @@ function localClock(country, t) {
   const local = new Date(t + zone.utc_offset_min * MS_MIN);
   const minutes = local.getUTCHours() * 60 + local.getUTCMinutes();
   const dow = local.getUTCDay();
-  const weekend = zone.weekend.indexOf(dow) !== -1;
+  const weekend = zone.weekend.indexOf(dow) !== -1 && WEEKEND_SEND_DAYS.indexOf(dow) === -1;
   const hh = String(local.getUTCHours()).padStart(2, '0');
   const mm = String(local.getUTCMinutes()).padStart(2, '0');
   const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];

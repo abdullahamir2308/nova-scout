@@ -3,8 +3,9 @@
     python n8n/sendtrack/test_send_brake_sql.py
 
 Section 9, Workflow 6 (operator decision 2026-10-19): "if bounces over the
-last 3 days exceed 3% of sends, or any spam complaint arrives, Send pauses and
-the operator is alerted." test_decide.js proves what Decide Send does with an
+last 3 days exceed 10% of sends, or any spam complaint arrives, Send pauses and
+the operator is alerted." (10% since
+2026-10-24, operator decision; it was 3%.) test_decide.js proves what Decide Send does with an
 open pause; this proves the pauses. The statements are the SHIPPED ones (Check
 Brake, Load Send State and Record Brake Alert, read out of
 ../workflows/send.json, with Config's own brake values), against a scratch
@@ -138,25 +139,25 @@ def checks(s):
     def expect(label, ok, detail=""):
         out.append((label, bool(ok), str(detail)))
 
-    expect("the shipped Config carries Section 9's brake: 3 days, 3%",
-           [cfg["brake_days"], cfg["brake_bounce_pct"]] == [3, 3], [cfg["brake_days"], cfg["brake_bounce_pct"]])
+    expect("the shipped Config carries Section 9's brake: 3 days, 10%",
+           [cfg["brake_days"], cfg["brake_bounce_pct"]] == [3, 10], [cfg["brake_days"], cfg["brake_bounce_pct"]])
 
     # 1. At the line, not over it.
     reset()
-    sends(100, 3)
+    sends(100, 10)
     r = run_check(s["check"], cfg)
-    expect("3 bounces in 100 sends (3%, not over) -> no pause", open_reasons() == [] and r["tripped_bounce_rate"] == 0,
+    expect("10 bounces in 100 sends (10%, not over) -> no pause", open_reasons() == [] and r["tripped_bounce_rate"] == 0,
            [r, open_reasons()])
-    expect("... and Check Brake reports what it counted", [r["sends"], r["bounced"]] == [100, 3], r)
+    expect("... and Check Brake reports what it counted", [r["sends"], r["bounced"]] == [100, 10], r)
 
     # 2. Over the line.
     reset()
-    sends(100, 4)
+    sends(100, 11)
     r = run_check(s["check"], cfg)
     p = pauses()
-    expect("4 bounces in 100 sends (4%) -> a bounce-rate pause", open_reasons() == ["bounce-rate"], p)
+    expect("11 bounces in 100 sends (11%) -> a bounce-rate pause", open_reasons() == ["bounce-rate"], p)
     expect("... whose detail is what the operator is told",
-           p and "4 of the 100 emails sent since" in p[0]["detail"] and "(4.0%), over the 3% brake" in p[0]["detail"]
+           p and "11 of the 100 emails sent since" in p[0]["detail"] and "(11.0%), over the 10% brake" in p[0]["detail"]
            and "cro1.example" in p[0]["detail"], p and p[0]["detail"])
     r2 = run_check(s["check"], cfg)
     expect("a second tick latches nothing new: still one open pause, detail unchanged",
@@ -166,30 +167,30 @@ def checks(s):
     #     kind at all -- what a Mailbox Watch older than the migration writes -- and they trip it: an unlabelled
     #     bounce is no proof of a delay.
     reset()
-    sends(100, 4, kind="transient")
+    sends(100, 11, kind="transient")
     r = run_check(s["check"], cfg)
-    expect("4 delay warnings in 100 sends -> no pause: a delay is not a bounce for the brake",
+    expect("11 delay warnings in 100 sends -> no pause: a delay is not a bounce for the brake",
            open_reasons() == [] and [r["sends"], r["bounced"], r["tripped_bounce_rate"]] == [100, 0, 0], [r, open_reasons()])
     reset()
-    sends(100, 4, kind="permanent")
+    sends(100, 11, kind="permanent")
     r = run_check(s["check"], cfg)
-    expect("4 permanent bounces in 100 sends -> a pause", open_reasons() == ["bounce-rate"] and r["bounced"] == 4,
+    expect("11 permanent bounces in 100 sends -> a pause", open_reasons() == ["bounce-rate"] and r["bounced"] == 11,
            [r, open_reasons()])
     reset()
-    sends(100, 3, kind="permanent")
+    sends(100, 10, kind="permanent")
     sends(5, 5, kind="transient", first_lead=101)
     r = run_check(s["check"], cfg)
-    expect("3 permanent + 5 delays in 105 sends -> no pause (3 of 105; the delays are sends, not bounces)",
-           open_reasons() == [] and [r["sends"], r["bounced"]] == [105, 3], [r, open_reasons()])
+    expect("10 permanent + 5 delays in 105 sends -> no pause (10 of 105; the delays are sends, not bounces)",
+           open_reasons() == [] and [r["sends"], r["bounced"]] == [105, 10], [r, open_reasons()])
     row = json.loads(psql(SCRATCH, "SELECT row_to_json(t) FROM (\n" + bind(s["load"], ["", cfg["min_gap_min"],
                                                                                         cfg["send_probability"],
                                                                                         cfg["brake_days"]]) + "\n) t;"))
     expect("... and Load Send State shows the delays apart from the bounces",
-           [row["brake"]["bounced"], row["brake"]["delayed"]] == [3, 5]
-           and sorted(row["brake"]["bounced_domains"]) == ["cro1.example", "cro2.example", "cro3.example"], row["brake"])
-    sends(1, 1, kind="permanent", first_lead=201)
+           [row["brake"]["bounced"], row["brake"]["delayed"]] == [10, 5]
+           and sorted(row["brake"]["bounced_domains"]) == sorted("cro%d.example" % i for i in range(1, 11)), row["brake"])
+    sends(2, 2, kind="permanent", first_lead=201)
     r = run_check(s["check"], cfg)
-    expect("... one more permanent bounce (4 of 106) -> a pause", open_reasons() == ["bounce-rate"] and r["bounced"] == 4,
+    expect("... two more permanent bounces (12 of 107, 11.2%) -> a pause", open_reasons() == ["bounce-rate"] and r["bounced"] == 12,
            [r, open_reasons()])
 
     # 3. The window is the last N days.
@@ -201,15 +202,15 @@ def checks(s):
 
     # 4. A claim is not a send.
     reset()
-    sends(100, 4)
+    sends(100, 11)
     sends(100, 0, confirmed=False, first_lead=201)
     run_check(s["check"], cfg)
-    expect("unconfirmed claims are not sends (4 of 100 confirmed, 100 claims beside) -> still a pause",
+    expect("unconfirmed claims are not sends (11 of 100 confirmed, 100 claims beside) -> still a pause",
            open_reasons() == ["bounce-rate"], pauses())
 
     # 5. Only the operator clears it -- and clearing restarts the count.
     reset()
-    sends(100, 4, ago="2 hours")
+    sends(100, 11, ago="2 hours")
     run_check(s["check"], cfg)
     # An hour ago: tripped 90 minutes ago, reviewed and cleared 30 minutes later.
     psql(SCRATCH, "UPDATE send_pauses SET tripped_at = now() - interval '90 minutes', "
@@ -222,9 +223,9 @@ def checks(s):
                                                                                         cfg["brake_days"]]) + "\n) t;"))
     expect("... and Load Send State shows Decide no pause: a cleared one is history, not a brake",
            row["pauses"] == [], row["pauses"])
-    sends(20, 1, ago="10 minutes", first_lead=301)
+    sends(5, 1, ago="10 minutes", first_lead=301)
     run_check(s["check"], cfg)
-    expect("... and the count restarts at the clear: 1 bounce in the 20 sent since (5%) trips a new pause",
+    expect("... and the count restarts at the clear: 1 bounce in the 5 sent since (20%) trips a new pause",
            open_reasons() == ["bounce-rate"] and len(pauses()) == 2, pauses())
 
     # 6. Any spam complaint.
@@ -254,7 +255,7 @@ def checks(s):
 
     # 7. Both at once: two pauses, one per reason.
     reset()
-    sends(10, 1)
+    sends(5, 1)
     complaint("<c5@cro.example>")
     run_check(s["check"], cfg)
     expect("bounces over the line AND a complaint -> one pause per reason", open_reasons() == ["bounce-rate", "spam-complaint"],
@@ -269,7 +270,7 @@ def checks(s):
            and all(x["alerted_at"] is None and x["detail"] for x in row["pauses"])
            and row["operator_email"] == "operator@example.invalid", row["pauses"])
     expect("... and the brake numbers it counted", [row["brake"]["sends"], row["brake"]["bounced"],
-                                                    len(row["brake"]["complaints"])] == [10, 1, 1], row["brake"])
+                                                    len(row["brake"]["complaints"])] == [5, 1, 1], row["brake"])
 
     # 9. Record Brake Alert stamps only on an accepted alert.
     ids = [x["id"] for x in row["pauses"]]

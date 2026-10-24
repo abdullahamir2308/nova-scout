@@ -25,7 +25,8 @@ What it proves, through n8n:
   7. the safety brake (Section 9, operator decision 2026-10-19; migration 021):
      a delay warning, through the shipped classifier and Record Inbound, does
      not count (migration 022, 2026-10-24); its final report does, unverifies
-     the contact, and takes the bounce rate over 3%, which pauses Send, the
+     the contact, and takes the bounce rate over the brake (10% since
+     2026-10-24), which pauses Send, the
      operator gets exactly one alert in
      the sink, nothing goes to a prospect, Claim Send refuses on the table too;
      clearing the pause resumes Send; then a spam complaint -- a real reply run
@@ -618,8 +619,10 @@ try:
            json.dumps(stats))
     print("     window as of the dry-run clock: %d sends, %d bounced (%.1f%%)"
           % (stats["sends"], stats["bounced"], 100.0 * stats["bounced"] / max(1, stats["sends"])))
-    expect("the copy is over the line: 1 bounce in %d sends is more than 3%%" % stats["sends"],
-           stats["bounced"] == 1 and stats["bounced"] * 100.0 > 3 * stats["sends"], json.dumps(stats))
+    brake_pct = {a["name"]: a["value"] for a in send_nodes["Config"]["parameters"]["assignments"]["assignments"]}[
+        "brake_bounce_pct"]
+    expect("the copy is over the line: 1 bounce in %d sends is more than %s%%" % (stats["sends"], brake_pct),
+           stats["bounced"] == 1 and stats["bounced"] * 100.0 > brake_pct * stats["sends"], json.dumps(stats))
     log0 = sink_log()
 
     run = execute("send0001dry")

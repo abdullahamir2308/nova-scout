@@ -118,14 +118,14 @@ t.check('ceiling by week 1..6 and 52', [1, 2, 3, 4, 5, 6, 52].map(ceilingForWeek
 }
 
 // --- the safety brake (Section 9, operator decision 2026-10-19; migration 021) --
-const PAUSE = { id: 7, reason: 'bounce-rate', detail: '2 of the 40 emails sent since 2026-10-16 09:00 UTC bounced (5.0%), over the 3% brake. Bounced: a.com, b.com.',
+const PAUSE = { id: 7, reason: 'bounce-rate', detail: '5 of the 40 emails sent since 2026-10-16 09:00 UTC bounced (12.5%), over the 10% brake. Bounced: a.com, b.com.',
   tripped_at: '2026-09-14T14:50:00.000Z', alerted_at: null };
 const COMPLAINT = { id: 8, reason: 'spam-complaint', detail: '1 spam complaint(s): 2026-09-14 from x@y.com "Re: hi".',
   tripped_at: '2026-09-14T14:55:00.000Z', alerted_at: null };
 d = decide(st({ pauses: [PAUSE], operator_email: 'Operator@Example.com' }), ALWAYS);
 t.check('an open pause stops the tick, though a draft is eligible and in hours', [d.send, d.reason, d.payload], [false, 'send-paused', null]);
 t.check('... the reason names what tripped and how to resume',
-  d.detail.includes('bounce rate over the brake') && d.detail.includes('5.0%') && d.detail.includes('Clear send_pauses'), true);
+  d.detail.includes('bounce rate over the brake') && d.detail.includes('12.5%') && d.detail.includes('Clear send_pauses'), true);
 t.check('... and the operator is alerted: to, subject, the pause ids',
   [d.alert.notify, d.alert.to, d.alert.subject, d.alert.pause_ids],
   [true, 'Operator@Example.com', '[Nova Scout] Send paused: bounce rate over the brake', [7]]);
@@ -226,8 +226,18 @@ t.check('India opens at 03:30Z', lc('India', '2026-09-14T03:30:00Z'), ['Mon 09:0
 t.check('... and is shut at 03:29Z', lc('India', '2026-09-14T03:29:00Z'), ['Mon 08:59', false]);
 t.check('Egypt works Sunday', lc('Egypt', '2026-09-13T08:00:00Z'), ['Sun 10:00', true]);
 t.check('Egypt does not work Friday', lc('Egypt', '2026-09-18T08:00:00Z'), ['Fri 10:00', false]);
-t.check('Argentina does not work Saturday', lc('Argentina', '2026-09-19T15:00:00Z'), ['Sat 12:00', false]);
-t.check('Argentina does not work Sunday', lc('Argentina', '2026-09-20T15:00:00Z'), ['Sun 12:00', false]);
+// Weekend sending (Section 9, operator decision 2026-10-24): Saturday and
+// Sunday send everywhere, in the same local window; Friday stays shut where
+// the statutory weekend is Friday-Saturday.
+t.check('Argentina sends on Saturday', lc('Argentina', '2026-09-19T15:00:00Z'), ['Sat 12:00', true]);
+t.check('Argentina sends on Sunday', lc('Argentina', '2026-09-20T15:00:00Z'), ['Sun 12:00', true]);
+t.check('... but not before 09:00 on a Saturday', lc('Argentina', '2026-09-19T11:59:00Z'), ['Sat 08:59', false]);
+t.check('... nor from 17:00 on a Sunday', lc('Argentina', '2026-09-20T20:00:00Z'), ['Sun 17:00', false]);
+t.check('Egypt sends on Saturday, the second day of its weekend', lc('Egypt', '2026-09-19T08:00:00Z'), ['Sat 10:00', true]);
+t.check('Saudi Arabia still does not send on Friday', lc('Saudi Arabia', '2026-09-18T08:00:00Z'), ['Fri 11:00', false]);
+t.check('Nepal sends on Saturday, its whole weekend', lc('Nepal', '2026-09-19T05:00:00Z'), ['Sat 10:45', true]);
+d = decide(st({ clock: '2026-09-19T15:00:00.000Z', sent_mirror_synced_at: '2026-09-19T14:55:00.000Z' }), ALWAYS);
+t.check('a Saturday tick with an Argentine recipient at work -> sends', [d.send, d.reason], [true, 'send']);
 t.check('a country outside Section 12 has no clock', localClock('Narnia', Date.parse(CLOCK)), null);
 
 d = decide(st({ candidates: [cand({ country: 'India' })] }), ALWAYS);

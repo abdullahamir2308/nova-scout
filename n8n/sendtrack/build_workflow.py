@@ -408,6 +408,25 @@ def load_brake(doc):
     return days, (int(pct) if pct == int(pct) else pct)
 
 
+_DAY_NAMES = {"Sunday": 0, "Monday": 1, "Tuesday": 2, "Wednesday": 3, "Thursday": 4, "Friday": 5, "Saturday": 6}
+
+
+def load_weekend_send_days(doc):
+    """Section 9, Workflow 6's weekend sending (operator decision 2026-10-24): the
+    statutory weekend days Send sends on anyway, as 0=Sunday .. 6=Saturday."""
+    m = re.search(r"\*\*Weekend sending[^*\n]*\*\*\s*Send sends on ((?:[A-Z][a-z]+day)(?:(?:, | and )[A-Z][a-z]+day)*) too", doc)
+    if not m:
+        raise AssertionError(
+            "weekend sending not found in Section 9 of %s -- expected '**Weekend sending ...** Send sends on "
+            "Saturday and Sunday too'" % MASTER_REF)
+    days = []
+    for name in re.split(r", | and ", m.group(1)):
+        if name not in _DAY_NAMES:
+            raise AssertionError("weekend sending names an unreadable day %r" % name)
+        days.append(_DAY_NAMES[name])
+    return days
+
+
 def load_health_interval(doc):
     m = re.search(r"health check runs every (\d+) minutes", doc)
     if not m:
@@ -437,6 +456,7 @@ def load_sender_offset(compose_text):
 DOC = _read(MASTER_REF)
 WARMUP = load_warmup(DOC)
 BRAKE_DAYS, BRAKE_BOUNCE_PCT = load_brake(DOC)
+WEEKEND_SEND_DAYS = load_weekend_send_days(DOC)
 OPT_OUT = load_opt_out(DOC)
 MAX_URLS = load_url_cap(DOC)
 OPT_OUT_KEYWORDS = load_opt_out_keywords(DOC)
@@ -538,6 +558,19 @@ def _assert_decide_matches_spec():
         % (sorted(set(COUNTRY_CLOCKS) - set(js_clocks)),
            sorted(set(js_clocks) - set(COUNTRY_CLOCKS)),
            sorted(n for n in set(js_clocks) & set(COUNTRY_CLOCKS) if js_clocks[n] != COUNTRY_CLOCKS[n])))
+
+    # Weekend sending (Section 9, operator decision 2026-10-24): the days Send
+    # sends on despite a statutory weekend, and the business-hours test must use them.
+    m = re.search(r"const WEEKEND_SEND_DAYS = \[([0-9,\s]*)\];", src)
+    assert m, "WEEKEND_SEND_DAYS not found in code_decide.js"
+    found = [int(d) for d in m.group(1).replace(" ", "").split(",") if d != ""]
+    assert sorted(found) == sorted(WEEKEND_SEND_DAYS), (
+        "weekend sending drifted between Section 9 and code_decide.js:\n  doc: %r\n  js:  %r"
+        % (WEEKEND_SEND_DAYS, found))
+    assert ("zone.weekend.indexOf(dow) !== -1 && WEEKEND_SEND_DAYS.indexOf(dow) === -1"
+            in re.sub(r"(^|[^:])//.*", r"\1", src)), (
+        "code_decide.js's business-hours test no longer lets WEEKEND_SEND_DAYS through a statutory weekend "
+        "(Section 9, weekend sending)")
 
     # The core 13 are the same list in both of Section 12's places.
     assert sorted(CLOCK_CORE) == sorted(GEOGRAPHIES), (
@@ -888,8 +921,8 @@ CHECK_BRAKE_SQL = """-- Check Brake: the Send safety brake's latch (Section 9, W
 -- send_brake_stats() is the one definition of the numbers: of the confirmed
 -- emails sent since the later of N days ago and the last cleared bounce-rate
 -- pause, how many came back bounced; and every spam complaint since the last
--- cleared complaint pause. STRICTLY over P%: at 3%, 3 bounces in 100 sends do
--- not trip, 4 do. A pause is a row with cleared_at NULL, at most one per reason
+-- cleared complaint pause. STRICTLY over P%: at 10%, 10 bounces in 100 sends do
+-- not trip, 11 do. A pause is a row with cleared_at NULL, at most one per reason
 -- (the partial unique index), so a repeated tick writes nothing new and the
 -- detail stays the one the operator was alerted about. Nothing here ever
 -- clears one: only the operator does.
@@ -3947,6 +3980,9 @@ print("  safety brake (Section 9): bounces over %d days > %s%% of sends, or any 
       "operator alerted, cleared only by the operator" % (BRAKE_DAYS, BRAKE_BOUNCE_PCT))
 print("  business-hours clocks (Section 12): %d countries -- %d core, %d extended; every one of the %d the index snapshot includes has one"
       % (len(COUNTRY_CLOCKS), len(CLOCK_CORE), len(COUNTRY_CLOCKS) - len(CLOCK_CORE), len(INDEX_COUNTRIES)))
+print("  weekend sending (Section 9): %s are sending days everywhere, 09:00-17:00 local; other statutory "
+      "weekend days still send nothing" % ", ".join(["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d]
+                                                    for d in WEEKEND_SEND_DAYS))
 print("  opt-out keywords (Sections 5+9): %r" % OPT_OUT_KEYWORDS)
 print("  follow-ups (Section 9): after %d days, maximum %d; the fixed templates, byte for byte with Section 9, "
       "written and gated by drafting's code_template.js -- no model call" % (FOLLOW_UP_DAYS, MAX_FOLLOW_UPS))

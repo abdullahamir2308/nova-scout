@@ -88,13 +88,14 @@ could both see 4 of 5.
 ## The safety brake (operator decision 2026-10-19)
 
 The ceiling went from 20 to 50 a day (Section 5) and the brake came with it
-(Section 9): **if bounces over the last 3 days exceed 3% of sends, or any spam
-complaint arrives, Send pauses and the operator is alerted.**
+(Section 9): **if bounces over the last 3 days exceed 10% of sends, or any spam
+complaint arrives, Send pauses and the operator is alerted.** (The share was 3%
+until 2026-10-24, operator decision; the complaint rule is unchanged.)
 
 - **Check Brake** runs first every tick. `send_brake_stats()` (migration 021)
   counts, of the confirmed emails sent in the window, how many came back
   bounced, and every `inbound_messages` row flagged `spam_complaint`; over the
-  line (strictly: 3 in 100 does not trip, 4 does), it writes a `send_pauses` row.
+  line (strictly: 10 in 100 does not trip, 11 does), it writes a `send_pauses` row.
 - **While a row is open** (`cleared_at` NULL) Decide Send refuses
   `send-paused` before every other check, and Claim Send refuses on the table.
 - **One alert** to `settings.operator_email`, from this workflow (Brake Alert? →
@@ -114,7 +115,7 @@ complaint arrives, Send pauses and the operator is alerted.**
 
 ### Permanent or transient (operator decision 2026-10-24, migration 022)
 
-Only a **permanent** bounce counts toward the 3%, and a permanent bounce marks
+Only a **permanent** bounce counts toward the 10%, and a permanent bounce marks
 the contact it bounced from **unverified** — so Drafting's and Follow-Ups' gate
 hold anything new for it, Send refuses it, and migration 020's trigger refuses
 an auto-approval, until a person enters a working address.
@@ -177,8 +178,10 @@ in Decide Send (and the ones marked ★ again inside Claim Send):
 - follow-ups only after a first touch, at most two
 - ★ the body is unchanged since Decide read it (an edit mid-tick aborts the claim)
 
-Then **the recipient's business hours**: 09:00–17:00 local, Monday–Friday
-(Egypt Sunday–Thursday), on a fixed standard-time offset per Section 12 country.
+Then **the recipient's business hours**: 09:00–17:00 local, every day but a
+statutory weekend day other than Saturday and Sunday (weekend sending, operator
+decision 2026-10-24 -- so Friday stays shut in Egypt and the other Friday–Saturday
+countries), on a fixed standard-time offset per Section 12 country.
 No DST, by the operator's decision — Poland, Czech Republic, Hungary, Romania and
 Egypt run an hour later than the table in summer. Then pacing: 20 minutes since
 the mailbox's last external send, then a 40% coin flip per tick.

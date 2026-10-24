@@ -242,7 +242,7 @@ case("the warm-up table disappears -> refuses loudly", "warm-up table not found"
 
 # --- Section 9: the Send safety brake (operator decision 2026-10-19) --------
 case("Section 9 loses the safety brake -> refuses loudly", "Send safety brake not found",
-     mutate_doc=lambda d: d.replace("if bounces over the last 3 days exceed 3% of sends",
+     mutate_doc=lambda d: d.replace("if bounces over the last 3 days exceed 10% of sends",
                                     "if bounces are high", 1))
 positive(
     "Section 9's brake window and share flow straight into the Send Config",
@@ -251,7 +251,7 @@ positive(
     and {a["name"]: a["value"] for a in node(load(tmp, "send.json"), "Config")["parameters"]
          ["assignments"]["assignments"]}.get("brake_days") == 7
     else "brake_days/brake_bounce_pct did not follow the doc",
-    mutate_doc=lambda d: d.replace("if bounces over the last 3 days exceed 3% of sends",
+    mutate_doc=lambda d: d.replace("if bounces over the last 3 days exceed 10% of sends",
                                    "if bounces over the last 7 days exceed 5% of sends", 1),
 )
 case("Claim Send stops refusing while a pause is open -> refuses", "no longer refuses while the safety brake is on",
@@ -464,6 +464,18 @@ case("the clock table marks a non-core country 'core' -> refuses",
 case("the clock table disappears -> refuses loudly",
      "no clock table follows",
      mutate_doc=lambda d: d.replace("| Country | Standard offset | Weekend | Tier |\n|---|---|---|---|\n", "", 1))
+# Weekend sending (Section 9, operator decision 2026-10-24).
+case("Section 9 loses the weekend-sending sentence -> refuses loudly", "weekend sending not found",
+     mutate_doc=lambda d: d.replace("Send sends on Saturday and Sunday too", "Send may send at weekends", 1))
+case("the doc drops Sunday and the JS does not follow -> refuses", "weekend sending drifted",
+     mutate_doc=lambda d: d.replace("Send sends on Saturday and Sunday too", "Send sends on Saturday too", 1))
+case("the JS stops sending on Sunday -> refuses", "weekend sending drifted",
+     mutate_file=("code_decide.js", lambda s: s.replace("const WEEKEND_SEND_DAYS = [6, 0];",
+                                                        "const WEEKEND_SEND_DAYS = [6];", 1)))
+case("the business-hours test ignores WEEKEND_SEND_DAYS -> refuses", "no longer lets WEEKEND_SEND_DAYS through",
+     mutate_file=("code_decide.js", lambda s: s.replace(
+         "zone.weekend.indexOf(dow) !== -1 && WEEKEND_SEND_DAYS.indexOf(dow) === -1",
+         "zone.weekend.indexOf(dow) !== -1", 1)))
 case("the directory lists a country nobody gave a clock -> refuses",
      "have no business-hours clock",
      mutate_index=lambda s: dict(s, slugs=sorted(s["slugs"] + ["greenland"])))
