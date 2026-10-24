@@ -1,6 +1,13 @@
+# Every image is pinned to an exact version AND the digest that version had when
+# it was pinned (2026-10-24), so no pull, reinstall or `docker compose up` can
+# change what runs. The tag is for people; with a digest present Docker uses the
+# digest and ignores the tag. A Docker reinstall on 2026-10-23 re-pulled
+# n8nio/n8n:latest and silently upgraded n8n 2.35.7 -> 2.44.6; that is what this
+# prevents. Upgrading is a decision with its own steps: Master Ref Section 3,
+# "Upgrading an image".
 services:
   postgres:
-    image: postgres:16
+    image: postgres:16.15@sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
@@ -21,7 +28,7 @@ services:
       retries: 10
 
   n8n:
-    image: n8nio/n8n:latest
+    image: n8nio/n8n:2.44.6@sha256:d02752c6ab446ae9db8deec2f9cc887c378f77cdcad31650814df936b7386dfb
     restart: unless-stopped
     depends_on:
       postgres:
@@ -55,7 +62,7 @@ services:
     # code mounted read-only, a read-only filesystem, no root, and NO published
     # port -- every request logs in to the mailbox, unauthenticated, so it stays
     # on the compose network. build_workflow.py refuses a `ports:` here.
-    image: python:3.12-alpine
+    image: python:3.12.15-alpine3.24@sha256:b658b05ce9c4eb97ec6fc19424818a1f31993659c2b505a532f470e83807815d
     restart: unless-stopped
     user: "65534:65534"
     read_only: true
@@ -91,7 +98,7 @@ services:
     # It has no authentication of its own, so it stays on the compose network,
     # and it refuses to send as any From but the configured mailbox.
     # build_workflow.py refuses a `ports:` here.
-    image: python:3.12-alpine
+    image: python:3.12.15-alpine3.24@sha256:b658b05ce9c4eb97ec6fc19424818a1f31993659c2b505a532f470e83807815d
     restart: unless-stopped
     user: "65534:65534"
     read_only: true
@@ -109,7 +116,7 @@ services:
     command: ["python", "-u", "/opt/novascout/sendtrack/smtp_send_server.py"]
 
   nocodb:
-    image: nocodb/nocodb:latest
+    image: nocodb/nocodb:2026.10.0@sha256:e8fee91b205b7c51df6e35a9d890d8b68b216e987ed3feb387c5478dff6df951
     restart: unless-stopped
     depends_on:
       postgres:

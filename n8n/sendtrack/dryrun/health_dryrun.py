@@ -28,6 +28,7 @@ import email.policy
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,11 @@ PGUSER = "novascout"
 REAL, BASE, DRY = "novascout", "novascout_dryrun_base", "novascout_dryrun"
 SINK_DIR, SINK_JS = "/tmp/novascout_sink", "/tmp/novascout_smtp_sink.js"
 BAD_CHECKER = "nova-scout-imaphealth-dryrun-badhost"
+# The throwaway checker runs the image the real imap-health service is pinned to,
+# so the dry run never pulls one of its own.
+with open(os.path.join(REPO, "docker-compose.yml"), encoding="utf-8") as _f:
+    _svc = re.search(r"^  imap-health:\n((?:    .*\n|[ \t]*\n)+)", _f.read(), re.M)
+CHECKER_IMAGE = re.search(r"^    image: (\S+)", _svc.group(1), re.M).group(1)
 OPERATOR = "operator@dryrun.invalid"
 SCRATCH = tempfile.mkdtemp(prefix="novascout-health-dryrun-")
 KEEP = "--keep" in sys.argv
@@ -302,7 +308,7 @@ sh(["docker", "run", "-d", "--name", BAD_CHECKER, "--network", network, "--user"
     "--mount", "type=bind,source=%s,target=/opt/novascout/sendtrack,readonly" % SENDTRACK,
     "--mount", "type=bind,source=%s,target=/opt/novascout/NovaScout_MasterRef.md,readonly"
     % os.path.join(REPO, "NovaScout_MasterRef.md"),
-    "python:3.12-alpine", "python", "-u", "/opt/novascout/sendtrack/imap_health_server.py"])
+    CHECKER_IMAGE, "python", "-u", "/opt/novascout/sendtrack/imap_health_server.py"])
 for _ in range(50):
     if "listening" in sh(["docker", "logs", BAD_CHECKER], check=False):
         break
