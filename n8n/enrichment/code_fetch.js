@@ -24,16 +24,35 @@ const LINK_KEYWORDS = [
   'leadership', 'management', 'our-team', 'people', 'staff',
 ];
 
+// Each pattern names the chat embed itself, never the vendor's domain in
+// general: a vendor's domain also serves its analytics, forms, cookie banners
+// and help-centre assets, and a page can mention or link a vendor without
+// running its widget. Measured 2026-10-24: the old HubSpot pattern matched
+// js.hs-scripts.com (HubSpot's tracking loader, on every HubSpot customer's
+// site) and "hs-banner" (its cookie banner) and wrongly disqualified 15 of 17
+// leads. HubSpot's chat is decided by hubspotLoaderChat() below.
 const CHATBOT_PATTERNS = [
-  ['Intercom', /widget\.intercom\.io|intercomcdn\.com|intercomSettings/i],
+  ['Intercom', /widget\.intercom\.io|js\.intercomcdn\.com|intercomSettings/i],
   ['Drift', /js\.driftt\.com|drift\.com\/include|driftt\.com/i],
   ['Tidio', /code\.tidio\.co|tidiochat/i],
-  ['Tawk', /embed\.tawk\.to|tawk\.to/i],
-  ['Crisp', /client\.crisp\.chat|crisp\.chat/i],
-  ['HubSpot Chat', /js\.hs-scripts\.com|js\.usemessages\.com|hs-banner/i],
-  ['LiveChat', /cdn\.livechatinc\.com|livechatinc\.com/i],
-  ['Zendesk', /static\.zdassets\.com|zopim|zendesk\.com\/embeddable/i],
+  ['Tawk', /embed\.tawk\.to|Tawk_API/i],
+  ['Crisp', /client\.crisp\.chat|CRISP_WEBSITE_ID/i],
+  ['HubSpot Chat', /js(?:-[a-z]{2,3}\d)?\.usemessages\.com|conversations-embed\.js|hubspot-messages-iframe-container/i],
+  ['LiveChat', /cdn\.livechatinc\.com|__lc\.license/i],
+  ['Zendesk', /static\.zdassets\.com\/ekr\/snippet\.js|ze-snippet|zopim|zendesk\.com\/embeddable/i],
 ];
+
+// HubSpot's loader, //js.hs-scripts.com/<portal>.js (or a regional host such as
+// js-na2. / js-eu1.), injects js.usemessages.com/conversations-embed.js only
+// when the portal has chat switched on; otherwise it loads analytics, the
+// cookie banner and forms. So a loader is a question, not an answer: fetch it.
+const HUBSPOT_LOADER_RE = /\/\/(js(?:-[a-z]{2,3}\d)?\.hs-scripts\.com)\/(\d+)\.js/gi;
+const HUBSPOT_CHAT_IN_LOADER = /usemessages\.com\/conversations-embed/i;
+// Asked for as a script: HubSpot answers the page fetch's HTML Accept header
+// with 406 Not Acceptable (measured 2026-10-24, which is how the first n8n run
+// read every loader as "no chat").
+const LOADER_ACCEPT = 'application/javascript, */*;q=0.1';
+const MAX_HUBSPOT_LOADERS = 2;
 
 const LINKEDIN_RE = /https?:\/\/(?:[a-z]{2,3}\.)?linkedin\.com\/in\/[A-Za-z0-9\-_%]+/gi;
 
@@ -95,7 +114,7 @@ async function get(url, opts) {
     method: 'GET',
     url,
     timeout: o.timeout || TIMEOUT_MS,
-    headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml', 'Accept-Language': 'en,*;q=0.5' },
+    headers: { 'User-Agent': UA, Accept: o.accept || 'text/html,application/xhtml+xml', 'Accept-Language': 'en,*;q=0.5' },
     json: false,
     returnFullResponse: true,
     ignoreHttpStatusErrors: true,
@@ -194,6 +213,58 @@ function discoverLinks(html, baseUrl, host) {
     }
   }
   return { links: out, anchors };
+}
+
+// The text a pattern matched, with a little context, so the disqualifier's
+// "detected by matching the vendor embed script" can be checked from the data.
+function evidenceAround(re, text) {
+  const m = re.exec(text);
+  if (!m) return null;
+  return text.slice(Math.max(0, m.index - 60), m.index + m[0].length + 60).replace(/\s+/g, ' ');
+}
+
+// Fetches each HubSpot portal loader on the page (at most MAX_HUBSPOT_LOADERS)
+// and reports whether it injects the chat embed: true or false when it was read,
+// false when HubSpot says the portal is gone (404/410), and null -- unknown --
+// for any other answer or none. Unknown does not disqualify: a false positive
+// deletes a real lead, a false negative only costs one email to a company with
+// chat.
+async function hubspotLoaderChat(html) {
+  const seen = new Set();
+  const out = [];
+  let m;
+  HUBSPOT_LOADER_RE.lastIndex = 0;
+  while ((m = HUBSPOT_LOADER_RE.exec(html)) !== null && out.length < MAX_HUBSPOT_LOADERS) {
+    const url = 'https://' + m[1].toLowerCase() + '/' + m[2] + '.js';
+    if (seen.has(m[2])) continue;
+    seen.add(m[2]);
+    try {
+      const r = await get(url, { accept: LOADER_ACCEPT });
+      const body = String(r.body || '');
+      const read = r.statusCode >= 200 && r.statusCode < 300;
+      const gone = r.statusCode === 404 || r.statusCode === 410;
+      out.push({ url, status: r.statusCode, chat: read ? HUBSPOT_CHAT_IN_LOADER.test(body) : gone ? false : null });
+    } catch (e) {
+      out.push({ url, status: null, chat: null, error: (e.message || String(e)).slice(0, 120) });
+    }
+  }
+  return out;
+}
+
+async function detectChat(blob) {
+  const evidence = {};
+  for (const [vendor, re] of CHATBOT_PATTERNS) {
+    const hit = evidenceAround(re, blob);
+    if (hit) evidence[vendor] = hit;
+  }
+  if (!evidence['HubSpot Chat']) {
+    const loaders = await hubspotLoaderChat(blob);
+    if (loaders.length) evidence.hubspot_loaders = loaders;
+    const chatLoader = loaders.find((l) => l.chat === true);
+    if (chatLoader) evidence['HubSpot Chat'] = 'portal loader ' + chatLoader.url + ' injects conversations-embed.js';
+  }
+  const vendors = CHATBOT_PATTERNS.map(([v]) => v).filter((v) => evidence[v]);
+  return { vendors, evidence };
 }
 
 // Leads are fetched CONCURRENTLY. The serial constraint in Section 3 is about
@@ -307,7 +378,9 @@ async function processLead(item) {
 
   rec.pages_fetched = pages.length;
 
-  const vendors = CHATBOT_PATTERNS.filter(([, re2]) => re2.test(blob)).map(([v]) => v);
+  const chat = await detectChat(blob);
+  const vendors = chat.vendors;
+  rec.chat_evidence = chat.evidence;
   rec.has_chatbot = vendors.length > 0;
   rec.chatbot_vendor = vendors.length ? vendors.join(', ') : null;
   rec.linkedin_candidates = Array.from(new Set((blob.match(LINKEDIN_RE) || []).map((u) => u))).slice(0, 10);

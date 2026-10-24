@@ -37,6 +37,7 @@ return {
           discovered: src.discovered,
           anchors_seen: src.anchors_seen,
           errors: src.fetch_errors,
+          chat_evidence: src.chat_evidence,
           prompt_chars: src.prompt_chars,
         },
         model: null,
