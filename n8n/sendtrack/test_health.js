@@ -67,7 +67,7 @@ t.check('a message still missed on the second check -> alert, listing it for a b
 
 a = assess(OK, failingRow(1, { missing_sent: [{ message_id: '<s1@amitrixlabs.com>', at: '2026-09-16T14:00:00.000Z', to: 'x@cro.example' }] }), CFG);
 t.check('a Sent message missing from the mirror -> sent-missed, says the ceiling does not count it',
-  [a.problems, a.alert_kind, a.text.includes('warm-up ceiling does not count them'), a.text.includes('<s1@amitrixlabs.com>')],
+  [a.problems, a.alert_kind, a.text.includes('warm-up ceiling may not count them'), a.text.includes('<s1@amitrixlabs.com>')],
   [['sent-missed'], 'problem', true, true]);
 
 a = assess(FAILED, failingRow(1, { missing_inbox: MISSED }), CFG);
@@ -134,6 +134,33 @@ t.check('13 missed messages -> the first 10 listed, then a count',
   [true, false, true, 'inbox-missed: 13 message(s)']);
 t.check('subject stays within 200 characters', assess(FAILED, failingRow(1, { missing_inbox: MISSED,
   missing_sent: [{ message_id: '<s>', at: NOW, to: 'x' }] }), { ...CFG }).subject.length <= 200, true);
+
+// --- 2026-10-28: the Sent-mirror gap ---------------------------------------------------
+const BLOCKED = [{ message_id: '<cbabc4b5@amitrixlabs.example>', sent_at: '2026-09-16T14:20:36.000Z' }];
+const CFG2 = Object.assign({}, CFG, { block_alert_min: 20, block_min: 35 });
+a = assess(OK, row({ blocked_sends: BLOCKED, missing_sent: [{ message_id: BLOCKED[0].message_id,
+  at: '2026-09-16T14:21:00.000Z', to: 'bd@cro.example' }] }), CFG2);
+t.check('Send blocked by sent-mirror-behind -> send-blocked, confirmed and alerted on the FIRST check',
+  [a.problems, a.confirmed, a.alert_kind, a.notify], [['sent-missed', 'send-blocked'], true, 'problem', true]);
+t.check('... the alert says how long, names the send, and gives the repair tool',
+  [a.text.includes('for more than 20 minutes'), a.text.includes('<cbabc4b5@amitrixlabs.example>'),
+    a.text.includes('reconcile_sent_mirror.py'), a.subject.includes('Send is blocked')], [true, true, true, true]);
+t.check('... and its detail counts the sends', a.state.detail.includes('send-blocked: 1 send(s)'), true);
+a = assess(OK, row({ mismatched_sent: [{ message_id: '<gone@amitrixlabs.example>', sent_at: NOW }] }), CFG2);
+t.check('the mirror marks seen what the folder lacks -> sent-mismatch, NOT confirmed on one check',
+  [a.problems, a.confirmed, a.alert_kind], [['sent-mismatch'], false, null]);
+a = assess(OK, failingRow(1, { prev_problems: ['sent-mismatch'],
+  mismatched_sent: [{ message_id: '<gone@amitrixlabs.example>', sent_at: NOW }] }), CFG2);
+t.check('... on the second failing check it alerts, naming the message',
+  [a.alert_kind, a.text.includes('<gone@amitrixlabs.example>'), a.text.includes('are not in the Sent folder')],
+  ['problem', true, true]);
+a = assess(OK, row({ missing_sent: [{ message_id: '<s1@x>', at: NOW, to: 'x@cro.example' }] }), CFG2);
+t.check('sent-missed alone still waits for a second check (the reconcile usually clears it first)',
+  [a.problems, a.confirmed], [['sent-missed'], false]);
+t.check('... and its text points at the reconcile and the repair tool, not at re-publishing',
+  [a.text, a.confirmed ? 'x' : ''].join('').length >= 0 &&
+  assess(OK, failingRow(1, { prev_problems: ['sent-missed'], missing_sent: [{ message_id: '<s1@x>', at: NOW, to: 'x' }] }),
+    CFG2).text.includes('reconcile_sent_mirror.py'), true);
 
 // --- the node body, as n8n runs it ---------------------------------------------------------
 const out = runOnceForAll(FILE, [{ json: failingRow(1) }], {

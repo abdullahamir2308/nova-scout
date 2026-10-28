@@ -13,7 +13,22 @@
 // The second is the one that proves the triggers are listening: a login that
 // works says the mailbox is reachable, not that n8n is still connected to it.
 //
-// Nothing alerts on one bad check. Both outages on 2026-09-16 were a host
+// Since 2026-10-28 it also asks the two questions the Sent-mirror gap of that
+// morning showed nobody was asking (Section 9, Workflow 6):
+//
+//   3. Do the mirror and the folder agree?  A Sent message is only mirrored
+//      once mailbox_sent has it with seen_in_sent_folder = true -- Send writes
+//      its own row the moment SMTP accepts, so "a row exists" proved nothing,
+//      and IMAP Health stayed green while Send was blocked. And the other way:
+//      a row the mirror says it SAW in the folder that the folder does not hold
+//      (sent-mismatch).
+//   4. Is Send blocked by sent-mirror-behind?  A workflow send unseen for longer
+//      than Send's own grace plus block_alert_min (send-blocked). The duration is
+//      in the condition itself, so this one alerts on the FIRST check that finds
+//      it -- waiting for a second would add up to another interval of a send
+//      path that has already been stopped for block_alert_min.
+//
+// Nothing alerts on one bad check (send-blocked excepted, above). Both outages on 2026-09-16 were a host
 // waking or starting, and on a wake this workflow can tick before Mailbox Watch
 // has reconnected -- mail that arrived during sleep looks "missed" for a few
 // seconds. confirm_after consecutive failing checks are needed first. Then one
@@ -32,7 +47,13 @@ const PROBLEMS = {
   'imap-failed': 'the mailbox is not reachable over IMAP',
   'inbox-missed': 'Mailbox Watch has missed INBOX mail',
   'sent-missed': 'Mailbox Watch has missed Sent mail',
+  'sent-mismatch': 'the Sent mirror lists mail the Sent folder does not hold',
+  'send-blocked': 'Send is blocked: its own sends are missing from the Sent mirror',
 };
+
+// Problems whose condition already says how long it has lasted: no second
+// check needed before alerting.
+const IMMEDIATE = ['send-blocked'];
 
 const LIST_MAX = 10;
 
@@ -102,11 +123,31 @@ function problemLines(code, ctx) {
         'Until then, read these by hand and blocklist any opt-out:',
     ].concat(listMessages(rows, (r) => '  ' + str(r.at) + '  ' + str(r.from) + '  "' + str(r.subject) + '"'));
   }
+  if (code === 'send-blocked') {
+    const rows = arr(db.blocked_sends);
+    return [
+      'Send has been refusing everything (sent-mirror-behind) for more than ' + cfg.block_alert_min + ' minutes: ' +
+        rows.length + ' of its own send(s) went out and never appeared in the Sent mirror. Nothing cold goes ' +
+        'out until they do. Mailbox Watch reconciles the Sent folder every 10 minutes, so if this lasts, the ' +
+        'message is not in the folder at all, or the reconcile is not running.',
+      'Check and repair with:  python n8n/sendtrack/reconcile_sent_mirror.py   (dry run; add --apply to write). ' +
+        'It marks a send seen only when the real Sent folder holds it.',
+    ].concat(listMessages(rows, (r) => '  ' + str(r.sent_at) + '  ' + str(r.message_id)));
+  }
+  if (code === 'sent-mismatch') {
+    const rows = arr(db.mismatched_sent);
+    return [
+      rows.length + ' message(s) the Sent mirror marks as seen in the folder are not in the Sent folder now ' +
+        '(deleted or moved by hand?). The warm-up ceiling still counts them, which errs towards sending less; ' +
+        'look at them before trusting the mirror.',
+    ].concat(listMessages(rows, (r) => '  ' + str(r.sent_at) + '  ' + str(r.message_id)));
+  }
   const rows = arr(db.missing_sent);
   return [
-    rows.length + ' Sent message(s) landed more than ' + cfg.grace_min + ' minutes ago and are not in the Sent ' +
-      'mirror (mailbox_sent), so the warm-up ceiling does not count them. Re-publishing Mailbox Watch re-reads ' +
-      'the whole folder.',
+    rows.length + ' Sent message(s) landed more than ' + cfg.grace_min + ' minutes ago and are not confirmed in ' +
+      'the Sent mirror (mailbox_sent with seen_in_sent_folder), so the warm-up ceiling may not count them and ' +
+      'Send stops once one of its own is older than its grace. Mailbox Watch reconciles the folder every 10 ' +
+      'minutes; if this lasts, run python n8n/sendtrack/reconcile_sent_mirror.py.',
   ].concat(listMessages(rows, (r) => '  ' + str(r.at) + '  to ' + (str(r.to) || '?') + '  ' + str(r.message_id)));
 }
 
@@ -117,13 +158,16 @@ function assess(check, db, cfg) {
   if (found) problems.push(found.code);
   if (arr(db.missing_inbox).length) problems.push('inbox-missed');
   if (arr(db.missing_sent).length) problems.push('sent-missed');
+  if (arr(db.mismatched_sent).length) problems.push('sent-mismatch');
+  if (arr(db.blocked_sends).length) problems.push('send-blocked');
   const healthy = problems.length === 0;
 
   const prevAlertedAt = str(db.prev_last_alerted_at) || null;
   const prevAlerted = arr(db.prev_alerted_problems);
   const consecutive = healthy ? 0 : (Number(db.prev_consecutive_failures) || 0) + 1;
   const failingSince = healthy ? null : str(db.prev_failing_since) || str(db.now);
-  const confirmed = !healthy && consecutive >= cfg.confirm_after;
+  const confirmed = !healthy && (consecutive >= cfg.confirm_after ||
+    problems.some((p) => IMMEDIATE.indexOf(p) !== -1));
   const sameProblems = problems.slice().sort().join(',') === prevAlerted.slice().sort().join(',');
   const reminderDue = prevAlertedAt !== null && now - ms(prevAlertedAt) >= cfg.remind_hours * 3600 * 1000;
 
@@ -169,6 +213,8 @@ function assess(check, db, cfg) {
     if (p === 'checker-unreachable') return p + ': ' + found.why;
     if (p === 'imap-failed') return p + ' at ' + (str(ctx.check.stage) || '?') + ': ' + (str(ctx.check.detail) || '?');
     if (p === 'inbox-missed') return p + ': ' + arr(db.missing_inbox).length + ' message(s)';
+    if (p === 'send-blocked') return p + ': ' + arr(db.blocked_sends).length + ' send(s)';
+    if (p === 'sent-mismatch') return p + ': ' + arr(db.mismatched_sent).length + ' message(s)';
     return p + ': ' + arr(db.missing_sent).length + ' message(s)';
   }).join('; ').slice(0, 2000);
 

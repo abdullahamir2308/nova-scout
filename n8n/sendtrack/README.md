@@ -78,6 +78,27 @@ the manual sends with no error anywhere. Consequence worth knowing: the Sent
 trigger only fires once the folder holds a message, so **nothing is sent until
 at least one message is in Sent and Mailbox Watch is published.**
 
+**The Sent reconcile (2026-10-28).** The Sent trigger reacts only to a new
+arrival, so a send that lands while its connection is not listening is never
+delivered to it — and once Send stops for it, nothing new arrives to wake the
+trigger (that morning: 07:40 send missed, Send blocked 07:55–08:22). So Mailbox
+Watch also reads the folder on its own clock: every 10 minutes, and when n8n
+starts or the workflow is published (`n8n Trigger`). *List Sent Folder* asks the
+imap-health checker for its read-only listing (last 48 hours, Message-ID, Date,
+To/Cc/Bcc); *Plan Sent Reconcile* (`code_reconcile_sent.js`, with
+`code_mirror_sent.js`'s library above it) builds rows with Normalise Sent's own
+`sentRows()`; *Reconcile Sent* is Mirror Sent's upsert, cut verbatim out of its
+statement by the build. Only a complete listing writes anything; only a
+well-formed Message-ID is used as the key; a known message only gets
+`seen_in_sent_folder = true`. Proven by `test_reconcile.js`,
+`test_sent_reconcile_sql.py` (+ `_mutations.py`, 12/12 killed) and
+`dryrun/sent_gap_dryrun.py` (the gap end to end through n8n, 22/22).
+
+**Repairing by hand:** `python n8n/sendtrack/reconcile_sent_mirror.py` (dry run:
+the shipped statement in a rolled-back transaction) and `--apply`. It lists the
+whole real Sent folder read-only and never marks seen a send the folder lacks —
+those are printed as UNREPAIRABLE.
+
 The ceiling is checked twice. Decide Send refuses at the ceiling; then Claim
 Send re-counts it in SQL, under a Postgres advisory lock taken in a *separate
 statement* — the Postgres node runs the text as one implicit transaction, and

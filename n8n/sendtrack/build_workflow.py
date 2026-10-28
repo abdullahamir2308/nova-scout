@@ -427,6 +427,15 @@ def load_weekend_send_days(doc):
     return days
 
 
+def load_reconcile_interval(doc):
+    """Section 9, Workflow 6 (2026-10-28): how often Mailbox Watch reconciles the Sent folder."""
+    m = re.search(r"the Sent reconcile runs every (\d+) minutes", doc)
+    if not m:
+        raise AssertionError("the Sent reconcile interval not found in Section 9 of %s -- expected "
+                             "'the Sent reconcile runs every N minutes'" % MASTER_REF)
+    return int(m.group(1))
+
+
 def load_health_interval(doc):
     m = re.search(r"health check runs every (\d+) minutes", doc)
     if not m:
@@ -1107,7 +1116,67 @@ SELECT (SELECT count(*) FROM up WHERE inserted)::int     AS new_rows,
        (SELECT __ISO_S__ FROM s)                         AS synced_at
   FROM p;""".replace("__ISO_S__", iso("s.last_synced_at"))
 
-LOAD_SETTINGS_SQL = """-- Load Settings: the operator's notification address, read at runtime from the
+# Reconcile Sent (2026-10-28): the Sent folder read on Mailbox Watch's own clock
+# and upserted with Mirror Sent's OWN statement body -- the `r` and `up` CTEs are
+# cut out of MIRROR_SQL below, not retyped, so the two paths cannot write a row
+# differently. Around them: `listed` gates everything (an incomplete listing
+# reconciles nothing), `was` is the mirror before this statement (one snapshot,
+# so it sees the rows as they were), and the read is stamped on its own
+# mailbox_sync row, 'Sent-reconcile' -- not 'Sent', which stays the trigger's
+# proof of life.
+_MIRROR_R_UP = MIRROR_SQL[MIRROR_SQL.index("r AS ("):MIRROR_SQL.index("s AS (")]
+RECONCILE_SQL = """-- Reconcile Sent: the Sent folder as the imap-health checker listed it, read
+-- on Mailbox Watch's own clock (every 10 minutes, and on start or publish) --
+-- because the Sent trigger reacts only to new mail, and a send that landed
+-- while its connection was down is never delivered to it (Section 9,
+-- Workflow 6, 2026-10-28). The `r` and `up` CTEs are Mirror Sent's, verbatim.
+--
+-- $1 Plan Sent Reconcile's payload: {listed, rows, seen, undated, skipped, hours}
+--
+--   * nothing at all happens unless `listed` is true -- the checker answered
+--     with a complete listing. So a row is only ever marked seen when the
+--     folder holds its Message-ID.
+--   * keyed on Message-ID (the primary key): a known message only gets
+--     seen_in_sent_folder = true, a message the mirror never had is inserted as
+--     the trigger would have inserted it, and a repeat changes nothing.
+WITH p AS (
+  SELECT $1::jsonb AS p
+),
+listed AS (
+  SELECT coalesce((p.p->>'listed')::boolean, false) AS ok FROM p
+),
+""" + _MIRROR_R_UP.replace("FROM p, jsonb_array_elements(p.p->'rows') AS x",
+                           "FROM p, listed, jsonb_array_elements(p.p->'rows') AS x\n   WHERE listed.ok") + """was AS (
+  SELECT m.message_id, m.seen_in_sent_folder
+    FROM mailbox_sent m
+   WHERE m.message_id IN (SELECT r.message_id FROM r)
+),
+s AS (
+  INSERT INTO mailbox_sync (folder, last_synced_at, messages_seen, undated)
+  SELECT 'Sent-reconcile', now(), (p.p->>'seen')::int, (p.p->>'undated')::int
+    FROM p, listed
+   WHERE listed.ok
+  ON CONFLICT (folder) DO UPDATE
+     SET last_synced_at = EXCLUDED.last_synced_at,
+         messages_seen  = EXCLUDED.messages_seen,
+         undated        = EXCLUDED.undated
+  RETURNING last_synced_at
+)
+SELECT (SELECT ok FROM listed)                                              AS listed,
+       (SELECT count(*) FROM r)::int                                        AS listed_rows,
+       (SELECT count(*) FROM up WHERE inserted)::int                        AS new_rows,
+       (SELECT count(*) FROM was WHERE NOT was.seen_in_sent_folder)::int    AS healed,
+       (SELECT coalesce(jsonb_agg(was.message_id ORDER BY was.message_id), '[]'::jsonb)
+          FROM was WHERE NOT was.seen_in_sent_folder)                       AS healed_ids,
+       (SELECT count(*) FROM was WHERE was.seen_in_sent_folder)::int        AS already_seen,
+       coalesce((p.p->>'skipped')::int, 0)                                  AS skipped,
+       (SELECT __ISO_S__ FROM s)                                            AS synced_at
+  FROM p;""".replace("__ISO_S__", iso("s.last_synced_at"))
+assert "ON CONFLICT (message_id) DO UPDATE SET seen_in_sent_folder = true" in RECONCILE_SQL
+assert MIRROR_SQL[MIRROR_SQL.index("up AS ("):MIRROR_SQL.index("s AS (")] in RECONCILE_SQL, (
+    "Reconcile Sent's upsert is no longer Mirror Sent's, verbatim")
+
+LOAD_SETTINGS_SQL ="""-- Load Settings: the operator's notification address, read at runtime from the
 -- settings table (migration 008; written from .env by sync_settings.py), so it
 -- is never baked into this workflow. Normalise Sent treats a message that went
 -- only to it like a note to an own-domain colleague: not a warm-up send.
@@ -2113,9 +2182,20 @@ HEALTH_LOAD_SQL = with_iso("""-- Load Health State: the IMAP checker's Message-I
 -- has recorded, plus this check's previous state -- one statement, one snapshot,
 -- one clock.
 --
--- $1 {inbox: [{message_id, at, from, subject}], sent: [{message_id, at, to}], grace_min}
+-- $1 {inbox: [{message_id, at, from, subject}], sent: [{message_id, at, to}], grace_min,
+--     listed, since, block_min}
 --    The lists come from Check IMAP (empty when the checker did not answer);
---    `at` is INTERNALDATE, when the message landed in its folder.
+--    `at` is INTERNALDATE, when the message landed in its folder. `listed` is
+--    true only when the checker's IMAP check passed, `since` the start of its
+--    window. `block_min` is Send's mirror grace plus block_alert_min.
+--
+-- Since 2026-10-28 (the Sent-mirror gap): a Sent message counts as mirrored
+-- only when mailbox_sent has it with seen_in_sent_folder -- Send writes its own
+-- row as SMTP accepts, so the row alone proved nothing. MISMATCHED is the other
+-- direction: a row the mirror marks seen whose Message-ID the folder no longer
+-- holds (only when `listed`, only inside the window with an hour's margin, never
+-- the mirror's own fallback ids). BLOCKED is Send's sent-mirror-behind rule --
+-- Load Send State's definition, word for word -- aged by block_min.
 --
 -- A message is MISSED once it has been in its folder longer than grace_min with
 -- no row. INBOX counts only from when Mailbox Watch first ran: its Inbox trigger
@@ -2162,7 +2242,21 @@ missed_inbox AS (
 missed_sent AS (
   SELECT s.* FROM sent s, clk
    WHERE s.at <= clk.now - clk.grace
-     AND NOT EXISTS (SELECT 1 FROM mailbox_sent m WHERE m.message_id = s.message_id)
+     AND NOT EXISTS (SELECT 1 FROM mailbox_sent m WHERE m.message_id = s.message_id AND m.seen_in_sent_folder)
+),
+mismatched_sent AS (
+  SELECT m.message_id, m.sent_at FROM mailbox_sent m, p, clk
+   WHERE coalesce((p.p->>'listed')::boolean, false)
+     AND m.seen_in_sent_folder
+     AND m.sent_at >= (p.p->>'since')::timestamptz + interval '1 hour'
+     AND m.sent_at <= clk.now - clk.grace
+     AND m.message_id NOT LIKE '<no-message-id.%'
+     AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.message_id = m.message_id)
+),
+blocked_sends AS (
+  SELECT m.message_id, m.sent_at FROM mailbox_sent m, p, clk
+   WHERE m.source = 'workflow' AND NOT m.seen_in_sent_folder
+     AND m.sent_at <= clk.now - make_interval(mins => (p.p->>'block_min')::int)
 ),
 h AS (
   SELECT * FROM mailbox_health WHERE check_name = 'imap'
@@ -2177,6 +2271,13 @@ SELECT ISO(clk.now) AS now,
        (SELECT coalesce(jsonb_agg(jsonb_build_object('message_id', message_id, 'at', ISO(at),
                                                      'to', to_addr) ORDER BY at), '[]'::jsonb)
           FROM missed_sent) AS missing_sent,
+       (SELECT coalesce(jsonb_agg(jsonb_build_object('message_id', message_id, 'sent_at', ISO(sent_at))
+                                  ORDER BY sent_at), '[]'::jsonb)
+          FROM mismatched_sent) AS mismatched_sent,
+       (SELECT coalesce(jsonb_agg(jsonb_build_object('message_id', message_id, 'sent_at', ISO(sent_at))
+                                  ORDER BY sent_at), '[]'::jsonb)
+          FROM blocked_sends) AS blocked_sends,
+       (SELECT ISO(last_synced_at) FROM mailbox_sync WHERE folder = 'Sent-reconcile') AS reconciled_at,
        (SELECT healthy FROM h) AS prev_healthy,
        (SELECT problems FROM h) AS prev_problems,
        (SELECT consecutive_failures FROM h) AS prev_consecutive_failures,
@@ -2555,7 +2656,7 @@ for _fn, _arg, _called in (("renderFollowUp", "f", "renderFollowUp"), ("gate", "
 _health = js("code_health.js")
 _server = js("imap_health_server.py")
 _preflight = js("imap_preflight.py")
-HEALTH_CONFIG_FIELDS = {"checker_url", "grace_min", "confirm_after", "remind_hours"}
+HEALTH_CONFIG_FIELDS = {"checker_url", "grace_min", "confirm_after", "remind_hours", "block_alert_min", "block_min"}
 _assert_wired("Assess Health (db.*)", _reads(_health, "db"), final_select_aliases(HEALTH_LOAD_SQL), "Load Health State")
 _assert_wired("Assess Health (cfg.*)", _reads(_health, "cfg"), HEALTH_CONFIG_FIELDS, "Config")
 _assert_wired("Assess Health (check.*)", _reads(_health, "check") - {"error"},
@@ -2882,6 +2983,52 @@ DECIDE_JS = (
 CHECK_JS = bake("code_check_smtp.js", OWN_DOMAIN=OWN_DOMAIN)
 MIRROR_JS = bake("code_mirror_sent.js", OWN_DOMAIN=OWN_DOMAIN)
 
+# The checker is the imap-health service in docker-compose.yml, on the port
+# imap_health_server.py listens on; both are asserted below.
+_port = re.search(r"^PORT = (\d+)$", _server, re.M)
+assert _port, "PORT not found in imap_health_server.py"
+HEALTH_CHECKER_SERVICE = "imap-health"
+HEALTH_CONFIG = {"checker_url": "http://%s:%s/check" % (HEALTH_CHECKER_SERVICE, _port.group(1)),
+                 "grace_min": 15, "confirm_after": 2, "remind_hours": 6, "block_alert_min": 20}
+# Send fails closed sent-mirror-behind once one of its own sends has been missing
+# from the Sent mirror for MIRROR_GRACE_MIN (code_decide.js). IMAP Health calls
+# Send blocked once that has lasted block_alert_min more (2026-10-28: "alert if
+# Send has been blocked by sent-mirror-behind for more than 20 minutes").
+SEND_MIRROR_GRACE_MIN = _js_int(js("code_decide.js"), "MIRROR_GRACE_MIN", "code_decide.js")
+HEALTH_BLOCK_MIN = SEND_MIRROR_GRACE_MIN + HEALTH_CONFIG["block_alert_min"]
+
+# The Sent reconcile (2026-10-28): code_mirror_sent.js's library -- messageId(),
+# sentRows(), the external rule -- above Plan Sent Reconcile's own code, so a
+# reconciled message becomes exactly the row the Sent trigger would have written.
+RECONCILE_JS = (
+    "// Plan Sent Reconcile -- generated by n8n/sendtrack/build_workflow.py.\n"
+    "// Part 1, verbatim: n8n/sendtrack/code_mirror_sent.js above its 'Node body' marker.\n"
+    "// Part 2: n8n/sendtrack/code_reconcile_sent.js.\n\n"
+    + bake_src(above_node_body("code_mirror_sent.js"), "code_mirror_sent.js", OWN_DOMAIN=OWN_DOMAIN)
+    + "\n" + bake("code_reconcile_sent.js")
+)
+# Wiring guards for the reconcile (2026-10-28), the same kind as every other node
+# boundary here: what Reconcile Sent reads, Plan Sent Reconcile (or the mirror
+# library above it) emits; what Plan Sent Reconcile reads off a listing entry,
+# imap_preflight.py writes; and IMAP Health's "Send is blocked" is Load Send
+# State's own sent-mirror-behind rule, word for word.
+_assert_js_emits("Reconcile Sent", _sql_payload_reads(RECONCILE_SQL) | set(re.findall(r"x->>?'(\w+)'", RECONCILE_SQL)),
+                 js("code_mirror_sent.js") + js("code_reconcile_sent.js"), "Plan Sent Reconcile")
+_entry_reads = set(re.findall(r"\be\.(\w+)", js("code_reconcile_sent.js")))
+_listing_keys = set(re.findall(r'"(\w+)":', js("imap_preflight.py")))
+assert _entry_reads and _entry_reads <= _listing_keys, (
+    "Plan Sent Reconcile reads listing fields imap_preflight.py --ids-json does not write: %r"
+    % sorted(_entry_reads - _listing_keys))
+_UNCONFIRMED = "m.source = 'workflow' AND NOT m.seen_in_sent_folder"
+assert _UNCONFIRMED in LOAD_STATE_SQL and _UNCONFIRMED in HEALTH_LOAD_SQL, (
+    "IMAP Health's send-blocked no longer uses Load Send State's sent-mirror-behind rule word for word")
+RECONCILE_INTERVAL_MIN = load_reconcile_interval(DOC)
+RECONCILE_TRIGGER = "Reconcile Every %d Minutes" % RECONCILE_INTERVAL_MIN
+assert RECONCILE_INTERVAL_MIN < SEND_MIRROR_GRACE_MIN, (
+    "Section 9 has the Sent reconcile every %d minutes, but Send stops %d minutes after one of its own sends "
+    "goes missing from the mirror -- the reconcile must come round inside that grace."
+    % (RECONCILE_INTERVAL_MIN, SEND_MIRROR_GRACE_MIN))
+
 # Workflow 7's operator-command library, verbatim above its own 'Node body'
 # marker, then Classify Inbound: so one message is read for a command and for a
 # classification by the same two files that the Decide Command node runs, and
@@ -3168,9 +3315,10 @@ send_connections = {
 
 mailwatch_nodes = [
     imap_trigger("Sent Folder", "Sent", False, [-880, -100],
-                 "The warm-up ceiling's input. Reads the WHOLE Sent folder on every activation (Fetch Only New "
-                 "Emails off), so manual sends made while n8n was down are counted; then each new message as it "
-                 "is filed. Keyed on Message-ID, so re-reads are no-ops."),
+                 "The warm-up ceiling's input. Fires only when a message ARRIVES (n8n EmailReadImap v2.2): the "
+                 "first arrival after an activation reads the whole folder, later ones only newer UIDs. A message "
+                 "that lands while its connection is down is never delivered here -- Reconcile, below, picks it "
+                 "up. Keyed on Message-ID, so re-reads are no-ops."),
     dict(pg_node("Load Settings", LOAD_SETTINGS_SQL, None, [-660, -100],
                  "The operator's notification address, from the settings table at runtime (sync_settings.py "
                  "writes it from .env) -- never baked into this JSON. Once per trigger batch."),
@@ -3182,6 +3330,46 @@ mailwatch_nodes = [
     pg_node("Mirror Sent", MIRROR_SQL, "={{ [JSON.stringify($json.payload)] }}", [-220, -100],
             "Upsert into mailbox_sent; stamp mailbox_sync. The send path refuses to send until this has run "
             "at least once, and stops if its own sends stop appearing here."),
+    # The Sent reconcile (2026-10-28): the same upsert, fed by a read-only
+    # listing of the folder on this workflow's own clock instead of an arrival.
+    {"parameters": {"rule": {"interval": [{"field": "minutes", "minutesInterval": RECONCILE_INTERVAL_MIN}]}},
+     "name": RECONCILE_TRIGGER, "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2,
+     "position": [-1100, -360],
+     "notes": ("Section 9: the Sent reconcile runs every %d minutes -- inside Send's %d-minute mirror grace, so a "
+               "send the Sent trigger missed is mirrored before Send would stop for it. n8n offers no hook for "
+               "an IMAP reconnect (the trigger only logs it), so this tick is what covers one."
+               % (RECONCILE_INTERVAL_MIN, SEND_MIRROR_GRACE_MIN))},
+    {"parameters": {"events": ["init", "activate", "update"]},
+     "name": "On Start or Publish", "type": "n8n-nodes-base.n8nTrigger", "typeVersion": 1,
+     "position": [-1100, -540],
+     "notes": "Reconcile at once when n8n starts (Instance Started) and whenever this workflow is published "
+              "(Workflow Published / Published Workflow Updated) -- the moments the Sent trigger reconnects "
+              "and, unlike an arrival, reads nothing."},
+    {"parameters": {"assignments": {"assignments": [
+        {"id": "checker", "name": "checker_url", "value": HEALTH_CONFIG["checker_url"], "type": "string"},
+    ]}, "options": {}},
+     "name": "Config", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [-880, -450],
+     "notes": "checker_url: the imap-health service (docker-compose.yml), the same read-only IMAP listing IMAP "
+              "Health uses -- its 60-second answer cache keeps the two from logging in twice."},
+    http_get_node("List Sent Folder", "={{ $json.checker_url }}", 150000, [-660, -450],
+                  "imap_preflight.py run by the imap-health service: a fresh read-only IMAP session (EXAMINE, "
+                  "BODY.PEEK -- nothing is marked, moved or deleted) and every Sent message of the last 48 hours "
+                  "by Message-ID with its Date and recipient headers."),
+    dict(pg_node("Reconcile Settings", LOAD_SETTINGS_SQL, None, [-440, -450],
+                 "The operator's notification address, as for Normalise Sent: a message only to it is not a "
+                 "warm-up send."),
+         executeOnce=True),
+    code_node("Plan Sent Reconcile", RECONCILE_JS, "runOnceForAllItems", [-220, -450],
+              "Only a complete listing counts (the checker's IMAP check passed): otherwise listed=false and "
+              "nothing is reconciled. Each entry is matched on its Message-ID and turned into a row by "
+              "Normalise Sent's own code; an entry without a well-formed Message-ID is skipped, never keyed "
+              "on a fallback."),
+    if_node("Listed?", "listed", "={{ $json.listed }}", [0, -450],
+            "False: the checker gave no complete listing -- nothing is written, the next tick tries again."),
+    pg_node("Reconcile Sent", RECONCILE_SQL, "={{ [JSON.stringify($json.payload)] }}", [220, -450],
+            "Mirror Sent's upsert, verbatim, on Message-ID: a send the trigger missed is marked "
+            "seen_in_sent_folder (healed), a message the mirror never had is inserted, anything known is left "
+            "alone. Stamps mailbox_sync 'Sent-reconcile'."),
     imap_trigger("Inbox", "INBOX", True, [-880, 160],
                  "Replies, opt-outs, bounces, out-of-offices. Only new messages after the first activation; "
                  "the last UID survives restarts, so anything that arrived while n8n was down is caught up."),
@@ -3248,6 +3436,13 @@ mailwatch_connections = {
     "Sent Folder": edge("Load Settings"),
     "Load Settings": edge("Normalise Sent"),
     "Normalise Sent": edge("Mirror Sent"),
+    RECONCILE_TRIGGER: edge("Config"),
+    "On Start or Publish": edge("Config"),
+    "Config": edge("List Sent Folder"),
+    "List Sent Folder": edge("Reconcile Settings"),
+    "Reconcile Settings": edge("Plan Sent Reconcile"),
+    "Plan Sent Reconcile": edge("Listed?"),
+    "Listed?": branch("Reconcile Sent"),
     "Inbox": edge("Classify Inbound"),
     # The operator fork comes FIRST, which is the whole point of Section 9,
     # Workflow 7's hazard: Record Inbound is only ever reached by a message that
@@ -3347,13 +3542,6 @@ for _n in followup_nodes:
 # Workflow: IMAP Health
 # ---------------------------------------------------------------------------
 
-# The checker is the imap-health service in docker-compose.yml, on the port
-# imap_health_server.py listens on; both are asserted below.
-_port = re.search(r"^PORT = (\d+)$", _server, re.M)
-assert _port, "PORT not found in imap_health_server.py"
-HEALTH_CHECKER_SERVICE = "imap-health"
-HEALTH_CONFIG = {"checker_url": "http://%s:%s/check" % (HEALTH_CHECKER_SERVICE, _port.group(1)),
-                 "grace_min": 15, "confirm_after": 2, "remind_hours": 6}
 
 health_nodes = [
     {"parameters": {"rule": {"interval": [{"field": "minutes", "minutesInterval": HEALTH_INTERVAL_MIN}]}},
@@ -3370,12 +3558,18 @@ health_nodes = [
             {"id": "grace", "name": "grace_min", "value": HEALTH_CONFIG["grace_min"], "type": "number"},
             {"id": "confirm", "name": "confirm_after", "value": HEALTH_CONFIG["confirm_after"], "type": "number"},
             {"id": "remind", "name": "remind_hours", "value": HEALTH_CONFIG["remind_hours"], "type": "number"},
+            {"id": "blockalert", "name": "block_alert_min", "value": HEALTH_CONFIG["block_alert_min"],
+             "type": "number"},
+            {"id": "blockmin", "name": "block_min", "value": HEALTH_BLOCK_MIN, "type": "number"},
         ]}, "options": {}},
         "name": "Config", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [-880, 130],
         "notes": ("grace_min: how long a message may sit in INBOX or Sent unrecorded before it counts as missed "
                   "(the triggers record within seconds). confirm_after: consecutive failing checks before an "
                   "alert -- a host waking can tick this before Mailbox Watch reconnects. remind_hours: repeat "
-                  "while it lasts. checker_url: the imap-health service (docker-compose.yml)."),
+                  "while it lasts. checker_url: the imap-health service (docker-compose.yml). block_alert_min: "
+                  "how long Send may be blocked by sent-mirror-behind before send-blocked alerts (at once, no "
+                  "second check); block_min is that plus Send's own %d-minute mirror grace (code_decide.js)."
+                  % SEND_MIRROR_GRACE_MIN),
     },
     http_get_node("Check IMAP", "={{ $json.checker_url }}", 150000, [-660, 130],
                   "imap_preflight.py -- the same connection logic, unchanged -- run by the imap-health service: "
@@ -3383,14 +3577,16 @@ health_nodes = [
                   "Sent in the last 48 hours. The n8n image has no Python, hence the service."),
     pg_node("Load Health State", HEALTH_LOAD_SQL,
             "={{ [JSON.stringify({ inbox: $json.inbox || [], sent: $json.sent || [], "
-            "grace_min: $('Config').first().json.grace_min })] }}", [-440, 130],
+            "grace_min: $('Config').first().json.grace_min, block_min: $('Config').first().json.block_min, "
+            "listed: $json.ok === true && Array.isArray($json.sent), since: $json.since || null })] }}",
+            [-440, 130],
             "Those Message-IDs against inbound_messages and mailbox_sent: anything that landed more than "
             "grace_min ago with no row was MISSED -- the proof a login alone cannot give that Mailbox Watch is "
             "still listening. Plus the previous check's state and the operator's address (settings table)."),
     code_node("Assess Health", HEALTH_JS, "runOnceForAllItems", [-220, 130],
-              "Problems: checker-unreachable, imap-failed, inbox-missed, sent-missed. Alert after confirm_after "
-              "consecutive failing checks, remind every remind_hours, alert again if the problem changes, one "
-              "email when it clears."),
+              "Problems: checker-unreachable, imap-failed, inbox-missed, sent-missed, sent-mismatch, "
+              "send-blocked. Alert after confirm_after consecutive failing checks (send-blocked: at once), remind "
+              "every remind_hours, alert again if the problem changes, one email when it clears."),
     if_node("Alert?", "notify", "={{ $json.notify }}", [0, 130],
             "Only when there is something to say AND the settings table holds an operator address."),
     email_node("Send Alert", "={{ $json.notify_to }}", "={{ $json.subject }}", "={{ $json.text }}", [220, 40],
@@ -4041,6 +4237,27 @@ if VARIANTS_OUT:
                    ("Send Alert", "credentials"), ("Record Health", "credentials")])
     assert sorted(got) == want, "the dry-run IMAP Health variant drifted: %r" % sorted(got)
     VARIANTS.append(("imaphealth-dryrun.json", dry_health))
+
+    # The Sent reconcile alone (2026-10-28): Mailbox Watch's reconcile branch,
+    # exactly as shipped, started by hand. Everything else in Mailbox Watch is
+    # dropped -- its IMAP triggers carry the real IMAP credential, which no
+    # dry-run variant may.
+    mw_wf = SHIPPED[1][1]
+    _rec = {"Config", "List Sent Folder", "Reconcile Settings", "Plan Sent Reconcile", "Listed?", "Reconcile Sent"}
+    _drop = {n["name"] for n in mw_wf["nodes"]} - _rec
+    dry_rec = dry_variant(mw_wf, "mailwatch0001rec", "DRY RUN - Mailbox Watch Sent reconcile (scratch DB)", {}, _drop)
+    dry_rec["nodes"].append({"parameters": {}, "name": "Manual Trigger", "type": "n8n-nodes-base.manualTrigger",
+                             "typeVersion": 1, "position": [-1100, -450]})
+    dry_rec["connections"]["Manual Trigger"] = edge("Config")
+    got = [d for d in _node_diff(mw_wf, dry_rec) if d[1] != "removed"]
+    want = sorted([("Manual Trigger", "added"), ("Manual Trigger", "connections"), ("Reconcile Settings", "credentials"),
+                   ("Reconcile Sent", "credentials")])
+    assert sorted(got) == want, "the dry-run reconcile variant drifted: %r" % sorted(got)
+    assert {d[0] for d in _node_diff(mw_wf, dry_rec) if d[1] == "removed"} == _drop
+    assert {n["name"] for n in dry_rec["nodes"]} == _rec | {"Manual Trigger"}, (
+        "the dry-run reconcile variant drifted: it must hold the reconcile branch and nothing else, has %r"
+        % sorted(n["name"] for n in dry_rec["nodes"]))
+    VARIANTS.append(("mailwatch-reconcile-dryrun.json", dry_rec))
 
     digest_wf = SHIPPED[4][1]
     dry_digest = dry_variant(digest_wf, "digest0001dry", "DRY RUN - Daily Digest (scratch DB, SMTP sink)",

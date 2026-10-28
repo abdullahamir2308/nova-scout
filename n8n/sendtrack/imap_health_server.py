@@ -51,7 +51,7 @@ def parse_result(returncode, out, err, ids):
     """One pre-flight run -> the answer. `ids` is the parsed --ids-json file, or
     None when the run did not write one."""
     res = {"ok": False, "status": "error", "stage": None, "detail": None, "hint": None, "note": None,
-           "exit_code": returncode, "inbox": [], "sent": [], "hours": HOURS,
+           "exit_code": returncode, "inbox": [], "sent": [], "hours": HOURS, "since": None,
            "inbox_no_message_id": 0, "sent_no_message_id": 0, "sent_undated": 0,
            "output_tail": _tail(out)}
     failed = re.search(r"^IMAP CHECK: FAILED at (\S+)\n  ([^\n]*)(?:\n  hint: ([^\n]*))?", out or "", re.M)
@@ -60,7 +60,7 @@ def parse_result(returncode, out, err, ids):
             res.update(stage="ids", detail="the IMAP check passed but no Message-ID list was written")
             return res
         res.update(ok=True, status="passed")
-        for k in ("inbox", "sent", "hours", "inbox_no_message_id", "sent_no_message_id", "sent_undated"):
+        for k in ("inbox", "sent", "hours", "since", "inbox_no_message_id", "sent_no_message_id", "sent_undated"):
             if k in ids:
                 res[k] = ids[k]
         if returncode != 0:

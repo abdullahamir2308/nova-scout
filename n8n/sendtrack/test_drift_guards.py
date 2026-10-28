@@ -635,7 +635,10 @@ case("Assess Health stops emitting a state field Record Health writes -> refuses
      mutate_file=("code_health.js", lambda s: s.replace("      consecutive_failures: consecutive,\n", "", 1)))
 case("Load Health State's payload expression drops grace_min -> refuses", "never sets it",
      mutate_file=("build_workflow.py", lambda s: s.replace(
-         "\"grace_min: $('Config').first().json.grace_min })] }}\"", "\"})] }}\"", 1)))
+         "\"grace_min: $('Config').first().json.grace_min, block_min:", "\"block_min:", 1)))
+case("Load Health State's payload expression drops block_min (send-blocked's age) -> refuses", "never sets it",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         " block_min: $('Config').first().json.block_min, ", " ", 1)))
 case("Load Health State stops counting an operator command as recorded (the 2026-10-18 false alarm) -> refuses",
      "recorded in operator_commands as recorded",
      mutate_file=("build_workflow.py", lambda s: s.replace(
@@ -645,7 +648,9 @@ case("Load Health State stops counting a prospect's mail as recorded -> refuses"
      mutate_file=("build_workflow.py", lambda s: s.replace(
          "     AND NOT EXISTS (SELECT 1 FROM inbound_messages m WHERE m.message_id = i.message_id)\n", "", 1)))
 case("Section 8 adds a health problem code the JS does not know -> refuses", "problem codes drifted",
-     mutate_doc=lambda d: d.replace("inbox-missed|sent-missed)", "inbox-missed|sent-missed|smtp-failed)", 1))
+     mutate_doc=lambda d: d.replace("sent-mismatch|send-blocked)", "sent-mismatch|send-blocked|smtp-failed)", 1))
+case("Section 8 drops a health problem code the JS still raises -> refuses", "problem codes drifted",
+     mutate_doc=lambda d: d.replace("|send-blocked)", ")", 1))
 case("Section 8 drops a mailbox_health column Record Health writes -> refuses", "does not define",
      mutate_doc=lambda d: d.replace("failing_since, last_checked_at, last_ok_at,", "failing_since, last_checked_at,", 1))
 case("docker-compose has no imap-health service -> refuses", "no 'imap-health' service",
@@ -662,6 +667,40 @@ positive(
     == [{"field": "minutes", "minutesInterval": 25}] else "the schedule is not every 25 minutes",
     mutate_doc=lambda d: d.replace("health check runs every 20 minutes", "health check runs every 25 minutes", 1),
 )
+
+# --- the Sent reconcile and send-blocked (2026-10-28) ------------------------
+case("Section 9 drops the Sent reconcile interval -> refuses", "sent reconcile interval not found",
+     mutate_doc=lambda d: d.replace("the Sent reconcile runs every 10 minutes", "the Sent reconcile runs often", 1))
+case("the Sent reconcile set slower than Send's mirror grace -> refuses", "inside that grace",
+     mutate_doc=lambda d: d.replace("the Sent reconcile runs every 10 minutes", "the Sent reconcile runs every 20 minutes", 1))
+positive(
+    "Section 9's reconcile interval flows straight into Mailbox Watch's reconcile schedule",
+    lambda tmp: None if node(load(tmp, "mailbox-watch.json"), "Reconcile Every 5 Minutes")["parameters"]["rule"]["interval"]
+    == [{"field": "minutes", "minutesInterval": 5}] else "the reconcile schedule is not every 5 minutes",
+    mutate_doc=lambda d: d.replace("the Sent reconcile runs every 10 minutes", "the Sent reconcile runs every 5 minutes", 1),
+)
+case("Reconcile Sent's upsert stops being Mirror Sent's -> refuses", "no longer Mirror Sent's",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         '_MIRROR_R_UP = MIRROR_SQL[MIRROR_SQL.index("r AS ("):MIRROR_SQL.index("s AS (")]',
+         '_MIRROR_R_UP = MIRROR_SQL[MIRROR_SQL.index("r AS ("):MIRROR_SQL.index("s AS (")].replace('
+         '"DO UPDATE SET seen_in_sent_folder = true", "DO UPDATE SET seen_in_sent_folder = true, source = \'x\'")', 1)))
+case("IMAP Health's send-blocked drifts from Load Send State's rule -> refuses", "word for word",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "   WHERE m.source = 'workflow' AND NOT m.seen_in_sent_folder\n     AND m.sent_at <= clk.now",
+         "   WHERE m.source = 'workflow' AND m.seen_in_sent_folder IS NOT TRUE\n     AND m.sent_at <= clk.now", 1)))
+case("Plan Sent Reconcile reads a listing field the pre-flight never writes -> refuses", "does not write",
+     mutate_file=("code_reconcile_sent.js", lambda s: s.replace("str(e.date)", "str(e.date_header)")))
+case("the dry-run reconcile variant keeps an extra node -> refuses", "reconcile variant drifted",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         '    _drop = {n["name"] for n in mw_wf["nodes"]} - _rec\n',
+         '    _drop = {n["name"] for n in mw_wf["nodes"]} - _rec - {"Normalise Sent"}\n', 1)),
+     env_overrides={"SENDTRACK_VARIANTS_OUT": "{tmp}/variants", "SENDTRACK_DRYRUN_NOW": "2026-09-14T10:00:00Z"})
+case("the dry-run reconcile variant keeps an IMAP trigger (the real mailbox credential) -> refuses",
+     "must never carry the real IMAP credential",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         '    _drop = {n["name"] for n in mw_wf["nodes"]} - _rec\n',
+         '    _drop = {n["name"] for n in mw_wf["nodes"]} - _rec - {"Inbox"}\n', 1)),
+     env_overrides={"SENDTRACK_VARIANTS_OUT": "{tmp}/variants", "SENDTRACK_DRYRUN_NOW": "2026-09-14T10:00:00Z"})
 
 # --- the dry run tests what ships -------------------------------------------
 case("the dry-run variant keeps its schedule trigger (an extra difference) -> refuses",

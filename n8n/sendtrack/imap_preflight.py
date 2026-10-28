@@ -248,7 +248,10 @@ typ, uns = M.search(None, "UNSEEN")
 unseen = len(uns[0].split()) if typ == "OK" and uns and uns[0] else 0
 print("4. INBOX    ok  %d messages, %d unseen (EXAMINE, read-only)" % (inbox_n, unseen))
 
-ids_since = datetime.now(timezone.utc) - timedelta(hours=IDS_HOURS)
+# --ids-hours 0 (or less) lists everything: reconcile_sent_mirror.py reads the
+# whole Sent folder that way. SEARCH SINCE then asks from 1970.
+ids_since = (datetime.now(timezone.utc) - timedelta(hours=IDS_HOURS) if IDS_HOURS > 0
+             else datetime(1970, 1, 2, tzinfo=timezone.utc))
 inbox_recent, inbox_no_id = [], 0
 if IDS_JSON:
     # SINCE compares dates, not times, on the server's clock: ask from a day
@@ -309,7 +312,13 @@ if IDS_JSON:
             # counts it as undated), so it would never be found there.
             sent_undated += 1
         else:
-            sent_recent.append({"message_id": mid, "at": at.isoformat(), "to": header_text(msg.get("To"))})
+            # Date, Cc and Bcc as well as To (2026-10-28): the Sent reconcile in
+            # Mailbox Watch and reconcile_sent_mirror.py hand each entry to the
+            # same normaliser the Sent trigger uses (code_mirror_sent.js), which
+            # needs the Date header and every recipient header.
+            sent_recent.append({"message_id": mid, "at": at.isoformat(), "date": str(msg.get("Date")).strip(),
+                                "to": header_text(msg.get("To")), "cc": header_text(msg.get("Cc")),
+                                "bcc": header_text(msg.get("Bcc"))})
     with io.open(IDS_JSON, "w", encoding="utf-8") as fh:
         json.dump({"hours": IDS_HOURS, "since": ids_since.isoformat(),
                    "inbox": inbox_recent, "inbox_no_message_id": inbox_no_id,
