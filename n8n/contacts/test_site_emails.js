@@ -351,6 +351,36 @@ expect(
 
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 2026-10-28: a 1 MB research-site homepage hung n8n's task runner. EMAIL_RE
+// run over a whole page backtracks quadratically through a long run of its own
+// characters (an inline base64 image); addresses are now found from each '@'.
+// ---------------------------------------------------------------------------
+
+const B64 = '<img src="data:image/png;base64,' + 'iVBORw0KGgo+AAAA/NSUhE=='.repeat(17000) + '">';
+{
+  const t0 = Date.now();
+  checks.push(function () {
+    return harvest([lead({ domain: 'bigpage.com' })],
+      { 'https://bigpage.com': page(B64 + '<p>Write to studies@bigpage.com</p>' + B64) })
+      .then(function (r) {
+        t.check('a 800 KB inline image no longer stalls the node (under 2 s), and the address after it is still found',
+          [r.out[0].site_email, Date.now() - t0 < 2000], ['studies@bigpage.com', true]);
+      });
+  });
+}
+{
+  // The same answers as the old whole-page scan, on text without the pathology.
+  const lib = SRC.slice(0, SRC.indexOf('// Node body'));
+  const F = new Function('$', lib + '\nreturn { addressesIn, EMAIL_RE };')(function () { return { first: function () { return { json: {} }; } }; });
+  const text = 'Mail info@site.com or a.b-c+d@sub.site.co.uk; not x@y; ..dots..@site.com. ' +
+    'logo@2x.png, joe@site.com@other.com, ' + 'a'.repeat(70) + '@site.com, "x"@site.com, end@site.com.';
+  const old = text.match(F.EMAIL_RE) || [];
+  const fresh = F.addressesIn(text);
+  t.check('addressesIn() finds what the whole-page scan found (local parts up to 64 characters)',
+    fresh, old.filter(function (a) { return a.split('@')[0].length <= 64; }));
+}
+
 (function run(i) {
   if (i >= checks.length) {
     t.done();

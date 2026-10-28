@@ -280,13 +280,48 @@ function harvest(html, domain, found) {
     if (!whole || whole[0] !== a) continue;
     if (onOwnDomain(a, domain) && !looksLikeAsset(a)) found[a] = 'mailto';
   }
-  EMAIL_RE.lastIndex = 0;
-  while ((m = EMAIL_RE.exec(html)) !== null) {
-    const a = m[0].toLowerCase().replace(/^\.+/, '').replace(/\.+$/, '');
+  for (const raw of addressesIn(html)) {
+    const a = raw.toLowerCase().replace(/^\.+/, '').replace(/\.+$/, '');
     if (!onOwnDomain(a, domain) || looksLikeAsset(a)) continue;
     if (!found[a]) found[a] = 'text';
   }
   return found;
+}
+
+// Every EMAIL_RE match in `text`, found from each '@' outwards instead of by
+// running EMAIL_RE over the whole page. Run over a page, EMAIL_RE's leading
+// `[...]+` backtracks quadratically through any long run of its characters with
+// no '@' -- an inline base64 image is exactly that (+ / = and letters): 40 KB
+// took 1.2 s, and a 1 MB research-site homepage (2026-10-28) hung n8n's task
+// runner until it aborted the whole Contact Lookup batch, every run. Each '@'
+// gets the run of local-part characters before it (at most 64, RFC 5321's
+// limit -- a longer run is no address) and the host after it, and EMAIL_RE is
+// applied to that slice alone, so every address a page really carries is found
+// exactly as before.
+const LOCAL_CHAR = /[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]/;
+const HOST_CHAR = /[A-Za-z0-9.-]/;
+function addressesIn(text) {
+  const out = [];
+  const s = String(text || '');
+  let at = s.indexOf('@');
+  let lastEnd = -1;
+  while (at !== -1) {
+    let start = at;
+    while (start > 0 && start > lastEnd && at - start < 65 && LOCAL_CHAR.test(s.charAt(start - 1))) start--;
+    let end = at + 1;
+    while (end < s.length && end - at <= 255 && HOST_CHAR.test(s.charAt(end))) end++;
+    if (at - start <= 64 && start < at) {
+      EMAIL_RE.lastIndex = 0;
+      const m = EMAIL_RE.exec(s.slice(start, end));
+      EMAIL_RE.lastIndex = 0;
+      if (m && m.index === 0) {
+        out.push(m[0]);
+        lastEnd = start + m[0].length;
+      }
+    }
+    at = s.indexOf('@', at + 1);
+  }
+  return out;
 }
 
 function pick(addresses, founderName) {
