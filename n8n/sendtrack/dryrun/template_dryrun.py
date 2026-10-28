@@ -74,7 +74,7 @@ SENDTRACK = os.path.dirname(HERE)
 DRAFTING = os.path.join(SENDTRACK, "..", "drafting")
 REPO = os.path.abspath(os.path.join(SENDTRACK, "..", ".."))
 MIGRATIONS = [os.path.join(REPO, "postgres", "migrations", m)
-              for m in ("020_template_outreach.sql", "021_send_brake.sql", "022_hard_bounces.sql")]
+              for m in ("020_template_outreach.sql", "021_send_brake.sql", "022_hard_bounces.sql", "025_niches.sql")]
 N8N = "nova-scout-n8n-1"
 PG = "nova-scout-postgres-1"
 PGUSER = "novascout"
@@ -446,7 +446,8 @@ try:
     site_try = psql(DRY, """INSERT INTO drafts (lead_id, channel, variant, subject, body, status, approved_by)
                            VALUES (%d, 'email', 'template/A/company/role-inbox', 's', 'b', 'approved', 'auto')
                            RETURNING status || ' | ' || coalesce(hold_reason, '');""" % SITE_LEAD).strip()
-    expect("a template draft for a site cannot approve itself", "not a CRO" in site_try, site_try)
+    expect("a template draft for a Trialsites site (no niche, migration 025) cannot approve itself",
+           "no niche drafts this lead" in site_try, site_try)
     psql(DRY, "DELETE FROM drafts WHERE id > (SELECT max(id) FROM drafts) - 2 AND variant IN "
               "('role-inbox/D1.ANG-HOURS.BEN-247.PR-BOTH.A1', 'template/A/company/role-inbox') AND subject = 's';")
 

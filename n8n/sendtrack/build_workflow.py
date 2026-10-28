@@ -521,8 +521,10 @@ def _assert_decide_matches_spec():
     assert "OPT_OUT" not in re.sub(r"//.*", "", src), (
         "code_decide.js still checks for an opt-out sentence. Section 5 removed it on 2026-10-19 (operator "
         "decision); every template draft would be refused.")
-    assert "__SENDER_IDENTITY__" in src and "'\\n' + SENDER_IDENTITY + '\\n'" in src, (
+    assert "__SENDER_IDENTITY__" in src and "'\\n' + identityFor(c) + '\\n'" in src, (
         "code_decide.js no longer checks each body for the sender's name and title lines (Section 5)")
+    assert "__NICHE_IDENTITIES__" in src and ": SENDER_IDENTITY;" in src, (
+        "code_decide.js no longer falls back to SENDER_IDENTITY for a lead whose niche has no identity of its own")
 
     found = _js_int(src, "MAX_URLS", "code_decide.js")
     assert found == MAX_URLS, (
@@ -753,6 +755,8 @@ CANDIDATE_COLUMNS = [
      "AND f.status = 'sent' AND f.variant LIKE 'follow-up-%')::int", "follow_ups_sent"),
     ("EXISTS (SELECT 1 FROM outreach_log o WHERE o.lead_id = d.lead_id AND o.replied)", "replied"),
     ("EXISTS (SELECT 1 FROM outreach_log o WHERE o.lead_id = d.lead_id AND o.outcome = 'bounced')", "bounced"),
+    # The lead's niche (migration 025): which identity its body must sign with.
+    ("lead_niche((SELECT e.raw_extraction FROM enrichments e WHERE e.lead_id = d.lead_id), l.source)", "niche"),
 ]
 
 LOAD_STATE_SQL = """-- Load Send State: everything Decide Send needs, in ONE statement so it is one
@@ -1523,6 +1527,7 @@ cl AS (
          l.company_name                                        AS company_name,
          l.status                                              AS lead_status,
          lead_company_type(e.raw_extraction, l.source)         AS company_type,
+         lead_niche(e.raw_extraction, l.source)                AS niche,
          (EXISTS (SELECT 1 FROM outreach_log o WHERE o.lead_id = l.id)
           OR EXISTS (SELECT 1 FROM mailbox_sent m WHERE m.lead_id = l.id AND m.external)) AS emailed,
          EXISTS (SELECT 1 FROM blocklist b WHERE lower(l.domain) = b.domain
@@ -1582,7 +1587,7 @@ res AS (
          (SELECT jsonb_agg(jsonb_build_object(
                    'line', cv.line, 'domain', cv.domain, 'email', cv.email, 'name', cv.name,
                    'lead_id', cv.lead_id, 'company', cv.company_name, 'company_type', cv.company_type,
-                   'refused', cv.refused) ORDER BY cv.line)
+                   'niche', cv.niche, 'refused', cv.refused) ORDER BY cv.line)
             FROM cv)                                            AS contact_results
     FROM ok
 ),
@@ -2393,23 +2398,26 @@ SELECT win.day::text                                                     AS dige
        auto_approve_email_enabled()                                      AS auto_approve_email,
        (SELECT coalesce(json_agg(x ORDER BY x.approved_at, x.draft_id), '[]'::json) FROM (
           SELECT d.id AS draft_id, d.lead_id, l.company_name, l.domain, l.country, d.channel, d.variant, d.status,
-                 ISO(d.approved_at) AS approved_at
+                 ISO(d.approved_at) AS approved_at, lead_niche(e.raw_extraction, l.source) AS niche
             FROM drafts d JOIN leads l ON l.id = d.lead_id
+            LEFT JOIN enrichments e ON e.lead_id = l.id
            WHERE d.approved_by = 'auto' AND d.approved_at >= win.from_ts AND d.approved_at < win.to_ts) x)
                                                                          AS auto_approved,
        (SELECT coalesce(json_agg(x ORDER BY x.sent_at, x.draft_id), '[]'::json) FROM (
           SELECT o.draft_id, o.lead_id, l.company_name, l.domain, c.email AS to_addr, d.variant, d.approved_by,
-                 ISO(o.sent_at) AS sent_at
+                 ISO(o.sent_at) AS sent_at, lead_niche(e.raw_extraction, l.source) AS niche
             FROM outreach_log o
             JOIN leads l ON l.id = o.lead_id
             LEFT JOIN drafts d ON d.id = o.draft_id
             LEFT JOIN contacts c ON c.lead_id = o.lead_id
+            LEFT JOIN enrichments e ON e.lead_id = o.lead_id
            WHERE o.channel = 'email' AND o.message_id IS NOT NULL
              AND o.sent_at >= win.from_ts AND o.sent_at < win.to_ts) x)
                                                                          AS sent,
        (SELECT coalesce(json_agg(x ORDER BY x.created_at, x.draft_id), '[]'::json) FROM (
           SELECT d.id AS draft_id, d.lead_id, l.company_name, l.domain, d.channel, d.variant, d.hold_reason,
                  ISO(d.created_at) AS created_at, d.created_at >= win.from_ts AS new,
+                 lead_niche((SELECT e.raw_extraction FROM enrichments e WHERE e.lead_id = l.id), l.source) AS niche,
                  CASE WHEN d.channel = 'email'
                        AND NOT EXISTS (SELECT 1 FROM digest_log g WHERE g.digest_day = win.day)
                        AND win.hour >= $2::int
@@ -2418,7 +2426,25 @@ SELECT win.day::text                                                     AS dige
                       THEN reply_approval_issue('email-hold', d.id, d.lead_id) END AS code
             FROM drafts d JOIN leads l ON l.id = d.lead_id
            WHERE d.status = 'pending') x)
-                                                                         AS held
+                                                                         AS held,
+       -- Every template email sent so far, by niche and A/B arm (migration 025;
+       -- the arm is in the variant: template/<A|B>/... or follow-up-N/template/<A|B>):
+       -- what the operator reads the A/B test off.
+       (SELECT coalesce(json_agg(x ORDER BY x.niche, x.arm), '[]'::json) FROM (
+          SELECT coalesce(lead_niche(e.raw_extraction, l.source), 'none')            AS niche,
+                 substring(d.variant from '(?:^|/)template/([AB])')                AS arm,
+                 count(*) FILTER (WHERE d.variant NOT LIKE 'follow-up-%')::int      AS first_touches,
+                 count(*) FILTER (WHERE d.variant LIKE 'follow-up-%')::int          AS follow_ups,
+                 count(DISTINCT o.lead_id) FILTER (WHERE o.replied)::int            AS replied_leads,
+                 count(*) FILTER (WHERE o.outcome = 'bounced')::int                 AS bounced
+            FROM outreach_log o
+            JOIN drafts d ON d.id = o.draft_id
+            JOIN leads l ON l.id = o.lead_id
+            LEFT JOIN enrichments e ON e.lead_id = l.id
+           WHERE o.channel = 'email' AND o.message_id IS NOT NULL
+             AND d.variant ~ '(^|/)template/[AB]'
+           GROUP BY 1, 2) x)
+                                                                         AS niche_totals
   FROM win;""".replace("__ZONE__", SENDER_ZONE))
 
 DIGEST_RECORD_SQL = """-- Record Digest: the digest is recorded only once SMTP accepted it, so one that
@@ -2974,11 +3000,28 @@ REPLY_SYSTEM_PROMPT = "\n".join([
 # EDIT on a held email. One definition, so the two cannot disagree.
 COLD_EMAIL_JS = bake_src(above_node_body("code_cold_email.js"), "code_cold_email.js",
                          SENDER_IDENTITY=SENDER_IDENTITY)
+def load_niche_identities():
+    """The research-site niche's sign-off (n8n/drafting/code_site_template.js,
+    SITE_SIGN_OFF): 'Cheers!', the sender's name, its own title. The name must be
+    NOVASCOUT_SENDER_NAME -- one sender, two titles -- and the title must not be
+    the CRO one (the niche row's sender_title, migration 025, says the same)."""
+    src = io.open(os.path.join(DRAFTING_DIR, "code_site_template.js"), encoding="utf-8").read()
+    m = re.search(r"const SITE_SIGN_OFF = (\[[^\]]*\]);", src)
+    assert m, "SITE_SIGN_OFF not found in n8n/drafting/code_site_template.js"
+    sign = json.loads(m.group(1))
+    assert len(sign) == 3 and sign[0] == "Cheers!" and sign[1] == SENDER_NAME, (
+        "the research-site sign-off %r is not 'Cheers!' / %r / its title" % (sign, SENDER_NAME))
+    assert sign[2] != SENDER_TITLE, "the research-site sign-off uses the CRO title"
+    return {"research_site": sign[1] + "\n" + sign[2]}
+
+
+NICHE_IDENTITIES = load_niche_identities()
+
 DECIDE_JS = (
     "// Decide Send -- generated by n8n/sendtrack/build_workflow.py.\n"
     "// Part 1, verbatim: n8n/sendtrack/code_cold_email.js above its 'Node body' marker.\n"
     "// Part 2: n8n/sendtrack/code_decide.js.\n\n"
-    + COLD_EMAIL_JS + "\n" + bake("code_decide.js", SENDER_IDENTITY=SENDER_IDENTITY)
+    + COLD_EMAIL_JS + "\n" + bake("code_decide.js", SENDER_IDENTITY=SENDER_IDENTITY, NICHE_IDENTITIES=NICHE_IDENTITIES)
 )
 CHECK_JS = bake("code_check_smtp.js", OWN_DOMAIN=OWN_DOMAIN)
 MIRROR_JS = bake("code_mirror_sent.js", OWN_DOMAIN=OWN_DOMAIN)
@@ -3050,7 +3093,7 @@ COMMAND_JS = (
     "// Part 2: n8n/sendtrack/code_operator_command.js.\n\n"
     + COLD_EMAIL_JS + "\n" + bake("code_operator_command.js", SIGNATURE=SIGNATURE, MAX_URLS=MAX_URLS)
 )
-assert "const shape = coldEmailProblem(body);" in DECIDE_JS and "coldEmailProblem(edited)" in COMMAND_JS, (
+assert "const shape = coldEmailProblem(asSenderIdentity(body, identityFor(c)));" in DECIDE_JS and "coldEmailProblem(edited)" in COMMAND_JS, (
     "Decide Send or Decide Command no longer applies code_cold_email.js (draft 350, 2026-10-28)")
 COMMAND_ACK_JS = bake("code_command_ack.js")
 DETECT_SIGNAL_JS = bake("code_detect_signal.js")

@@ -45,6 +45,49 @@ function company(r) {
   return dStr(r.company_name) || dStr(r.domain) || ('lead ' + r.lead_id);
 }
 
+// The A/B arm a template draft carries in its variant (template/<A|B>/... or
+// follow-up-N/template/<A|B>), or '-' for anything else.
+function armOf(variant) {
+  const m = /(?:^|\/)template\/([AB])(?:[/+]|$)/.exec(dStr(variant));
+  return m ? m[1] : '-';
+}
+
+function nicheOf(r) {
+  return dStr(r.niche) || 'none';
+}
+
+// Counts per niche and arm (migration 025): this window's auto-approved and
+// sent emails, then every template email sent so far with its replies -- the
+// numbers the A/B test is read off.
+function nicheArmLines(autoApproved, sent, held, totals) {
+  const keys = {};
+  function bump(r, field) {
+    const k = nicheOf(r) + '|' + armOf(r.variant);
+    keys[k] = keys[k] || { auto: 0, sent: 0, held: 0 };
+    keys[k][field]++;
+  }
+  autoApproved.forEach(function (r) { bump(r, 'auto'); });
+  sent.forEach(function (r) { bump(r, 'sent'); });
+  held.filter(function (r) { return dStr(r.channel) === 'email'; }).forEach(function (r) { bump(r, 'held'); });
+  const lines = ['BY NICHE AND A/B ARM -- this digest\'s window'];
+  const ks = Object.keys(keys).sort();
+  if (!ks.length) lines.push('  none');
+  ks.forEach(function (k) {
+    const p = k.split('|');
+    lines.push('  ' + p[0] + ' / arm ' + p[1] + ':  ' + keys[k].auto + ' auto-approved, ' + keys[k].sent + ' sent, ' +
+      keys[k].held + ' email(s) held');
+  });
+  lines.push('', 'BY NICHE AND A/B ARM -- every template email sent so far');
+  const t = Array.isArray(totals) ? totals : [];
+  if (!t.length) lines.push('  none');
+  t.forEach(function (r) {
+    lines.push('  ' + nicheOf(r) + ' / arm ' + (dStr(r.arm) || '-') + ':  ' + Number(r.first_touches || 0) +
+      ' first touches, ' + Number(r.follow_ups || 0) + ' follow-ups, ' + Number(r.replied_leads || 0) +
+      ' lead(s) replied, ' + Number(r.bounced || 0) + ' bounced');
+  });
+  return lines;
+}
+
 function zoneLabel() {
   return SENDER_ZONE === 'Asia/Karachi' ? 'PKT' : SENDER_ZONE;
 }
@@ -77,16 +120,18 @@ function buildDigest(row, cfg) {
     'AUTO-APPROVED (' + autoApproved.length + ') -- no person read these. Each goes out in its recipient\'s',
     'business hours; reject it in the review queue to stop it.',
   ];
+  const byNiche = nicheArmLines(autoApproved, sent, held, row.niche_totals);
   if (!autoApproved.length) lines.push('  none');
   autoApproved.forEach(function (r) {
     lines.push('  #' + r.draft_id + '  ' + company(r) + ' (' + dStr(r.domain) + ', ' + dStr(r.country) + ')  ' +
-      kindOf(r.variant) + '  approved ' + local(r.approved_at, z) + '  -- now ' + dStr(r.status));
+      kindOf(r.variant) + '  [' + nicheOf(r) + ' ' + armOf(r.variant) + ']  approved ' + local(r.approved_at, z) +
+      '  -- now ' + dStr(r.status));
   });
   lines.push('', 'SENT (' + sent.length + ')');
   if (!sent.length) lines.push('  none');
   sent.forEach(function (r) {
-    lines.push('  #' + r.draft_id + '  ' + company(r) + ' -> ' + dStr(r.to_addr) + '  ' + kindOf(r.variant) + '  ' +
-      local(r.sent_at, z) + '  approved by ' + (dStr(r.approved_by) || 'unknown'));
+    lines.push('  #' + r.draft_id + '  ' + company(r) + ' -> ' + dStr(r.to_addr) + '  ' + kindOf(r.variant) +
+      '  [' + nicheOf(r) + ' ' + armOf(r.variant) + ']  ' + local(r.sent_at, z) + '  approved by ' + (dStr(r.approved_by) || 'unknown'));
   });
   lines.push('', 'HELD FOR A PERSON (' + held.length + (newHeld ? ', ' + newHeld + ' new' : '') +
     ') -- the exceptions queue: every pending draft, and why.');
@@ -120,6 +165,8 @@ function buildDigest(row, cfg) {
     lines.push('can use them, and only with SPF and DKIM passing; anything else is logged and');
     lines.push('ignored. I will remind you about any you have not answered in 4 hours.');
   }
+  lines.push('');
+  byNiche.forEach(function (l) { lines.push(l); });
   lines.push('', '-- Nova Scout (Workflow 6, Daily Digest). Sent only to this address; it uses no warm-up slot.');
 
   return {

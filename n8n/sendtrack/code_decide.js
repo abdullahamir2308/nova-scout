@@ -258,6 +258,27 @@ const MIRROR_GRACE_MIN = 15;
 // written before -- so this is the one check both pass.
 const SENDER_IDENTITY = __SENDER_IDENTITY__;
 
+// A niche that signs with another title (migration 025): the research-site
+// niche's emails end "Abdullah Amir" / "Software Engineer, Amitrix Labs" -- its
+// template's sign-off, substituted at build time. A body is checked for the
+// identity of ITS lead's niche (Load Send State's `niche`); every other lead,
+// every CRO among them, is checked for SENDER_IDENTITY exactly as before.
+const NICHE_IDENTITIES = __NICHE_IDENTITIES__;
+
+function identityFor(c) {
+  const n = str(c && c.niche);
+  return Object.prototype.hasOwnProperty.call(NICHE_IDENTITIES, n) ? NICHE_IDENTITIES[n] : SENDER_IDENTITY;
+}
+
+// coldEmailProblem() (code_cold_email.js, shared with Decide Command) finds the
+// message by the sender's identity lines. A niche body is judged on the same
+// text with its own identity lines in that place -- the shape rule is the one
+// rule, wherever the email signs.
+function asSenderIdentity(body, identity) {
+  if (identity === SENDER_IDENTITY) return body;
+  return ('\n' + body + '\n').replace('\n' + identity + '\n', '\n' + SENDER_IDENTITY + '\n').slice(1, -1);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -409,11 +430,11 @@ function ineligibility(c) {
 
   if (/^low-context/.test(str(c.variant)) || /^NOT DRAFTED/.test(body)) return 'low-context';
   if (!str(c.subject)) return 'no-subject';
-  if (('\n' + body + '\n').indexOf('\n' + SENDER_IDENTITY + '\n') === -1) return 'stale-signature';
+  if (('\n' + body + '\n').indexOf('\n' + identityFor(c) + '\n') === -1) return 'stale-signature';
   // A greeting, at least COLD_MIN_WORDS words of message and no address in it
   // (code_cold_email.js, placed above this file by the build). Draft 350,
   // 2026-10-24: an EDIT that was really an instruction passed every other check.
-  const shape = coldEmailProblem(body);
+  const shape = coldEmailProblem(asSenderIdentity(body, identityFor(c)));
   if (shape) return 'not-an-email:' + shape;
   if (countUrls(body) > MAX_URLS) return 'too-many-urls';
   if (!clockFor(c.country)) return 'unknown-country:' + str(c.country);

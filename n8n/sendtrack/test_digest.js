@@ -58,11 +58,12 @@ t.check('the window is stated', d.text.indexOf('Covers 2026-10-04 08:00 PKT to 2
 t.check('the flag is stated', d.text.indexOf('Auto-approval of email drafts: ON') !== -1, true);
 t.check('... and OFF when it is off', buildDigest(with_({ auto_approve_email: false }), CFG).text.indexOf('Auto-approval of email drafts: OFF') !== -1, true);
 t.check('each auto-approval: draft, company, domain, country, kind, when, what became of it',
-  d.text.indexOf('  #105  KLIXAR (klixar.com, Argentina)  follow-up 2  approved 2026-10-05 01:32 PKT  -- now approved') !== -1, true);
+  d.text.indexOf('  #105  KLIXAR (klixar.com, Argentina)  follow-up 2  [none -]  approved 2026-10-05 01:32 PKT' +
+    '  -- now approved') !== -1, true);
 t.check('... under a heading that says no person read them and how to stop one',
   d.text.indexOf('AUTO-APPROVED (1) -- no person read these.') !== -1 && d.text.indexOf('reject it in the review queue to stop it') !== -1, true);
 t.check('each send: recipient, kind, when, and who approved it',
-  d.text.indexOf('  #99  KLIXAR -> hello@klixar.com  follow-up 1  2026-10-04 17:10 PKT  approved by human') !== -1, true);
+  d.text.indexOf('  #99  KLIXAR -> hello@klixar.com  follow-up 1  [none -]  2026-10-04 17:10 PKT  approved by human') !== -1, true);
 t.check('held: every pending draft, new ones marked, each with its reason on its own line',
   [d.text.indexOf('HELD FOR A PERSON (3, 1 new)') !== -1,
    d.text.indexOf('  #106  BiTrial  email follow-up 2  [new]  since 2026-10-04 20:00 PKT\n        claim-check: widened "so you know exactly what came in" (BEN-SEE)') !== -1,
@@ -91,8 +92,43 @@ t.check('Record Digest is told which codes went out, so the reminder lane knows 
 t.check('no codes at all -> no code paragraph', d.text.indexOf('work once each') === -1, true);
 
 const empty = buildDigest(with_({ auto_approved: [], sent: [], held: [] }), CFG);
-t.check('an empty day still sends, saying "none" three times (the digest is also the proof the stack ran)',
-  [empty.send, empty.text.split('  none').length - 1], [true, 3]);
+t.check('an empty day still sends, saying "none" in all five sections (the digest is also the proof the stack ran)',
+  [empty.send, empty.text.split('  none\n').length - 1], [true, 5]);
+
+// Per niche and A/B arm (migration 025).
+{
+  const nd = buildDigest(with_({
+    auto_approved: [
+      { draft_id: 501, lead_id: 4000, company_name: 'Axis CRC', domain: 'axis.mx', country: 'Mexico', channel: 'email',
+        variant: 'template/A/trials/unnamed', status: 'approved', approved_at: '2026-10-04T20:32:00.000Z', niche: 'research_site' },
+      { draft_id: 502, lead_id: 4001, company_name: 'Beta Site', domain: 'beta.mx', country: 'Mexico', channel: 'email',
+        variant: 'template/B/city/unnamed', status: 'approved', approved_at: '2026-10-04T20:40:00.000Z', niche: 'research_site' },
+      { draft_id: 503, lead_id: 180, company_name: 'ProRelix', domain: 'prorelix.com', country: 'India', channel: 'email',
+        variant: 'follow-up-1/template/A', status: 'approved', approved_at: '2026-10-04T21:00:00.000Z', niche: 'cro' },
+    ],
+    sent: [
+      { draft_id: 400, lead_id: 4002, company_name: 'Gamma', domain: 'gamma.mx', to_addr: 'info@gamma.mx',
+        variant: 'template/A/areas/role-inbox+x', approved_by: 'auto', sent_at: '2026-10-04T12:10:00.000Z', niche: 'research_site' },
+    ],
+    held: [],
+    niche_totals: [
+      { niche: 'cro', arm: 'A', first_touches: 14, follow_ups: 17, replied_leads: 0, bounced: 1 },
+      { niche: 'research_site', arm: 'B', first_touches: 3, follow_ups: 0, replied_leads: 1, bounced: 0 },
+    ],
+  }), CFG);
+  t.check('niche and arm on each auto-approved line',
+    nd.text.indexOf('  #501  Axis CRC (axis.mx, Mexico)  first touch  [research_site A]  approved') !== -1, true);
+  t.check('niche and arm on each sent line (tags after the arm do not hide it)',
+    nd.text.indexOf('  #400  Gamma -> info@gamma.mx  first touch  [research_site A]') !== -1, true);
+  t.check('this window, by niche and arm', [
+    nd.text.indexOf('  cro / arm A:  1 auto-approved, 0 sent, 0 email(s) held') !== -1,
+    nd.text.indexOf('  research_site / arm A:  1 auto-approved, 1 sent, 0 email(s) held') !== -1,
+    nd.text.indexOf('  research_site / arm B:  1 auto-approved, 0 sent, 0 email(s) held') !== -1], [true, true, true]);
+  t.check('every template email so far, by niche and arm', [
+    nd.text.indexOf('  cro / arm A:  14 first touches, 17 follow-ups, 0 lead(s) replied, 1 bounced') !== -1,
+    nd.text.indexOf('  research_site / arm B:  3 first touches, 0 follow-ups, 1 lead(s) replied, 0 bounced') !== -1],
+    [true, true]);
+}
 t.check('kinds: first touch, follow-up N, low-context note',
   [kindOf('unnamed/D2.A1'), kindOf('follow-up-1/BEN-SEE.A1+long'), kindOf('low-context/role-inbox')],
   ['first touch', 'follow-up 1', 'low-context note']);

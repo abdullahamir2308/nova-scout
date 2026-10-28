@@ -398,7 +398,12 @@ SELECT l.id AS lead_id,
        ts.site_tier          AS ts_site_tier,
        ts.trial_count        AS ts_trial_count,
        ts.recent_trials_3yr  AS ts_recent_trials_3yr,
-       ts.active_recruiting  AS ts_active_recruiting
+       ts.active_recruiting  AS ts_active_recruiting,
+       sls.facility_name     AS sls_facility_name,
+       sls.ctgov_recruiting  AS sls_ctgov_recruiting,
+       sls.has_contact_form  AS sls_has_contact_form,
+       sls.has_mailto        AS sls_has_mailto,
+       sls.name_kind         AS sls_name_kind
   FROM leads l
   JOIN enrichments e ON e.lead_id = l.id
   LEFT JOIN blocklist b ON b.domain = l.domain
@@ -412,6 +417,10 @@ SELECT l.id AS lead_id,
      ORDER BY c.recent_trials_3yr DESC, c.site_tier, c.trial_count DESC, c.location_id
      LIMIT 1
   ) ts ON true
+  -- A research-site lead's source facts (migration 025): the strict
+  -- facility-level recruiting count and what the verification fetch saw. One
+  -- row per lead at most (primary key), so this cannot fan out either.
+  LEFT JOIN site_lead_sources sls ON sls.lead_id = l.id
  WHERE l.status = 'enriched'
  ORDER BY l.id
  LIMIT $1;"""

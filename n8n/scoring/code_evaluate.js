@@ -528,6 +528,205 @@ function scoreTrialsites(lead) {
 }
 
 // ---------------------------------------------------------------------------
+// The research-site niche (migration 025; operator brief 2026-10-28).
+//
+// A site or an SMO is not scored by the CRO factors: "active trials" for a CRO
+// is a sponsor-name match a site never meets, oncology is NoblePath's case
+// study, and "founder with LinkedIn" is a CRO's buyer. A lead takes this path
+// when it comes from one of the open site sources, or when enrichment calls an
+// ICH GCP lead a site or an SMO. Trialsites leads stay on the CRO path exactly
+// as before: they belong to no niche until the operator settles that source's
+// licence (Master Ref Section 13).
+//
+// Classification is strict, first rule wins, and only a positive answer is a
+// site: enrichment must have said 'site' or 'SMO', and nothing in the name or
+// the domain may say CRO, sponsor, hospital, academic or government. Anything
+// else is excluded -- disqualified with the reason -- so a lead the niche does
+// not understand is never drafted with its wording, and a site-source lead
+// enrichment calls a CRO never reaches the CRO template either.
+// ---------------------------------------------------------------------------
+
+const SITE_SOURCES = ['sites-ctgov', 'sites-overture'];
+
+const SITE_WEIGHTS = {
+  recruiting_trials: 25,
+  site_type: 15,
+  therapeutic_areas: 10,
+  inquiry_form: 10,
+  geography: 10,
+  employees: 10,
+  site_quality: 10,
+  director: 10,
+};
+const SITE_ORDER = ['recruiting_trials', 'site_type', 'therapeutic_areas', 'inquiry_form', 'geography',
+  'employees', 'site_quality', 'director'];
+
+// Recruiting trials at THIS site (ClinicalTrials.gov, strict facility-level
+// match at harvest: site_lead_sources.ctgov_recruiting). Highest band reached.
+const SITE_TRIAL_BANDS = [[10, 25], [5, 20], [2, 15], [1, 10]];
+
+// Name screens, as whole words of the folded name. The institution lists are
+// the Trialsites selector's (n8n/sites/code_select_candidates.js), which a
+// drift test keeps equal; sponsor and CRO words are this niche's own.
+const SITE_HOSPITAL_WORDS = [
+  'hospital', 'hospitals', 'hospitalar', 'hospitalaria', 'hospitalario', 'hopital', 'ospedale', 'hastane',
+  'hastanesi', 'szpital', 'szpitala', 'szpitalny', 'korhaz', 'nemocnice', 'spital', 'spitalul', 'krankenhaus',
+  'klinikum', 'ziekenhuis', 'sjukhus', 'sygehus', 'sairaala', 'nosocomio', 'bolnica', 'policlinico',
+  'santa casa', 'infirmary',
+];
+const SITE_ACADEMIC_WORDS = [
+  'medical college', 'college', 'school', 'academy', 'university', 'universidad', 'universidade', 'universita',
+  'universitat', 'universite', 'universitesi', 'universitas', 'universitario', 'universitaria', 'universitair',
+  'uniwersytet', 'uniwersytecki', 'egyetem', 'egyetemi', 'univerzita', 'univerzitet', 'faculty', 'facultad',
+  'faculdade', 'fakultesi', 'fakultat',
+];
+const SITE_GOVERNMENT_WORDS = [
+  'ministry', 'ministerio', 'ministerstwo', 'government', 'national', 'nacional', 'nazionale', 'state',
+  'federal', 'municipal', 'county', 'provincial', 'public health', 'health service', 'nhs', 'trust',
+  'military', 'army', 'navy', 'veterans', 'seguro social', 'imss', 'issste', 'aiims', 'pgimer',
+];
+const SITE_INSTITUTION_STEMS = [
+  'universit', 'universid', 'uniwersyt', 'univerzit', 'egyetem', 'szpital', 'hastane', 'nemocnic', 'spital',
+  'krankenhaus', 'ziekenhuis', 'sjukhus', 'sygehus', 'sairaal', 'ospedal', 'bolnic', 'korhaz', 'ministr',
+  'minister', 'fakult', 'facult', 'faculd',
+];
+// Academic and hospital phrases the Trialsites lists do not carry, seen in this
+// niche's first run (2026-10-28: "MD Anderson Cancer Center" passed every word
+// list). Strict on purpose: a "... Medical Center" that runs trials is a
+// hospital until a person says otherwise.
+const SITE_EXTRA_INSTITUTION_WORDS = [
+  'cancer center', 'cancer centre', 'cancer institute', 'comprehensive cancer', 'medical center', 'medical centre',
+  'health system', 'healthcare system', 'health sciences', 'health science center', 'childrens', 'children s',
+];
+const SITE_SPONSOR_WORDS = [
+  'pharma', 'pharmaceutical', 'pharmaceuticals', 'therapeutics', 'biotech', 'biotechnology', 'bioscience',
+  'biosciences', 'biopharma', 'biopharmaceuticals', 'biologics', 'vaccine', 'vaccines', 'medical devices',
+];
+const SITE_CRO_WORDS = ['cro', 'contract research', 'contract research organization', 'contract research organisation'];
+const SITE_SMO_WORDS = ['smo', 'site management', 'site management organization', 'site management organisation',
+  'site network', 'research network'];
+const SITE_RESEARCH_WORDS = [
+  'research', 'investigacion', 'investigaciones', 'investigacao', 'investigacoes', 'pesquisa', 'pesquisas',
+  'badan', 'badania', 'kliniczne', 'klinicznych', 'arastirma', 'arastirmalari', 'kutato', 'kutatas',
+  'kutatokozpont', 'vyzkum', 'vyzkumu', 'cercetare', 'cercetari', 'recherche', 'forschung', 'ricerca',
+  'onderzoek', 'trial', 'trials', 'smo', 'site management', 'estudios clinicos', 'estudos clinicos', 'ensayos',
+  'clinical studies', 'studienzentrum',
+];
+const SITE_INSTITUTIONAL_DOMAIN = [
+  /\.edu$/, /\.gov$/, /\.mil$/, /\.int$/, /\.(ac|edu|gov|gob|gouv|govt|mil|nic)\.[a-z]{2}$/,
+  /\.nhs\.uk$/, /\.nhs\.net$/, /\.hscni\.net$/, /\.health\.nz$/,
+];
+
+function siteWords(v) {
+  return String(v === null || v === undefined ? '' : v).normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .toLowerCase().replace(/[^a-z0-9&]+/g, ' ').trim();
+}
+function siteWordsRe(list) {
+  return new RegExp('(^| )(' + list.join('|') + ')( |$)');
+}
+const SITE_HOSPITAL_RE = siteWordsRe(SITE_HOSPITAL_WORDS);
+const SITE_ACADEMIC_RE = siteWordsRe(SITE_ACADEMIC_WORDS);
+const SITE_GOVERNMENT_RE = siteWordsRe(SITE_GOVERNMENT_WORDS);
+const SITE_EXTRA_INSTITUTION_RE = siteWordsRe(SITE_EXTRA_INSTITUTION_WORDS);
+const SITE_STEM_RE = new RegExp('(^| )(' + SITE_INSTITUTION_STEMS.join('|') + ')[a-z]*( |$)');
+const SITE_SPONSOR_RE = siteWordsRe(SITE_SPONSOR_WORDS);
+const SITE_CRO_RE = siteWordsRe(SITE_CRO_WORDS);
+const SITE_SMO_RE = siteWordsRe(SITE_SMO_WORDS);
+const SITE_RESEARCH_RE = siteWordsRe(SITE_RESEARCH_WORDS);
+
+// Does this lead take the research-site path?
+function isSiteNicheLead(lead) {
+  if (SITE_SOURCES.indexOf(lead.source) !== -1) return true;
+  if (lead.source === 'trialsites') return false;
+  const ct = companyType(lead.raw_extraction || {});
+  return ct === 'site' || ct === 'SMO';
+}
+
+// { entity: 'site'|'SMO'|null, kind, excluded: null|{code,text} }
+function classifySite(lead) {
+  const raw = lead.raw_extraction || {};
+  const ct = companyType(raw);
+  const names = [lead.company_name, lead.sls_facility_name].map(siteWords).filter(Boolean);
+  const domain = String(lead.domain || '').toLowerCase();
+  function out(code, text) { return { entity: null, kind: null, excluded: { code: 'site_' + code, text: text } }; }
+  const anyName = function (re) { return names.some(function (n) { return re.test(n); }); };
+  // A facility where an industry trial is recruiting patients right now
+  // (ClinicalTrials.gov, the location's own status) is a site whatever the
+  // model read on its homepage: in the first run, enrichment called four US
+  // dedicated research sites "CRO" (they "conduct clinical trials"). A CRO by
+  // NAME stays a CRO. lead_company_type() (migration 025) makes the same call.
+  const recruitingSite = lead.source === 'sites-ctgov' && Number(lead.sls_ctgov_recruiting) > 0;
+  if (anyName(SITE_CRO_RE) || (ct === 'CRO' && !recruitingSite)) {
+    return out('cro', 'Classified as a CRO, not a research site or SMO (' + (anyName(SITE_CRO_RE) ? 'its name' : 'enrichment') +
+      ') — the research-site niche drafts sites and SMOs only, and a lead from a site source never takes the CRO template.');
+  }
+  if (anyName(SITE_SPONSOR_RE)) return out('sponsor', 'Its name reads as a sponsor (pharma, biotech or device company), not a research site.');
+  if (anyName(SITE_HOSPITAL_RE)) return out('hospital', 'Its name reads as a hospital — the research-site niche excludes hospitals.');
+  if (anyName(SITE_ACADEMIC_RE)) {
+    return out('academic', 'Its name reads as a university or academic institution — excluded from the research-site niche.');
+  }
+  if (anyName(SITE_GOVERNMENT_RE)) {
+    return out('government', 'Its name reads as a government or public body — excluded from the research-site niche.');
+  }
+  if (SITE_INSTITUTIONAL_DOMAIN.some(function (re) { return re.test(domain); })) {
+    return out('institution', domain + ' is an institutional domain (university, government or health service) — excluded from the research-site niche.');
+  }
+  if (anyName(SITE_STEM_RE) || anyName(SITE_EXTRA_INSTITUTION_RE)) {
+    return out('academic', 'Its name reads as a university, a cancer or medical center, or a hospital — excluded from the research-site niche.');
+  }
+  if (ct !== 'site' && ct !== 'SMO' && !(ct === 'CRO' && recruitingSite)) {
+    return out('unclear', 'Enrichment did not classify it as a research site or SMO (' + (ct || 'no classification') +
+      '), and the research-site niche drafts only a positive classification.');
+  }
+  const smo = ct === 'SMO' || anyName(SITE_SMO_RE);
+  return {
+    entity: smo ? 'SMO' : 'site',
+    kind: smo ? 'smo' : (anyName(SITE_RESEARCH_RE) ? 'dedicated' : 'practice'),
+    excluded: null,
+  };
+}
+
+function rescale(f, max) {
+  return Object.assign({}, f, { points: Math.round(f.points * max / f.max), max: max });
+}
+
+function siteNicheFactors(lead, cls) {
+  const n = Number(lead.sls_ctgov_recruiting) || 0;
+  let trialPts = 0;
+  for (const b of SITE_TRIAL_BANDS) { if (n >= b[0]) { trialPts = b[1]; break; } }
+  const areas = canonicalAreas(lead.therapeutic_areas).filter(function (a) { return a !== 'Other'; });
+  const form = lead.sls_has_contact_form;
+  const mailto = lead.sls_has_mailto;
+  let formPts = 5;
+  let formDetail = 'inquiry path not measured';
+  if (form === true && mailto !== true) { formPts = 10; formDetail = 'inquiries go through a contact form only'; }
+  else if (form === true) { formPts = 6; formDetail = 'a contact form and a published email address'; }
+  else if (form === false) { formPts = 3; formDetail = 'no contact form on the pages read'; }
+  return {
+    recruiting_trials: {
+      points: trialPts, max: SITE_WEIGHTS.recruiting_trials, basis: n > 0 ? 'confirmed' : 'unknown',
+      detail: n > 0 ? n + ' recruiting trial' + (n === 1 ? '' : 's') + ' listed at this facility on ClinicalTrials.gov'
+        : 'no recruiting trial matched to this facility on ClinicalTrials.gov',
+    },
+    site_type: {
+      points: cls.kind === 'practice' ? 8 : SITE_WEIGHTS.site_type, max: SITE_WEIGHTS.site_type, basis: 'confirmed',
+      detail: cls.kind === 'smo' ? 'a site management organisation (a network of sites)'
+        : (cls.kind === 'dedicated' ? 'a dedicated clinical research site' : 'a practice that runs trials'),
+    },
+    therapeutic_areas: {
+      points: areas.length ? SITE_WEIGHTS.therapeutic_areas : 0, max: SITE_WEIGHTS.therapeutic_areas,
+      basis: areas.length ? 'confirmed' : 'unknown',
+      detail: areas.length ? 'therapeutic areas stated: ' + areas.slice(0, 4).join(', ') : 'no therapeutic areas extracted',
+    },
+    inquiry_form: { points: formPts, max: SITE_WEIGHTS.inquiry_form, basis: form === null || form === undefined ? 'unknown' : 'confirmed', detail: formDetail },
+    geography: rescale(scoreGeography(lead), SITE_WEIGHTS.geography),
+    employees: rescale(scoreEmployees(lead), SITE_WEIGHTS.employees),
+    site_quality: rescale(scoreSite(lead), SITE_WEIGHTS.site_quality),
+    director: rescale(scoreFounder(lead), SITE_WEIGHTS.director),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Node body
 // ---------------------------------------------------------------------------
 
@@ -541,6 +740,12 @@ const evidence = siteEvidence(rawEx.fetch);
 // facts to write a rationale from, so it never reaches the model — it gets a
 // deterministic rationale describing exactly what is and is not known.
 const hasExtraction = rawEx.enrichment_status === 'ok';
+
+// The research-site niche's own exclusions join the shared disqualifiers; a CRO
+// lead never enters this branch, so its result is what it always was.
+const siteNiche = isSiteNicheLead(lead);
+const siteClass = siteNiche ? classifySite(lead) : null;
+if (siteClass && siteClass.excluded && !reasons.length) reasons.push(siteClass.excluded);
 
 if (reasons.length) {
   return {
@@ -605,5 +810,13 @@ return {
     // Set only for a Trialsites lead; Compute Fit Score then uses it for the
     // trials factor and ignores the ClinicalTrials.gov answer (and its failure).
     trialsites_trials: scoreTrialsites(lead),
+    // Set only for a research-site niche lead: its own factors, summed by
+    // Compute Fit Score in this order instead of the CRO factors.
+    site_niche: siteClass ? {
+      entity: siteClass.entity,
+      kind: siteClass.kind,
+      order: SITE_ORDER,
+      factors: siteNicheFactors(lead, siteClass),
+    } : null,
   },
 };

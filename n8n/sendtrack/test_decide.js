@@ -12,7 +12,9 @@ const { extractFunctions, runOnceForAll, runner, withColdEmail } = require('./ha
 const FILE = path.join(__dirname, 'code_decide.js');
 // What Send checks for since 2026-10-19: the name line, then the title line.
 const IDENTITY = 'Test Sender\nFounder, Test Labs';
-const transform = withColdEmail(IDENTITY);
+// A niche that signs with its own title (migration 025), the shape the build bakes.
+const SITE_IDENTITY = 'Test Sender\nSoftware Engineer, Test Labs';
+const transform = withColdEmail(IDENTITY, { research_site: SITE_IDENTITY });
 // The two signatures in the queue: the template's (Section 5, since
 // 2026-10-19) and the name / title / phone of everything written before.
 const SIG = 'Cheers!\n' + IDENTITY;
@@ -188,6 +190,14 @@ const reasonFor = (over) => {
   ['signed as a previous sender identity', { body: BODY.replace(IDENTITY, 'Fatima\nFounder, Test Labs') }, 'stale-signature'],
   ['the title line missing', { body: BODY.replace('\nFounder, Test Labs', '') }, 'stale-signature'],
   ['name and title run together on one line', { body: BODY.replace(IDENTITY, 'Test Sender, Founder, Test Labs') }, 'stale-signature'],
+  // Migration 025: a body is checked for ITS lead's niche's identity.
+  ['research-site niche, signed with the niche\'s own title', { niche: 'research_site', body: BODY.replace(IDENTITY, SITE_IDENTITY) }, 'eligible'],
+  ['research-site niche, signed with the CRO title', { niche: 'research_site', body: BODY }, 'stale-signature'],
+  ['CRO niche, signed with the research-site title', { niche: 'cro', body: BODY.replace(IDENTITY, SITE_IDENTITY) }, 'stale-signature'],
+  ['no niche at all (a Trialsites lead): the sender identity, as before', { niche: null, body: BODY }, 'eligible'],
+  ['research-site niche: the whole-email rule still applies to its text',
+    { niche: 'research_site', body: 'Hi there,\n\nSend to this email mailto:x@y.com\n\nCheers!\n' + SITE_IDENTITY },
+    'not-an-email:too-short:6-words'],
   ['the identity only inside a quoted earlier email, not signed by this one',
     { variant: 'follow-up-1', lead_status: 'sent', prior_sends: 1,
       body: 'Hi there,\n\nJust bringing this back.\n\nCheers!\n\nOn Mon, 05 Oct 2026, Test Sender wrote:\n> Hi there,\n>\n> ' +

@@ -41,6 +41,19 @@ function ackAddress(r) {
   return ACK_ADDRESS.test(a) ? a : '';
 }
 
+// Whether anything will draft the lead CONTACT just queued. Since migration 025
+// a niche row answers it (lead_niche(): 'cro', 'research_site', or none --
+// a Trialsites lead, for one); a result without the niche key is read the way
+// it was before, by company type.
+function notDrafted(c) {
+  if (Object.prototype.hasOwnProperty.call(c, 'niche')) {
+    return aStr(c.niche) ? '' : ' (but no niche drafts this lead' +
+      (aStr(c.company_type) ? ', a ' + aStr(c.company_type) : '') + ', so nothing will be written for it)';
+  }
+  return aStr(c.company_type) && aStr(c.company_type) !== 'CRO'
+    ? ' (but it is a ' + aStr(c.company_type) + ', which the CRO template never drafts)' : '';
+}
+
 // CONTACT (2026-10-28): one line per lead the operator named, applied or not.
 function contactLines(r) {
   const rows = Array.isArray(r.contact_results) ? r.contact_results : [];
@@ -50,8 +63,7 @@ function contactLines(r) {
     if (!aStr(c.refused)) {
       out.push('  ' + aStr(c.line) + '. ' + who + ' (lead ' + aStr(c.lead_id) + '): ' + aStr(c.email) +
         (aStr(c.name) ? ', ' + aStr(c.name) : '') + ' -- set, verified, queued for drafting' +
-        (aStr(c.company_type) && aStr(c.company_type) !== 'CRO'
-          ? ' (but it is a ' + aStr(c.company_type) + ', which the CRO template never drafts)' : ''));
+        notDrafted(c));
     } else {
       out.push('  ' + aStr(c.line) + '. ' + who + ': NOT applied -- ' + aStr(c.refused));
     }

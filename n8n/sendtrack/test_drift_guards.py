@@ -35,6 +35,7 @@ COMPOSE = os.path.join(REPO, "docker-compose.yml")
 RULES = os.path.join(REPO, "n8n", "drafting", "code_assemble.js")
 TEMPLATE = os.path.join(REPO, "n8n", "drafting", "code_template.js")
 TEMPLATE_SPEC = os.path.join(REPO, "n8n", "drafting", "template_spec.py")
+SITE_TEMPLATE = os.path.join(REPO, "n8n", "drafting", "code_site_template.js")
 # Section 12's clock table must cover every country the scraper includes, so each
 # case gets its own copy of the scraper tree -- geography.py classifies the slugs
 # and index_slugs.json is the /cro-list index as it was last read.
@@ -106,7 +107,9 @@ def setup(mutate_doc=None, mutate_compose=None, mutate_file=None, mutate_rules=N
                                 (TEMPLATE, os.path.join("drafting", "code_template.js"), mutate_template,
                                  "code_template.js"),
                                 (TEMPLATE_SPEC, os.path.join("drafting", "template_spec.py"), None,
-                                 "template_spec.py")):
+                                 "template_spec.py"),
+                                (SITE_TEMPLATE, os.path.join("drafting", "code_site_template.js"), None,
+                                 "code_site_template.js")):
         text = read(src)
         if fn:
             new = fn(text)
@@ -287,7 +290,10 @@ case("Send starts requiring an opt-out sentence again -> refuses (Section 5, 202
          "const MAX_URLS = 1;", "const OPT_OUT = \"If this isn't relevant, reply 'no' and I won't follow up.\";\nconst MAX_URLS = 1;", 1)))
 case("Send stops checking the sender's name and title lines -> refuses", "no longer checks each body",
      mutate_file=("code_decide.js", lambda s: s.replace(
-         "  if (('\\n' + body + '\\n').indexOf('\\n' + SENDER_IDENTITY + '\\n') === -1) return 'stale-signature';\n", "", 1)))
+         "  if (('\\n' + body + '\\n').indexOf('\\n' + identityFor(c) + '\\n') === -1) return 'stale-signature';\n", "", 1)))
+case("Send checks a niche's own identity but stops falling back to the sender's -> refuses",
+     "falls back to SENDER_IDENTITY",
+     mutate_file=("code_decide.js", lambda s: s.replace(": SENDER_IDENTITY;", ": NICHE_IDENTITIES.research_site;", 1)))
 case("no sender title anywhere -> refuses (Send would accept a body signed with the name alone)",
      "NOVASCOUT_SENDER_TITLE is not set", env_overrides={"NOVASCOUT_SENDER_TITLE": None})
 case("Section 5 and Section 9 list different opt-out keywords -> refuses", "two different opt-out keyword lists",

@@ -35,7 +35,11 @@ const totalCount =
 // -- does not decide its score.
 const tsTrials = ev.trialsites_trials || null;
 
-if (totalCount === null && !tsTrials) {
+// A research-site niche lead (migration 025) brings its own factors and order
+// from Evaluate Lead; ClinicalTrials.gov's sponsor count plays no part in it.
+const siteNiche = ev.site_niche || null;
+
+if (totalCount === null && !tsTrials && !siteNiche) {
   return {
     json: {
       write: false,
@@ -60,13 +64,13 @@ const trials = tsTrials ? tsTrials : {
   total_count: totalCount,
 };
 
-const factors = Object.assign({}, ev.factors, { trials: trials });
+const factors = siteNiche ? siteNiche.factors : Object.assign({}, ev.factors, { trials: trials });
 
 // ---------------------------------------------------------------------------
 // Weighted sum
 // ---------------------------------------------------------------------------
 
-const ORDER = ['geography', 'trials', 'founder', 'oncology', 'employees', 'site'];
+const ORDER = siteNiche ? siteNiche.order : ['geography', 'trials', 'founder', 'oncology', 'employees', 'site'];
 let fitScore = 0;
 for (const k of ORDER) fitScore += factors[k] ? factors[k].points : 0;
 fitScore = Math.max(0, Math.min(100, Math.round(fitScore)));
@@ -153,7 +157,11 @@ factLines.push(
     ? 'about ' + f.employee_estimate
     : 'not stated')
 );
-if (tsTrials) {
+if (siteNiche) {
+  factLines.push('Kind of organisation: ' + siteNiche.factors.site_type.detail);
+  factLines.push('Recruiting trials at this facility: ' + siteNiche.factors.recruiting_trials.detail);
+  factLines.push('Inquiry path: ' + siteNiche.factors.inquiry_form.detail);
+} else if (tsTrials) {
   factLines.push('Trial activity at this site (Trialsites registry aggregate): ' + tsTrials.recent_trials_3yr +
     ' trials in the last 3 years, ' + tsTrials.trial_count + ' in all, ' + tsTrials.active_recruiting +
     ' recruiting now, quality tier ' + (tsTrials.site_tier || 'unknown'));
