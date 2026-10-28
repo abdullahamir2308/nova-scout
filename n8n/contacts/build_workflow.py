@@ -81,6 +81,28 @@ def load_apollo_threshold(doc=None):
     return int(m.group(1))
 
 
+def load_cro_threshold(doc=None):
+    """Parse the lower gate for a CRO out of the same Section 9 sentence.
+
+    Decision 2026-10-28 (operator): a CRO-shaped lead (lead_company_type() =
+    'CRO', migration 019) is looked up from a lower score than a site or SMO,
+    because the CRO template is the only one that drafts, and the CRO leads at
+    40-49 were the pipeline's remaining supply. Sites and SMOs keep the general
+    gate. It may never be above the general gate.
+    """
+    doc = doc if doc is not None else _doc()
+    m = re.search(
+        r"Apollo lookup for leads scoring\s*(?:>=|≥|&ge;)\s*\d+\s*only, and for a CRO from\s*"
+        r"(?:>=|≥|&ge;)\s*(\d+)", doc
+    )
+    if not m:
+        raise AssertionError(
+            "CRO score gate not found in %s -- expected the Section 9 sentence to read "
+            "'Apollo lookup for leads scoring >= N only, and for a CRO from >= M'" % MASTER_REF
+        )
+    return int(m.group(1))
+
+
 def load_contacts_columns(doc=None):
     """Parse the `contacts` column list out of the Section 8 schema block."""
     doc = doc if doc is not None else _doc()
@@ -176,6 +198,11 @@ def load_title_tiers():
 
 
 APOLLO_THRESHOLD = load_apollo_threshold()
+CRO_THRESHOLD = load_cro_threshold()
+if CRO_THRESHOLD > APOLLO_THRESHOLD:
+    raise AssertionError(
+        "Section 9 puts the CRO gate (>= %d) above the general gate (>= %d); the CRO gate is a "
+        "lowering for CROs only, never a raise." % (CRO_THRESHOLD, APOLLO_THRESHOLD))
 CONTACTS_COLUMNS = load_contacts_columns()
 ICP_TARGET = load_icp_titles()
 CSV_URL = load_csv_url()
@@ -288,7 +315,10 @@ SELECT l.id           AS lead_id,
   LEFT JOIN contacts c ON c.lead_id = l.id
  WHERE l.status = 'scored'
    AND s.disqualified = false
-   AND s.fit_score >= $1
+   -- Section 9's gate: $1 for every lead, $4 (lower) for a CRO -- decision
+   -- 2026-10-28; lead_company_type() is migration 019's one definition.
+   AND s.fit_score >= CASE WHEN lead_company_type(e.raw_extraction, l.source) = 'CRO'
+                           THEN $4::int ELSE $1::int END
    AND c.lead_id IS NULL
    -- Added 2026-10-07 (migration 015). THE STARVATION FIX. Without this, a
    -- lead with no scraped address, no address on its own site and no founder
@@ -455,10 +485,12 @@ if "l.status = 'scored'" not in BATCH_SQL:
         "contact lookup happens AFTER scoring, never before' -- that rule is enforced "
         "by this WHERE clause and nothing else."
     )
-if "s.fit_score >= $1" not in BATCH_SQL:
+if ("AND s.fit_score >= CASE WHEN lead_company_type(e.raw_extraction, l.source) = 'CRO'\n"
+        "                           THEN $4::int ELSE $1::int END") not in BATCH_SQL:
     raise AssertionError(
         "the batch query no longer gates on fit_score. Section 9 limits Apollo to "
-        "leads scoring >= %d, which is what keeps it on the free tier." % APOLLO_THRESHOLD
+        "leads scoring >= %d (a CRO >= %d), which is what keeps it on the free tier."
+        % (APOLLO_THRESHOLD, CRO_THRESHOLD)
     )
 
 
@@ -636,6 +668,12 @@ nodes = [
                         "value": APOLLO_THRESHOLD,
                         "type": "number",
                     },
+                    {
+                        "id": "minfitcro",
+                        "name": "min_fit_score_cro",
+                        "value": CRO_THRESHOLD,
+                        "type": "number",
+                    },
                     {"id": "sitepages", "name": "site_max_pages", "value": SITE_MAX_PAGES,
                      "type": "number"},
                     {"id": "maxattempts", "name": "max_attempts", "value": MAX_ATTEMPTS,
@@ -652,9 +690,10 @@ nodes = [
             "Bounded batch (build rule 5), and smaller than Workflow 3's 25: every lead that "
             "gets past Resolve Contact costs money, so the ceiling is a spend ceiling, not a "
             "throughput one.\n\n"
-            "min_fit_score is generated from Section 9's '>= %d' rule by build_workflow.py and "
-            "guarded against drift there. Editing it in the n8n UI will be overwritten on the "
-            "next build -- change the spec instead." % APOLLO_THRESHOLD
+            "min_fit_score and min_fit_score_cro are generated from Section 9's '>= %d only, and "
+            "for a CRO from >= %d' rule by build_workflow.py and guarded against drift there. "
+            "Editing them in the n8n UI will be overwritten on the next build -- change the spec "
+            "instead." % (APOLLO_THRESHOLD, CRO_THRESHOLD)
         ),
     },
     {
@@ -709,7 +748,7 @@ nodes = [
             "operation": "executeQuery",
             "query": BATCH_SQL,
             "options": {
-                "queryReplacement": "={{ [$('Config').first().json.min_fit_score, $('Config').first().json.batch_size, $('Config').first().json.max_attempts] }}"
+                "queryReplacement": "={{ [$('Config').first().json.min_fit_score, $('Config').first().json.batch_size, $('Config').first().json.max_attempts, $('Config').first().json.min_fit_score_cro] }}"
             },
         },
         "name": "Get Qualified Batch",
@@ -719,7 +758,7 @@ nodes = [
         "credentials": PG_CRED,
         "notes": (
             "Section 9's gate, as a WHERE clause: status='scored' AND fit_score >= "
-            "min_fit_score AND no contacts row yet. Reads Config through $('Config') because "
+            "min_fit_score (min_fit_score_cro for a CRO) AND no contacts row yet. Reads Config through $('Config') because "
             "$json here is the CSV index, not the trigger.\n\n"
             "Query parameters are passed as an array so a value containing a comma is never "
             "split."
@@ -1032,7 +1071,7 @@ with io.open(OUT, "w", encoding="utf-8", newline="\n") as fh:
     json.dump(workflow, fh, ensure_ascii=False, indent=2)
     fh.write("\n")
 print("wrote", os.path.abspath(OUT))
-print("  apollo threshold: >= %d" % APOLLO_THRESHOLD)
+print("  apollo threshold: >= %d (a CRO: >= %d)" % (APOLLO_THRESHOLD, CRO_THRESHOLD))
 print("  contacts columns: %r" % (CONTACTS_COLUMNS,))
 print("  title tiers:      %r" % (TITLE_TIERS,))
 print("  csv url:          %s" % CSV_URL)

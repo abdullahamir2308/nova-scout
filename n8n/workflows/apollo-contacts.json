@@ -49,6 +49,12 @@
               "type": "number"
             },
             {
+              "id": "minfitcro",
+              "name": "min_fit_score_cro",
+              "value": 40,
+              "type": "number"
+            },
+            {
               "id": "sitepages",
               "name": "site_max_pages",
               "value": 5,
@@ -71,7 +77,7 @@
         -880,
         130
       ],
-      "notes": "Bounded batch (build rule 5), and smaller than Workflow 3's 25: every lead that gets past Resolve Contact costs money, so the ceiling is a spend ceiling, not a throughput one.\n\nmin_fit_score is generated from Section 9's '>= 50' rule by build_workflow.py and guarded against drift there. Editing it in the n8n UI will be overwritten on the next build -- change the spec instead."
+      "notes": "Bounded batch (build rule 5), and smaller than Workflow 3's 25: every lead that gets past Resolve Contact costs money, so the ceiling is a spend ceiling, not a throughput one.\n\nmin_fit_score and min_fit_score_cro are generated from Section 9's '>= 50 only, and for a CRO from >= 40' rule by build_workflow.py and guarded against drift there. Editing them in the n8n UI will be overwritten on the next build -- change the spec instead."
     },
     {
       "parameters": {
@@ -127,9 +133,9 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- The queue for this stage: scored, qualifying, and not yet looked up.\n--\n-- Section 7's ordering rule is enforced structurally here rather than by\n-- discipline -- the WHERE clause cannot see a lead that has not been scored, so\n-- no amount of re-running can spend a credit before scoring has had its say.\n--\n-- `c.lead_id IS NULL` is what makes re-running free. A lead keeps its contacts\n-- row whether the lookup found somebody or not, so a domain Apollo has already\n-- answered \"nobody\" for is never paid for twice.\nSELECT l.id           AS lead_id,\n       l.domain,\n       l.company_name,\n       l.country,\n       s.fit_score,\n       e.founder_name,\n       e.founder_linkedin,\n       e.raw_extraction->>'founder_title' AS founder_title\n  FROM leads l\n  JOIN scores s        ON s.lead_id = l.id\n  LEFT JOIN enrichments e ON e.lead_id = l.id\n  LEFT JOIN contacts c ON c.lead_id = l.id\n WHERE l.status = 'scored'\n   AND s.disqualified = false\n   AND s.fit_score >= $1\n   AND c.lead_id IS NULL\n   -- Added 2026-10-07 (migration 015). THE STARVATION FIX. Without this, a\n   -- lead with no scraped address, no address on its own site and no founder\n   -- LinkedIn goes to Apollo, is refused by the Free plan, writes nothing, and\n   -- comes back at the TOP of the next hour's batch -- `fit_score DESC` puts\n   -- the same stuck leads first every time. Nine were waiting on 2026-10-07;\n   -- at ten, the batch of 10 is full of them and no new lead is ever looked up\n   -- again. `contacts` could not record this: a tombstone there means \"asked,\n   -- nobody there\", which is a different thing from \"asked, Apollo would not\n   -- answer\", and Section 8 locks that table's columns.\n   --\n   -- Two ways out of the queue, and the second is the one that cannot be\n   -- defeated: 'exhausted' retires a lead whose every source has genuinely\n   -- answered, and the attempt count retires one whose refusal nobody\n   -- recognised. Delete the contact_attempts row to put a lead back.\n   AND NOT EXISTS (\n         SELECT 1 FROM contact_attempts a\n          WHERE a.lead_id = l.id\n            AND (a.last_outcome = 'exhausted' OR a.attempts >= $3))\n -- Best-first, not oldest-first. Every other workflow drains its queue in id\n -- order because the work is free; this one spends money, so a bounded batch\n -- should buy the highest-scoring contacts available rather than the oldest.\n -- Safe to keep now that a lead nobody can reach leaves the queue instead of\n -- sitting at the top of it.\n ORDER BY s.fit_score DESC, l.id\n LIMIT $2;",
+        "query": "-- The queue for this stage: scored, qualifying, and not yet looked up.\n--\n-- Section 7's ordering rule is enforced structurally here rather than by\n-- discipline -- the WHERE clause cannot see a lead that has not been scored, so\n-- no amount of re-running can spend a credit before scoring has had its say.\n--\n-- `c.lead_id IS NULL` is what makes re-running free. A lead keeps its contacts\n-- row whether the lookup found somebody or not, so a domain Apollo has already\n-- answered \"nobody\" for is never paid for twice.\nSELECT l.id           AS lead_id,\n       l.domain,\n       l.company_name,\n       l.country,\n       s.fit_score,\n       e.founder_name,\n       e.founder_linkedin,\n       e.raw_extraction->>'founder_title' AS founder_title\n  FROM leads l\n  JOIN scores s        ON s.lead_id = l.id\n  LEFT JOIN enrichments e ON e.lead_id = l.id\n  LEFT JOIN contacts c ON c.lead_id = l.id\n WHERE l.status = 'scored'\n   AND s.disqualified = false\n   -- Section 9's gate: $1 for every lead, $4 (lower) for a CRO -- decision\n   -- 2026-10-28; lead_company_type() is migration 019's one definition.\n   AND s.fit_score >= CASE WHEN lead_company_type(e.raw_extraction, l.source) = 'CRO'\n                           THEN $4::int ELSE $1::int END\n   AND c.lead_id IS NULL\n   -- Added 2026-10-07 (migration 015). THE STARVATION FIX. Without this, a\n   -- lead with no scraped address, no address on its own site and no founder\n   -- LinkedIn goes to Apollo, is refused by the Free plan, writes nothing, and\n   -- comes back at the TOP of the next hour's batch -- `fit_score DESC` puts\n   -- the same stuck leads first every time. Nine were waiting on 2026-10-07;\n   -- at ten, the batch of 10 is full of them and no new lead is ever looked up\n   -- again. `contacts` could not record this: a tombstone there means \"asked,\n   -- nobody there\", which is a different thing from \"asked, Apollo would not\n   -- answer\", and Section 8 locks that table's columns.\n   --\n   -- Two ways out of the queue, and the second is the one that cannot be\n   -- defeated: 'exhausted' retires a lead whose every source has genuinely\n   -- answered, and the attempt count retires one whose refusal nobody\n   -- recognised. Delete the contact_attempts row to put a lead back.\n   AND NOT EXISTS (\n         SELECT 1 FROM contact_attempts a\n          WHERE a.lead_id = l.id\n            AND (a.last_outcome = 'exhausted' OR a.attempts >= $3))\n -- Best-first, not oldest-first. Every other workflow drains its queue in id\n -- order because the work is free; this one spends money, so a bounded batch\n -- should buy the highest-scoring contacts available rather than the oldest.\n -- Safe to keep now that a lead nobody can reach leaves the queue instead of\n -- sitting at the top of it.\n ORDER BY s.fit_score DESC, l.id\n LIMIT $2;",
         "options": {
-          "queryReplacement": "={{ [$('Config').first().json.min_fit_score, $('Config').first().json.batch_size, $('Config').first().json.max_attempts] }}"
+          "queryReplacement": "={{ [$('Config').first().json.min_fit_score, $('Config').first().json.batch_size, $('Config').first().json.max_attempts, $('Config').first().json.min_fit_score_cro] }}"
         }
       },
       "name": "Get Qualified Batch",
@@ -145,7 +151,7 @@
           "name": "Postgres - novascout"
         }
       },
-      "notes": "Section 9's gate, as a WHERE clause: status='scored' AND fit_score >= min_fit_score AND no contacts row yet. Reads Config through $('Config') because $json here is the CSV index, not the trigger.\n\nQuery parameters are passed as an array so a value containing a comma is never split.",
+      "notes": "Section 9's gate, as a WHERE clause: status='scored' AND fit_score >= min_fit_score (min_fit_score_cro for a CRO) AND no contacts row yet. Reads Config through $('Config') because $json here is the CSV index, not the trigger.\n\nQuery parameters are passed as an array so a value containing a comma is never split.",
       "alwaysOutputData": false
     },
     {

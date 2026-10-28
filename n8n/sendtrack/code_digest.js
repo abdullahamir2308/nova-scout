@@ -105,6 +105,12 @@ function buildDigest(row, cfg) {
     if (dStr(r.code)) {
       lines.push('        reply with:  APPROVE ' + dStr(r.code) + '   |   REJECT ' + dStr(r.code) +
         '   |   EDIT ' + dStr(r.code) + ' <your text>');
+      // EDIT replaces the email's text; it cannot give it an address (draft
+      // 350, 2026-10-24). CONTACT does (migration 023).
+      if (/^(?:no-address|unverified-address)/.test(dStr(r.hold_reason))) {
+        lines.push('        to give it an address instead:  CONTACT ' + (dStr(r.domain) || '<lead domain>') +
+          ' <email address>');
+      }
     }
   });
   const codes = held.filter(function (r) { return dStr(r.code); }).length;

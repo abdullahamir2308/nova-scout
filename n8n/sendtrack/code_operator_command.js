@@ -92,6 +92,45 @@ function authResults(header) {
   return out;
 }
 
+// CONTACT (2026-10-28): the operator supplies a lead's address, which no EDIT
+// can do -- EDIT replaces a draft's TEXT (draft 350). One line per lead, as many
+// lines as wanted in one message, no code needed (the lead is named by its
+// domain, and nothing is sent by this command itself):
+//
+//   CONTACT <lead domain> <email address> [name]
+//
+// A mail client may turn the domain or the address into a link ("x.com
+// <http://x.com>", "mailto:" before an address), so those wrappers are dropped before the
+// words are read. Every line is checked here for shape only; whether the lead
+// exists, is still unemailed and is not blocklisted is Apply Operator Command's.
+const CONTACT_RE = /^\s*contact\b[\s:,-]*(.*)$/i;
+const CONTACT_DOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/;
+const CONTACT_EMAIL_RE = /^[a-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/;
+const CONTACT_NAME_RE = /^[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ.' -]{0,78}[A-Za-zÀ-ÖØ-öø-ÿ.]$/;
+const CONTACT_MAX_LINES = 50;
+const CONTACT_SYNTAX = 'CONTACT <lead domain> <email address> [name]';
+
+function parseContactLine(rest) {
+  // Unwrap autolinks ("x.com <http://x.com>" -> "x.com x.com"), then drop a word
+  // that only repeats the one before it.
+  const cleaned = opStr(rest)
+    .replace(/<((?:mailto:|https?:\/\/)[^>]*)>/gi, ' $1 ')
+    .replace(/\b(?:mailto:|https?:\/\/)/gi, '');
+  const words = cleaned.split(/[\s,;]+/).filter(Boolean).map(function (w) {
+    return w.replace(/\/+$/, '');
+  }).filter(function (w, i, all) {
+    return w && (i === 0 || w.toLowerCase() !== all[i - 1].toLowerCase());
+  });
+  const domain = (words[0] || '').toLowerCase().replace(/^www\./, '').replace(/[\/.]+$/, '');
+  const email = (words[1] || '').toLowerCase().replace(/^[<(]+|[>).]+$/g, '');
+  const name = words.slice(2).join(' ').replace(/^["']+|["']+$/g, '').trim();
+  let problem = null;
+  if (!CONTACT_DOMAIN_RE.test(domain)) problem = 'no lead domain where ' + CONTACT_SYNTAX + ' expects one';
+  else if (!CONTACT_EMAIL_RE.test(email)) problem = 'no email address after the domain';
+  else if (name && !CONTACT_NAME_RE.test(name)) problem = 'the name after the address is not a plain name';
+  return { domain: domain || null, email: email || null, name: name || null, problem: problem };
+}
+
 // What the operator wrote, above any quoted thread. freshText() already does
 // that cut for prospect replies; the command parser is handed the same text so
 // an APPROVE quoted back inside a later message is not re-read as a command.
@@ -102,6 +141,16 @@ function authResults(header) {
 function parseCommand(fresh) {
   const lines = opStr(fresh).replace(/\r\n?/g, '\n').split('\n');
   for (let i = 0; i < lines.length; i++) {
+    const c = CONTACT_RE.exec(lines[i]);
+    if (c && opStr(c[1])) {
+      // A CONTACT message: every CONTACT line in the fresh text is one lead.
+      const contactLines = [];
+      for (let k = i; k < lines.length && contactLines.length < CONTACT_MAX_LINES; k++) {
+        const ck = CONTACT_RE.exec(lines[k]);
+        if (ck && opStr(ck[1])) contactLines.push(Object.assign({ line: contactLines.length + 1 }, parseContactLine(ck[1])));
+      }
+      return { is_command: true, command: 'CONTACT', code: null, replacement: null, contact_lines: contactLines };
+    }
     const m = COMMAND_RE.exec(lines[i]);
     if (!m) continue;
     const verb = m[1].toUpperCase();
@@ -133,9 +182,10 @@ function parseCommand(fresh) {
       code: code,
       // Only EDIT carries a replacement; migration 017 refuses one on the others.
       replacement: verb === 'EDIT' ? (after || null) : null,
+      contact_lines: null,
     };
   }
-  return { is_command: false, command: null, code: null, replacement: null };
+  return { is_command: false, command: null, code: null, replacement: null, contact_lines: null };
 }
 
 // The whole decision for one message, as the SQL statement needs it. `sender_ok`
@@ -149,11 +199,14 @@ function operatorCommand(j, fresh) {
   // `sender` is the one reason this file cannot rule on, so it is reported as a
   // pending check rather than a verdict.
   let refused = null;
-  if (parsed.is_command && !parsed.code) refused = 'no one-time code in the message';
+  const contact = parsed.command === 'CONTACT';
+  if (parsed.is_command && !contact && !parsed.code) refused = 'no one-time code in the message';
   else if (parsed.is_command && !auth.spf) refused = 'the message\'s authentication results do not show SPF pass';
   else if (parsed.is_command && !auth.dkim) refused = 'the message\'s authentication results do not show DKIM pass';
   else if (parsed.is_command && parsed.command === 'EDIT' && !parsed.replacement) {
     refused = 'EDIT with no replacement text after the code';
+  } else if (contact && !parsed.contact_lines.some(function (l) { return !l.problem; })) {
+    refused = 'no CONTACT line could be read -- write one line per lead: ' + CONTACT_SYNTAX;
   }
 
   return {
@@ -161,6 +214,7 @@ function operatorCommand(j, fresh) {
     command: parsed.command,
     code: parsed.code,
     replacement: parsed.replacement,
+    contact_lines: parsed.contact_lines,
     spf_pass: auth.spf,
     dkim_pass: auth.dkim,
     refused_reason: refused,
@@ -210,7 +264,7 @@ const CMD_SIGNATURE = __SIGNATURE__;
 const CMD_MAX_URLS = __MAX_URLS__;
 const CMD_URL_RE = /\b(?:https?:\/\/|www\.)[^\s<>()]+/gi;
 
-const CMD_OUTCOME = { APPROVE: 'approved', REJECT: 'rejected', EDIT: 'edited' };
+const CMD_OUTCOME = { APPROVE: 'approved', REJECT: 'rejected', EDIT: 'edited', CONTACT: 'contact' };
 
 function cmdUrls(v) {
   return (opStr(v).match(CMD_URL_RE) || []).length;
@@ -262,6 +316,9 @@ function commandDecision(ctx) {
     refused = operator
       ? 'not sent from the operator address'
       : 'no operator address is configured (settings.operator_email)';
+  } else if (verb === 'CONTACT') {
+    // No code and no draft: each line names its lead by domain, and Apply
+    // Operator Command judges every line against the database.
   } else if (!ctx.code_found) {
     refused = 'no such one-time code';
   } else if (ctx.code_used_at) {
@@ -279,6 +336,16 @@ function commandDecision(ctx) {
       // code is NOT used, so the same code still works for a corrected EDIT.
       refused = 'that replacement carries ' + cmdUrls(edited) + ' links; Section 5 allows ' +
         CMD_MAX_URLS + '. The code is still good: send EDIT again with at most one link.';
+      edited = null;
+    } else if (opStr(ctx.code_kind) === 'email-hold' && coldEmailProblem(edited)) {
+      // A held COLD email (2026-10-28, draft 350): EDIT replaces its whole text,
+      // so what results must still be a whole email -- the rule Send applies
+      // (code_cold_email.js). An instruction such as "send to this address" is
+      // refused here, where the operator hears about it, and the code stays good.
+      refused = 'EDIT replaces this held email\'s whole text with yours, and the result is not a ' +
+        'complete email (' + coldEmailProblem(edited) + '). The code is still good. To give the lead ' +
+        'an address, send instead: CONTACT ' + (opStr(ctx.code_lead_domain) || '<lead domain>') +
+        ' <email address>';
       edited = null;
     }
   }
@@ -300,6 +367,9 @@ function commandDecision(ctx) {
     code: code,
     replacement: verb === 'EDIT' ? (cmd.replacement || null) : null,
     edited_body: edited,
+    // CONTACT's lines, each { line, domain, email, name, problem } -- only
+    // when the command is CONTACT and nothing above refused it.
+    contact_lines: verb === 'CONTACT' && accepted ? (cmd.contact_lines || []) : null,
     spf_pass: spf,
     dkim_pass: dkim,
     sender_ok: senderOk,

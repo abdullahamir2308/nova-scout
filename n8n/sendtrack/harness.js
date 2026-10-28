@@ -95,4 +95,12 @@ function runner(title) {
   };
 }
 
-module.exports = { extractFunctions, runForEachItem, runOnceForAll, runner, SANDBOX_MISSING };
+// code_cold_email.js's library half placed above a source, with the sender's
+// identity substituted throughout -- what build_workflow.py ships as Decide Send
+// and Decide Command (2026-10-28). Use as an extractFunctions `transform`.
+function withColdEmail(identity) {
+  const cold = fs.readFileSync(path.join(__dirname, 'code_cold_email.js'), 'utf8').split('// Node body')[0];
+  return (s) => (cold + '\n' + s).split('__SENDER_IDENTITY__').join(JSON.stringify(identity));
+}
+
+module.exports = { extractFunctions, runForEachItem, runOnceForAll, runner, withColdEmail, SANDBOX_MISSING };

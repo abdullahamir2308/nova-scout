@@ -22,6 +22,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 import backfill_bounce_kind as backfill
 
@@ -71,8 +72,15 @@ def classify(js, items):
     lib = js[:js.index("// Node body")]
     src = lib + "\nconst items = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n" \
         "process.stdout.write(JSON.stringify(items.map(classify)));\n"
-    p = subprocess.run(["node", "-e", src], input=json.dumps(items), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                       encoding="utf-8")
+    # A file, not `node -e`: Classify Inbound outgrew Windows' 32 KB command line
+    # (2026-10-28, when the CONTACT parser and code_cold_email.js joined it).
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as tf:
+        tf.write(src)
+    try:
+        p = subprocess.run(["node", tf.name], input=json.dumps(items), stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, encoding="utf-8")
+    finally:
+        os.unlink(tf.name)
     if p.returncode:
         raise SystemExit("the shipped classifier failed:\n" + p.stderr[-1500:])
     return json.loads(p.stdout)

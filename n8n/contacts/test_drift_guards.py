@@ -155,10 +155,49 @@ if _moved != 45:
 else:
     PASSED.append("moving the gate in the doc moves it in the workflow")
 
+def _cro_threshold_in_build(doc_mutator):
+    tmp, doc_path, ing_path = _scratch(doc_mutator, None, None, None, "crothreshold")
+    try:
+        rc, err = run_build(tmp, doc_path, ing_path)
+        if rc != 0:
+            return None, err
+        wf = json.loads(read(os.path.join(tmp, "out", "apollo-contacts.json")))
+        cfg = [n for n in wf["nodes"] if n["name"] == "Config"][0]
+        vals = {a["name"]: a["value"] for a in cfg["parameters"]["assignments"]["assignments"]}
+        return vals.get("min_fit_score_cro"), err
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# Decision 2026-10-28: a CRO is looked up from >= 40, everything else from >= 50.
+_cro, _ = _cro_threshold_in_build(None)
+if _cro != 40:
+    FAILED.append(("Section 9's CRO gate (>= 40) reaches Config",
+                   "generated min_fit_score_cro was %r, expected 40" % (_cro,)))
+else:
+    PASSED.append("Section 9's CRO gate (>= 40) reaches Config")
+_cro_moved, _ = _cro_threshold_in_build(
+    lambda d: d.replace("and for a CRO from ≥ 40", "and for a CRO from ≥ 35", 1))
+if _cro_moved != 35:
+    FAILED.append(("moving the CRO gate in the doc moves it in the workflow",
+                   "generated min_fit_score_cro was %r, expected 35" % (_cro_moved,)))
+else:
+    PASSED.append("moving the CRO gate in the doc moves it in the workflow")
+case(
+    "the CRO gate is put above the general gate -> build refuses",
+    mutate_doc=lambda d: d.replace("and for a CRO from ≥ 40", "and for a CRO from ≥ 60", 1),
+    expect_in="never a raise",
+)
+case(
+    "the CRO clause is dropped from the sentence -> build refuses loudly",
+    mutate_doc=lambda d: d.replace(", and for a CRO from ≥ 40", "", 1),
+    expect_in="cro score gate not found",
+)
+
 case(
     "the Apollo gate sentence is reworded away -> build refuses loudly",
     mutate_doc=lambda d: d.replace(
-        "**Then** Apollo lookup for leads scoring ≥ 50 only.",
+        "**Then** Apollo lookup for leads scoring ≥ 50 only, and for a CRO from ≥ 40.",
         "**Then** look up contacts for the good ones.", 1),
     expect_in="apollo score gate not found",
 )

@@ -7,12 +7,12 @@
 // build_workflow.py substitutes it. dryrun.py and template_dryrun.py then prove
 // the same guards end-to-end through n8n, Postgres and an SMTP sink.
 const path = require('path');
-const { extractFunctions, runOnceForAll, runner } = require('./harness');
+const { extractFunctions, runOnceForAll, runner, withColdEmail } = require('./harness');
 
 const FILE = path.join(__dirname, 'code_decide.js');
 // What Send checks for since 2026-10-19: the name line, then the title line.
 const IDENTITY = 'Test Sender\nFounder, Test Labs';
-const transform = (s) => s.replace('__SENDER_IDENTITY__', JSON.stringify(IDENTITY));
+const transform = withColdEmail(IDENTITY);
 // The two signatures in the queue: the template's (Section 5, since
 // 2026-10-19) and the name / title / phone of everything written before.
 const SIG = 'Cheers!\n' + IDENTITY;
@@ -193,6 +193,20 @@ const reasonFor = (over) => {
       body: 'Hi there,\n\nJust bringing this back.\n\nCheers!\n\nOn Mon, 05 Oct 2026, Test Sender wrote:\n> Hi there,\n>\n> ' +
         IDENTITY.split('\n').join('\n> ') }, 'stale-signature'],
   ['two URLs (Section 5 allows one)', { body: BODY.replace('Would you', 'See https://a.example and www.b.example. Would you') }, 'too-many-urls'],
+  // Draft 350, 2026-10-24: an operator EDIT that was an instruction. It kept the
+  // greeting and carried the signature (with phone), so every other check passed.
+  ['draft 350: an EDIT that was an instruction -- greeting, signature, five words of message',
+    { body: 'Hi there,\n\nSend to this email mailto:bdteam@jss.example\n\n' + IDENTITY + '\n+923178485713' },
+    'not-an-email:too-short:5-words'],
+  ['an address written into the message', { body: BODY.replace('Would you', 'Or write to bd@klixar.example. Would you') },
+    'not-an-email:address-in-text'],
+  ['... a bare mailto: too', { body: BODY.replace('Would you', 'Or use mailto: the team. Would you') },
+    'not-an-email:address-in-text'],
+  ['no greeting line', { body: BODY.replace('Hi there,\n\n', '') }, 'not-an-email:no-greeting'],
+  ['"Hello Dr. Novak," is a greeting', { body: BODY.replace('Hi there,', 'Hello Dr. Novak,') }, 'eligible'],
+  ['nineteen words of message are too few', { body: 'Hi there,\n\n' + Array(19).fill('word').join(' ') + '\n\n' + IDENTITY },
+    'not-an-email:too-short:19-words'],
+  ['twenty are enough', { body: 'Hi there,\n\n' + Array(20).fill('word').join(' ') + '\n\n' + IDENTITY }, 'eligible'],
   ['country outside Section 12', { country: 'Narnia' }, 'unknown-country:Narnia'],
   ['first touch to a lead the workflow already emailed', { prior_sends: 1 }, 'already-contacted'],
   ['first touch to a lead the operator emailed by hand', { prior_manual_sends: 1 }, 'already-contacted'],

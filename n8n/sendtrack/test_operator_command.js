@@ -18,7 +18,11 @@ const SRC = path.join(__dirname, 'code_operator_command.js');
 // ships as the Decide Command node. Slicing at the marker is what lets the node
 // body itself ($input, which cannot run outside n8n) live in the same file.
 const SIGNATURE = 'Abdullah Amir\nFounder, Amitrix Labs\n+923178485713';
-const lib = fs.readFileSync(SRC, 'utf8')
+// code_cold_email.js's library goes above it, as the build places it (2026-10-28).
+const COLD = fs.readFileSync(path.join(__dirname, 'code_cold_email.js'), 'utf8')
+  .split('// Node body')[0]
+  .replace('__SENDER_IDENTITY__', JSON.stringify('Abdullah Amir\nFounder, Amitrix Labs'));
+const lib = COLD + '\n' + fs.readFileSync(SRC, 'utf8')
   .split('// Node body')[0]
   .replace('__SIGNATURE__', JSON.stringify(SIGNATURE))
   .replace('__MAX_URLS__', '1');
@@ -333,6 +337,78 @@ console.log('\nEDIT -- the operator\'s own words, in the draft\'s own frame');
   d = M.commandDecision(withBody('EDIT ' + CODE2 + ' Short answer.', { draft_body: 'Hello,\n\nold text' }));
   ok('a draft with no signature in it still frames the edit, with the signature appended',
     d.accepted === true && d.edited_body === 'Hello,\n\nShort answer.\n\n' + SIGNATURE, d.edited_body);
+}
+
+console.log('\nEDIT on a held COLD email -- the result must still be a whole email (draft 350)');
+{
+  // Draft 350 as it stood before the operator's EDIT: a template first touch,
+  // held no-address, whose code the digest carried (kind email-hold).
+  const HELD = ['Hi there,', '',
+    'We have yet to be properly introduced, but I\'m Abdullah Amir and I\'m the Founder of Amitrix Labs.', '',
+    'A sponsor planning an oncology study will usually check JSS Medical Research\'s website before they ever ' +
+    'email you. That visit is a lead worth capturing.', '',
+    'That\'s precisely what we do at Amitrix Labs. We build AI agents for CRO websites that answer sponsor and ' +
+    'visitor questions, collect their details, and turn more of your visitors into qualified leads, so you win ' +
+    'more studies.', '', 'Worth a look for JSS Medical Research?', '', 'Cheers!', 'Abdullah Amir',
+    'Founder, Amitrix Labs'].join('\n');
+  const hold = { code_kind: 'email-hold', draft_variant: 'template/B/areas/unaddressed+no-address',
+    draft_body: HELD, code_lead_domain: 'jssresearch.example' };
+  let d = M.commandDecision(withBody('EDIT ' + CODE2 + ' Send to this email mailto:bdteam@jssresearch.example', hold));
+  ok('the 2026-10-24 EDIT is now refused: five words are not an email', d.accepted === false &&
+    d.edited_body === null && /not a complete email \(too-short:5-words\)/.test(d.refused_reason), d);
+  ok('... the refusal says the code still works and names CONTACT with the lead\'s domain',
+    /still good/.test(d.refused_reason) &&
+    /CONTACT jssresearch\.example <email address>/.test(d.refused_reason), d.refused_reason);
+  const rewrite = 'I came across JSS Medical Research while looking at CROs in India that run oncology studies, and ' +
+    'wanted to ask whether sponsor questions on your website get answered outside office hours.';
+  d = M.commandDecision(withBody('EDIT ' + CODE2 + ' ' + rewrite, hold));
+  ok('... a real rewrite of the held email is accepted', d.accepted === true && d.outcome === 'edited', d);
+  d = M.commandDecision(withBody('EDIT ' + CODE2 + ' Short answer.'));
+  ok('... and a short EDIT on a REPLY is still fine (the rule is for cold email)', d.accepted === true, d);
+}
+
+console.log('\nCONTACT -- giving a lead its address (migration 023)');
+{
+  let p = M.parseCommand('CONTACT jssresearch.example bdteam@jssresearch.example');
+  ok('one line: the domain and the address, no code needed', p.is_command === true && p.command === 'CONTACT' &&
+    p.code === null && p.contact_lines.length === 1 && p.contact_lines[0].domain === 'jssresearch.example' &&
+    p.contact_lines[0].email === 'bdteam@jssresearch.example' && p.contact_lines[0].name === null &&
+    p.contact_lines[0].problem === null, p);
+  p = M.parseCommand('contact: www.Acme-CRO.example  Jane.Doe@Acme-CRO.example  Jane Doe\n' +
+    'CONTACT beta.example <mailto:bd@beta.example>\nthanks!\nCONTACT gamma.example <http://gamma.example> ' +
+    'mailto:info@gamma.example');
+  ok('several lines in one message, case, www., mailto: and autolink wrappers all read',
+    JSON.stringify(p.contact_lines.map((l) => [l.line, l.domain, l.email, l.name, l.problem])) === JSON.stringify([
+      [1, 'acme-cro.example', 'jane.doe@acme-cro.example', 'Jane Doe', null],
+      [2, 'beta.example', 'bd@beta.example', null, null],
+      [3, 'gamma.example', 'info@gamma.example', null, null]]), p.contact_lines);
+  p = M.parseCommand('CONTACT jss.example <http://jss.example> bdteam@jss.example <mailto:bdteam@jss.example> Dr. John Sampalis');
+  ok('Gmail\'s plain-text autolinks ("x <http://x>") are read once, and a name follows the address',
+    JSON.stringify(p.contact_lines[0]) === JSON.stringify({ line: 1, domain: 'jss.example', email: 'bdteam@jss.example',
+      name: 'Dr. John Sampalis', problem: null }), p.contact_lines);
+  p = M.parseCommand('CONTACT jssresearch.example\nCONTACT not-a-domain bd@x.example');
+  ok('a line missing its address, or with no domain, is kept with its problem',
+    p.contact_lines.length === 2 && /no email address/.test(p.contact_lines[0].problem) &&
+    /no lead domain/.test(p.contact_lines[1].problem), p.contact_lines);
+
+  let d = M.commandDecision(withBody('CONTACT jssresearch.example bdteam@jssresearch.example',
+    { code_found: false, draft_id: null, draft_status: null, code_kind: null }));
+  ok('from the operator, SPF + DKIM passing: accepted, with its lines for the database to judge',
+    d.accepted === true && d.handled === true && d.command === 'CONTACT' && d.code === null &&
+    d.contact_lines.length === 1 && d.outcome === 'contact', d);
+  d = M.commandDecision(withBody('CONTACT jssresearch.example bdteam@jssresearch.example', { code_found: false,
+    payload: { message_id: '<x@evil.example>', from_addr: 'someone@evil.example', subject: 'hi' } }));
+  ok('... from anyone else: refused, not handled (it falls through as a prospect message), no lines',
+    d.accepted === false && d.handled === false && d.contact_lines === null && d.record === true, d);
+  const noAuth = 'CONTACT jssresearch.example bdteam@jssresearch.example';
+  d = M.commandDecision(ctx({ command: M.operatorCommand(msg('mx.zohomail.com; spf=pass; dkim=fail', noAuth), noAuth),
+    code_found: false }));
+  ok('... with DKIM failing: refused', d.accepted === false && /DKIM/.test(d.refused_reason), d);
+  d = M.commandDecision(withBody('CONTACT jssresearch.example', { code_found: false }));
+  ok('... with no readable line at all: refused, and the reply gives the syntax',
+    d.accepted === false && /CONTACT <lead domain> <email address> \[name\]/.test(d.refused_reason), d);
+  d = M.commandDecision(withBody('Thanks -- contact me tomorrow.', { code_found: false }));
+  ok('"contact" inside a sentence is not a command', d.record === false, d);
 }
 
 console.log('\n%d passed, %d failed\n', pass, fail);

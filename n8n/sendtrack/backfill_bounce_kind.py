@@ -27,6 +27,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKFLOW = os.path.join(HERE, "..", "workflows", "mailbox-watch.json")
@@ -68,8 +69,15 @@ def shipped_kinds(rows):
     lib = code[:code.index("// Node body")]
     js = lib + "\nconst rows = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n" \
         "process.stdout.write(JSON.stringify(rows.map(r => bounceKind(r.subject, r.body_excerpt))));\n"
-    p = subprocess.run(["node", "-e", js], input=json.dumps(rows), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                       encoding="utf-8")
+    # A file, not `node -e`: Classify Inbound outgrew Windows' 32 KB command line
+    # on 2026-10-28 (the CONTACT parser and code_cold_email.js joined it).
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as tf:
+        tf.write(js)
+    try:
+        p = subprocess.run(["node", tf.name], input=json.dumps(rows), stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, encoding="utf-8")
+    finally:
+        os.unlink(tf.name)
     if p.returncode:
         raise SystemExit("the shipped classifier failed:\n" + p.stderr[-1500:])
     kinds = json.loads(p.stdout)

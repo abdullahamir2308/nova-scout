@@ -410,6 +410,11 @@ function ineligibility(c) {
   if (/^low-context/.test(str(c.variant)) || /^NOT DRAFTED/.test(body)) return 'low-context';
   if (!str(c.subject)) return 'no-subject';
   if (('\n' + body + '\n').indexOf('\n' + SENDER_IDENTITY + '\n') === -1) return 'stale-signature';
+  // A greeting, at least COLD_MIN_WORDS words of message and no address in it
+  // (code_cold_email.js, placed above this file by the build). Draft 350,
+  // 2026-10-24: an EDIT that was really an instruction passed every other check.
+  const shape = coldEmailProblem(body);
+  if (shape) return 'not-an-email:' + shape;
   if (countUrls(body) > MAX_URLS) return 'too-many-urls';
   if (!clockFor(c.country)) return 'unknown-country:' + str(c.country);
   return null;

@@ -41,12 +41,62 @@ function ackAddress(r) {
   return ACK_ADDRESS.test(a) ? a : '';
 }
 
+// CONTACT (2026-10-28): one line per lead the operator named, applied or not.
+function contactLines(r) {
+  const rows = Array.isArray(r.contact_results) ? r.contact_results : [];
+  const out = [];
+  rows.forEach(function (c) {
+    const who = aStr(c.company) || aStr(c.domain) || '(no domain read)';
+    if (!aStr(c.refused)) {
+      out.push('  ' + aStr(c.line) + '. ' + who + ' (lead ' + aStr(c.lead_id) + '): ' + aStr(c.email) +
+        (aStr(c.name) ? ', ' + aStr(c.name) : '') + ' -- set, verified, queued for drafting' +
+        (aStr(c.company_type) && aStr(c.company_type) !== 'CRO'
+          ? ' (but it is a ' + aStr(c.company_type) + ', which the CRO template never drafts)' : ''));
+    } else {
+      out.push('  ' + aStr(c.line) + '. ' + who + ': NOT applied -- ' + aStr(c.refused));
+    }
+  });
+  return out;
+}
+
 function commandAck(r) {
   const to = ackAddress(r);
   const verb = aStr(r.command).toUpperCase();
   const code = aStr(r.code);
   const accepted = r.accepted === true;
   const lines = [];
+
+  if (verb === 'CONTACT') {
+    lines.push(accepted ? 'CONTACT accepted.' : 'CONTACT was REFUSED.');
+    lines.push('');
+    if (!accepted) {
+      lines.push('Reason: ' + (aStr(r.refused_reason) || 'not recorded'));
+      lines.push('');
+    }
+    const each = contactLines(r);
+    if (each.length) {
+      each.forEach(function (l) { lines.push(l); });
+      lines.push('');
+    }
+    lines.push('A lead that was set goes to Drafting on its next tick (every 30 minutes). Its first');
+    lines.push('touch approves itself when the usual rules pass (Workflow 5) and is then sent in the');
+    lines.push('recipient\'s business hours. Nothing was sent by this command.');
+    lines.push('');
+    lines.push('Syntax, one line per lead:  CONTACT <lead domain> <email address> [name]');
+    lines.push('');
+    lines.push('Your mail: ' + aStr(r.message_id));
+    lines.push('Subject:   ' + aStr(r.subject));
+    lines.push('SPF/DKIM:  ' + (r.spf_pass === true ? 'pass' : 'FAIL') + ' / ' +
+      (r.dkim_pass === true ? 'pass' : 'FAIL'));
+    lines.push('');
+    lines.push('-- Nova Scout (Workflow 7). Sent only to this address; it uses no warm-up slot.');
+    return {
+      notify: Boolean(r.notify) && to !== '',
+      notify_to: to,
+      subject: '[Nova Scout] ' + (accepted ? 'CONTACT ok' : 'command refused'),
+      text: lines.join('\n'),
+    };
+  }
 
   if (accepted) {
     lines.push(verb + ' accepted for draft ' + aStr(r.draft_id) +

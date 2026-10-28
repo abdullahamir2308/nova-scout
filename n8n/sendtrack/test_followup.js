@@ -14,7 +14,7 @@
 // approved forever, so it has to be sendable by construction.
 const fs = require('fs');
 const path = require('path');
-const { extractFunctions, runOnceForAll, runner } = require('./harness');
+const { extractFunctions, runOnceForAll, runner, withColdEmail } = require('./harness');
 
 const CLOCKS = ['Turkey', 'Poland', 'India', 'USA', 'Argentina'];
 const BUILD = path.join(__dirname, 'code_followup.js');
@@ -28,7 +28,7 @@ const bake = (s) => RULES + '\n' + s.replace('__SEND_CLOCK_COUNTRIES__', JSON.st
 const IDENTITY = 'Abdullah Amir\nFounder, Amitrix Labs';
 const { ineligibility } = extractFunctions(
   path.join(__dirname, 'code_decide.js'), '// Node body', ['ineligibility'],
-  (s) => s.replace('__SENDER_IDENTITY__', JSON.stringify(IDENTITY)));
+  withColdEmail(IDENTITY));
 const T = new Function(RULES + '\nreturn { renderFirstTouch, leadFacts };')();
 
 const t = runner('Workflow 6 -- template follow-ups');

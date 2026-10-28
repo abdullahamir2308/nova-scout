@@ -85,6 +85,13 @@ function reminder(r) {
   lines.push('  APPROVE ' + code);
   lines.push('  REJECT ' + code);
   lines.push('  EDIT ' + code + '   ...then your own text');
+  // EDIT replaces the email's text; it cannot give it an address (draft 350,
+  // 2026-10-24). CONTACT does, with no code (migration 023).
+  if (kind === 'email-hold' && /^(?:no-address|unverified-address)/.test(mStr(r.hold_reason))) {
+    lines.push('');
+    lines.push('No address? Do not use EDIT for that. Give the lead one instead:');
+    lines.push('  CONTACT ' + (mStr(r.domain) || '<lead domain>') + ' <email address>');
+  }
   lines.push('');
   lines.push('When the code expires nothing is sent and the draft stays pending; the next');
   lines.push('reminder carries a fresh code.');

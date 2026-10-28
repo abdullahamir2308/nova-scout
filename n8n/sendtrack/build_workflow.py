@@ -1331,6 +1331,7 @@ SELECT p.p->'msg'                                              AS payload,
        a.outcome                                               AS code_outcome,
        a.draft_id                                              AS draft_id,
        a.lead_id                                               AS code_lead_id,
+       (SELECT l.domain FROM leads l WHERE l.id = a.lead_id)   AS code_lead_domain,
        d.status                                                AS draft_status,
        d.channel                                               AS draft_channel,
        d.variant                                               AS draft_variant,
@@ -1368,6 +1369,19 @@ COMMAND_APPLY_SQL = """-- Apply Operator Command: record what arrived, and do wh
 -- `payload` is handed back unchanged: a command-shaped message that did NOT
 -- come from the operator falls through to Record Inbound, because it may well
 -- be a prospect writing (`handled` is false for it).
+--
+-- CONTACT (2026-10-28, migration 023) carries no code: each line names a lead
+-- by domain and gives its address. The same authentication is re-derived here;
+-- each line is then judged against the database -- the lead exists, has never
+-- been emailed, is at scored / contact_found / drafted, and neither domain is
+-- blocklisted -- and every line that passes, in this one statement: upserts the
+-- lead's contact (that address, verified = true by the operator's word; a name
+-- on the line replaces the stored one, otherwise the stored one stays -- the
+-- greeting uses it only when the address carries it), clears its
+-- contact_attempts row, and moves the lead to contact_found, so Drafting writes
+-- its first touch on its next tick through the normal gate (Workflow 5).
+-- Nothing is sent by this command. A re-delivered message changes nothing: the
+-- side effects run only while its Message-ID is not yet in operator_commands.
 WITH p AS (
   SELECT $1::jsonb AS p
 ),
@@ -1387,6 +1401,7 @@ j AS (
          (p.p->>'draft_id')::bigint                             AS draft_id,
          (p.p->>'outcome')                                      AS outcome,
          p.p->>'code_kind'                                      AS code_kind,
+         p.p->'contact_lines'                                   AS contact_lines,
          (SELECT value FROM settings WHERE key = 'operator_email') AS operator_email
     FROM p
 ),
@@ -1397,7 +1412,13 @@ ok AS (
          (j.refused_reason IS NULL AND j.command IS NOT NULL AND j.code IS NOT NULL
           AND j.spf_pass AND j.dkim_pass AND j.operator_email IS NOT NULL
           AND lower(j.operator_email) = j.from_addr
-          AND reply_approval_usable(j.code))                    AS may_act
+          AND reply_approval_usable(j.code))                    AS may_act,
+         (j.refused_reason IS NULL AND j.command = 'CONTACT'
+          AND j.spf_pass AND j.dkim_pass AND j.operator_email IS NOT NULL
+          AND lower(j.operator_email) = j.from_addr
+          AND jsonb_typeof(j.contact_lines) = 'array'
+          AND NOT EXISTS (SELECT 1 FROM operator_commands oc
+                           WHERE oc.message_id = j.message_id))  AS may_contact
     FROM j
 ),
 used AS (
@@ -1422,24 +1443,100 @@ act AS (
      AND d.status = 'pending'
   RETURNING d.id, d.status, d.variant
 ),
+-- CONTACT: every line, judged. Empty unless may_contact.
+cl AS (
+  SELECT x.n::int                                              AS line,
+         lower(x.v->>'domain')                                 AS domain,
+         lower(x.v->>'email')                                  AS email,
+         nullif(x.v->>'name', '')                              AS name,
+         x.v->>'problem'                                       AS problem,
+         l.id                                                  AS lead_id,
+         l.company_name                                        AS company_name,
+         l.status                                              AS lead_status,
+         lead_company_type(e.raw_extraction, l.source)         AS company_type,
+         (EXISTS (SELECT 1 FROM outreach_log o WHERE o.lead_id = l.id)
+          OR EXISTS (SELECT 1 FROM mailbox_sent m WHERE m.lead_id = l.id AND m.external)) AS emailed,
+         EXISTS (SELECT 1 FROM blocklist b WHERE lower(l.domain) = b.domain
+                                              OR lower(l.domain) LIKE '%.' || b.domain) AS lead_blocked,
+         EXISTS (SELECT 1 FROM blocklist b WHERE split_part(lower(x.v->>'email'), '@', 2) = b.domain
+                                              OR split_part(lower(x.v->>'email'), '@', 2) LIKE '%.' || b.domain)
+                                                               AS email_blocked,
+         -- Two lines for one lead: the later one is what the operator meant.
+         x.n < max(x.n) OVER (PARTITION BY lower(x.v->>'domain')) AS superseded
+    FROM ok
+   CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN ok.may_contact THEN ok.contact_lines
+                                                ELSE '[]'::jsonb END) WITH ORDINALITY AS x(v, n)
+    LEFT JOIN leads l       ON lower(l.domain) IN (lower(x.v->>'domain'), 'www.' || lower(x.v->>'domain'))
+    LEFT JOIN enrichments e ON e.lead_id = l.id
+),
+cv AS (
+  SELECT cl.*,
+         CASE WHEN cl.problem IS NOT NULL THEN cl.problem
+              WHEN cl.superseded THEN 'a later line names the same lead'
+              WHEN cl.lead_id IS NULL THEN 'no lead has the domain ' || cl.domain
+              WHEN cl.emailed THEN 'this lead has already been emailed'
+              WHEN cl.lead_status NOT IN ('scored', 'contact_found', 'drafted')
+                THEN 'this lead is ' || cl.lead_status
+              WHEN cl.lead_blocked THEN 'the lead''s domain is on the blocklist'
+              WHEN cl.email_blocked THEN 'that address''s domain is on the blocklist'
+              WHEN cl.email !~ '^[^ @<>(),;:"'']+@[a-z0-9-]+([.][a-z0-9-]+)+$' THEN 'not an email address'
+         END AS refused
+    FROM cl
+),
+cup AS (
+  INSERT INTO contacts (lead_id, name, title, email, linkedin_url, apollo_id, verified)
+  SELECT cv.lead_id, cv.name, NULL, cv.email, NULL, NULL, true
+    FROM cv
+   WHERE cv.refused IS NULL
+  ON CONFLICT (lead_id) DO UPDATE SET
+    email    = EXCLUDED.email,
+    verified = true,
+    name     = coalesce(EXCLUDED.name, contacts.name),
+    title    = CASE WHEN EXCLUDED.name IS NOT NULL THEN NULL ELSE contacts.title END
+  RETURNING lead_id
+),
+cadv AS (
+  UPDATE leads l
+     SET status = 'contact_found', updated_at = now()
+   WHERE l.id IN (SELECT cv.lead_id FROM cv WHERE cv.refused IS NULL)
+     AND l.status IN ('scored', 'contact_found', 'drafted')
+  RETURNING l.id
+),
+catt AS (
+  DELETE FROM contact_attempts a
+   WHERE a.lead_id IN (SELECT cv.lead_id FROM cv WHERE cv.refused IS NULL)
+  RETURNING a.lead_id
+),
+res AS (
+  SELECT CASE WHEN ok.command = 'CONTACT' THEN (SELECT count(*) FROM cup) > 0
+              ELSE (SELECT count(*) FROM act) = 1 END          AS accepted,
+         (SELECT jsonb_agg(jsonb_build_object(
+                   'line', cv.line, 'domain', cv.domain, 'email', cv.email, 'name', cv.name,
+                   'lead_id', cv.lead_id, 'company', cv.company_name, 'company_type', cv.company_type,
+                   'refused', cv.refused) ORDER BY cv.line)
+            FROM cv)                                            AS contact_results
+    FROM ok
+),
 rec AS (
   INSERT INTO operator_commands (message_id, received_at, from_addr, subject, command, code,
                                  spf_pass, dkim_pass, sender_ok, accepted, refused_reason,
-                                 replacement, draft_id)
+                                 replacement, draft_id, contact_lines)
   SELECT ok.message_id, coalesce(ok.received_at, now()), ok.from_addr, nullif(ok.subject, ''),
          ok.command, ok.code, ok.spf_pass, ok.dkim_pass, ok.sender_ok,
-         (SELECT count(*) FROM act) = 1,
-         CASE WHEN (SELECT count(*) FROM act) = 1 THEN NULL
+         res.accepted,
+         CASE WHEN res.accepted THEN NULL
+              WHEN ok.may_contact THEN 'no CONTACT line could be applied (each line says why)'
               ELSE coalesce(ok.refused_reason,
                             'the code or the draft changed between the read and the write') END,
          CASE WHEN ok.command = 'EDIT' THEN ok.replacement END,
-         ok.draft_id
-    FROM ok
+         ok.draft_id,
+         CASE WHEN ok.command = 'CONTACT' THEN res.contact_results END
+    FROM ok, res
   ON CONFLICT (message_id) DO NOTHING
   RETURNING message_id, accepted, refused_reason
 )
 SELECT (SELECT count(*) FROM rec) = 1                     AS recorded,
-       (SELECT count(*) FROM act) = 1                     AS accepted,
+       res.accepted                                       AS accepted,
        -- Re-derived, not carried over from the item: "this is the operator's
        -- own mail" is the decision that stops a prospect's reply being
        -- recorded, so it is made from `settings` here too.
@@ -1458,7 +1555,8 @@ SELECT (SELECT count(*) FROM rec) = 1                     AS recorded,
        ok.spf_pass                                        AS spf_pass,
        ok.dkim_pass                                       AS dkim_pass,
        ok.sender_ok                                       AS sender_ok,
-       CASE WHEN (SELECT count(*) FROM act) = 1 THEN NULL
+       CASE WHEN res.accepted THEN NULL
+            WHEN ok.may_contact THEN 'no CONTACT line could be applied (each line says why)'
             ELSE coalesce(ok.refused_reason,
                           'the code or the draft changed between the read and the write') END
                                                           AS refused_reason,
@@ -1467,8 +1565,9 @@ SELECT (SELECT count(*) FROM rec) = 1                     AS recorded,
        (SELECT variant FROM act)                          AS draft_variant,
        CASE WHEN (SELECT count(*) FROM act) = 1 THEN ok.edited_body END AS edited_body,
        (SELECT outcome FROM used)                         AS outcome,
+       res.contact_results                                AS contact_results,
        ok.payload                                         AS payload
-  FROM ok;"""
+  FROM ok, res;"""
 
 REPLY_QUEUE_SQL = with_iso("""-- Find Replies To Answer -- the Reply Assistant's queue (Section 9, Workflow 7).
 -- READ-ONLY, one row per prospect message that still needs an answer.
@@ -2769,7 +2868,17 @@ REPLY_SYSTEM_PROMPT = "\n".join([
     SENDER_NAME + " has to confirm, or \"\" if nothing).",
 ])
 
-DECIDE_JS = bake("code_decide.js", SENDER_IDENTITY=SENDER_IDENTITY)
+# "Is this a whole cold email?" (2026-10-28), library only, placed above both
+# nodes that judge a cold email's text: Decide Send, and Decide Command for an
+# EDIT on a held email. One definition, so the two cannot disagree.
+COLD_EMAIL_JS = bake_src(above_node_body("code_cold_email.js"), "code_cold_email.js",
+                         SENDER_IDENTITY=SENDER_IDENTITY)
+DECIDE_JS = (
+    "// Decide Send -- generated by n8n/sendtrack/build_workflow.py.\n"
+    "// Part 1, verbatim: n8n/sendtrack/code_cold_email.js above its 'Node body' marker.\n"
+    "// Part 2: n8n/sendtrack/code_decide.js.\n\n"
+    + COLD_EMAIL_JS + "\n" + bake("code_decide.js", SENDER_IDENTITY=SENDER_IDENTITY)
+)
 CHECK_JS = bake("code_check_smtp.js", OWN_DOMAIN=OWN_DOMAIN)
 MIRROR_JS = bake("code_mirror_sent.js", OWN_DOMAIN=OWN_DOMAIN)
 
@@ -2777,16 +2886,25 @@ MIRROR_JS = bake("code_mirror_sent.js", OWN_DOMAIN=OWN_DOMAIN)
 # marker, then Classify Inbound: so one message is read for a command and for a
 # classification by the same two files that the Decide Command node runs, and
 # the command is read FIRST (the node body says why).
-OPERATOR_RULES_JS = bake_src(above_node_body("code_operator_command.js"), "code_operator_command.js",
-                             SIGNATURE=SIGNATURE, MAX_URLS=MAX_URLS)
+OPERATOR_RULES_JS = COLD_EMAIL_JS + "\n" + bake_src(above_node_body("code_operator_command.js"),
+                                                    "code_operator_command.js",
+                                                    SIGNATURE=SIGNATURE, MAX_URLS=MAX_URLS)
 CLASSIFY_JS = (
     "// Classify Inbound -- generated by n8n/sendtrack/build_workflow.py.\n"
-    "// Part 1, verbatim: n8n/sendtrack/code_operator_command.js above its 'Node body' marker --\n"
+    "// Part 1, verbatim: n8n/sendtrack/code_cold_email.js and code_operator_command.js above their\n"
+    "// 'Node body' markers --\n"
     "// the operator-command parser and its authentication gate (Section 9, Workflow 7).\n"
     "// Part 2: n8n/sendtrack/code_classify_reply.js.\n\n"
     + OPERATOR_RULES_JS + "\n" + bake("code_classify_reply.js", OWN_DOMAIN=OWN_DOMAIN)
 )
-COMMAND_JS = bake("code_operator_command.js", SIGNATURE=SIGNATURE, MAX_URLS=MAX_URLS)
+COMMAND_JS = (
+    "// Decide Command -- generated by n8n/sendtrack/build_workflow.py.\n"
+    "// Part 1, verbatim: n8n/sendtrack/code_cold_email.js above its 'Node body' marker.\n"
+    "// Part 2: n8n/sendtrack/code_operator_command.js.\n\n"
+    + COLD_EMAIL_JS + "\n" + bake("code_operator_command.js", SIGNATURE=SIGNATURE, MAX_URLS=MAX_URLS)
+)
+assert "const shape = coldEmailProblem(body);" in DECIDE_JS and "coldEmailProblem(edited)" in COMMAND_JS, (
+    "Decide Send or Decide Command no longer applies code_cold_email.js (draft 350, 2026-10-28)")
 COMMAND_ACK_JS = bake("code_command_ack.js")
 DETECT_SIGNAL_JS = bake("code_detect_signal.js")
 NOTIFY_JS = bake("code_notify.js")

@@ -346,7 +346,7 @@ t.check('the shipped node body wraps the classification as payload', node[0].jso
 // message is not a command; the thread headers now ride along on the payload
 // (migration 017), because a reply draft has to thread to them.
 t.check('... and reads the same message for an operator command -- a prospect reply is not one',
-  node[0].json.command, { is_command: false, command: null, code: null, replacement: null,
+  node[0].json.command, { is_command: false, command: null, code: null, replacement: null, contact_lines: null,
     spf_pass: false, dkim_pass: false, refused_reason: null });
 const threaded = runForEachItem(CLASSIFY, [{ json: inbound('Tell me more.', {},
   { 'in-reply-to': '<seed@amitrixlabs.com>', references: '<seed@amitrixlabs.com>' }) }], {}, classifyNode);

@@ -25,8 +25,9 @@ re-activate it in the editor after importing.
 ## Why this is 3b and not part of Workflow 3
 
 Section 9 puts the Apollo lookup inside Workflow 3 ("**Then** Apollo lookup for
-leads scoring ≥ 50 only" -- ≥ 60 until 2026-10-06, see Section 9's "Decision
-2026-10-06"). It ships as a separate workflow anyway, for one
+leads scoring ≥ 50 only, and for a CRO from ≥ 40" -- ≥ 60 until 2026-10-06, see
+Section 9's "Decision 2026-10-06"; the CRO gate since 2026-10-28, "Decision
+2026-10-28", read into Config as `min_fit_score_cro`). It ships as a separate workflow anyway, for one
 reason: build rule 4 requires every workflow to be queue-driven and idempotent,
 and an inline Apollo stage is neither.
 
@@ -37,8 +38,8 @@ scored before it existed. Reaching them would have meant re-queueing them to
 ClinicalTrials.gov lookup each) to get at a step that costs neither. Every future
 outage, plan change, or threshold change would have the same shape.
 
-As its own queue keyed on `status='scored' AND fit_score >= 50 AND no contacts
-row`, it drains whatever is waiting, whenever it runs.
+As its own queue keyed on `status='scored' AND fit_score >= 50 (>= 40 for a CRO)
+AND no contacts row`, it drains whatever is waiting, whenever it runs.
 
 ## Four ways a lead gets a contact (2026-10-07)
 
