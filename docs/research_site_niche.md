@@ -93,7 +93,68 @@ replacement is "Overture proposes, the shipped verifier decides", measured in §
 
 ## 7. Measurements and decisions
 
-Filled in from the 2026-10-28 run — see the session report.
+Measured on the live database at 2026-10-29 18:21 PKT, after the harvest of 2026-10-28 and an overnight drain that
+a Windows Update restart cut at 07:07 PKT and that was resumed at 15:12 PKT. The decisions were not numbered by the
+session that made them; they are numbered here, and D2 is the one §2 cites.
+
+### 7.1 The funnel **[V]**
+
+| Step | Count |
+|---|---:|
+| ClinicalTrials.gov: RECRUITING, industry-funded studies (15 API requests) | 14,100 |
+| … their locations kept after the screens (institution name 31,436, sponsor placeholder 39,052, not recruiting here 5,853, country 1,132, sponsor or CRO name 416, occupied territory 1 excluded) | 33,765 |
+| Overture places kept (no research word and no ClinicalTrials.gov match 49,305, no name 4,310, website excluded / not matching 4,670, institution 2,551, other 2,603 excluded) | 57,464 |
+| Candidates, one per domain | 6,544 (sites-ctgov 942, sites-overture 5,602) |
+| Shipped Verify Website: the site's own pages name the candidate and its city | 2,919 resolved · 3,534 not confirmed · 91 robots.txt disallows the homepage (never a lead) |
+| New leads | 2,869 (sites-ctgov 681, sites-overture 2,188); the other 50 resolved domains were already leads (28 Trialsites, 22 ICH GCP) and kept their row — `leads.domain` is UNIQUE |
+
+| Source | ingested | enriched | scored | disqualified | drafted | drafted / processed |
+|---|---:|---:|---:|---:|---:|---:|
+| sites-ctgov | 0 | 0 | 269 | 66 | 346 | 51 % |
+| sites-overture | 467 | 20 | 269 | 1,279 | 153 | 9 % |
+
+The 487 Overture leads not yet through enrichment are worked by the scheduled Enrichment (every 30 minutes, 10
+leads), about a day of host uptime **[A]**; the queue is idempotent, so a faster manual drain can be resumed at any
+time. `scored` holds the leads under the floor and those Contact Lookup found no deliverable address for. Fit scores of
+the site leads (latest score): disqualified 1,345 · < 50: 121 · 50–59: 344 · 60–69: 347 · 70+: 225. Top
+disqualifications: "not a CRO, site or SMO" (enrichment read the site as something else) 1,102; enrichment called it
+a CRO 154; enrichment did not classify it 38; a university / cancer or medical centre / hospital name 14; no
+functioning website 13.
+
+Drafts: 499 — 485 auto-approved, 14 held `no-address`; 479 site and 20 SMO; arm A 250, arm B 249. Every one of the
+485 goes to a verified address on the site's own domain (485/485). None had been sent by 18:21 PKT (§7.3 D5, §7.4). Approved by
+country: USA 357, India 38, Canada 18, Germany 12, Australia 11, Mexico 10, Poland 8, United Kingdom 7, South
+Africa 6, Brazil 3.
+
+The CRO lane is unchanged: 615 of 617 leads score identically (the two that differ are the ICH GCP site and SMO,
+§5), and on a scratch copy all 84 sent CRO template emails re-render byte-identical (dry run, 30 checks passed).
+
+### 7.2 Overture as the free replacement for the Trialsites website lookup **[V]**
+
+Of the 111 Trialsites candidates the Anthropic lookup resolved (each confirmed by the shipped verifier), the free
+Overture matcher — same country, same name key, same city — proposes the same website for **14 (13 %)**, a different
+one for 6 and nothing for 91; of the 320 candidates whose lookup call failed it proposes something for 15. It is not a
+replacement for the lookup on Trialsites' records; it is a source in its own right (§7.1).
+
+### 7.3 Decisions
+
+| # | Decision | Status |
+|---|---|---|
+| D1 | Trialsites leads are in no niche until its "free for non-commercial use" licence is settled (§6). | Operator to decide |
+| D2 | ClinicalTrials.gov's robots.txt `Disallow: /api/` is read as aimed at crawlers, not at the documented API v2, which is harvested at one request in flight, ≥ 1.2 s apart, ~15 requests (§2). **[A]** If the operator reads it otherwise, the harvest stops; CTTI's AACT database (a public copy of ClinicalTrials.gov) is the bulk alternative. | **[A]** — operator to confirm |
+| D3 | The Anthropic website lookup was not rewired to Ollama: a local model cannot search the web, and the free matcher finds the same site for 14 of 111 (§7.2). | Made |
+| D4 | Fit floor 50, equal to Contact Lookup's gate (§3). | Made |
+| D5 | Send is unchanged and takes the eligible approved drafts in `ORDER BY d.id`, so an older CRO draft whose recipient is inside their 09:00–17:00 goes before any site draft (45 CRO drafts left at 18:21 PKT); site emails take the ticks no CRO recipient is eligible for (§7.4). Interleaving the niches would change Send. | Operator to decide |
+| D6 | The Overture source is kept despite its yield (9 % of processed leads drafted, against 51 % from ClinicalTrials.gov); most of its disqualifications are places that are not research sites. | Operator to decide whether to keep harvesting it |
+
+### 7.4 Fourteen-day send forecast **[A]**
+
+`python n8n/sendtrack/forecast_sends.py --days 14 --runs 100` at 2026-10-29 13:27Z: 530 approved now (CRO 45,
+research site 485), 77 follow-ups due in the window, no new site drafts assumed, host up 05:40–22:40 UTC. Median per
+day: 16 today (CRO 12, sites 4); 29–30 a day after that (p10–p90 about 25–34); site emails take most of the days
+from 2026-10-31 until the CRO follow-ups come due around 2026-11-07. **14-day median total: 409** (about 124 CRO,
+315 site). A projection, not a measurement: it assumes the host stays up through the window, and it ignores replies,
+bounces and opt-outs. The 2026-10-29 restart took the host down 07:10–14:46 PKT.
 
 ## 8. Master Ref lines this niche makes out of date (not edited, per the brief)
 
