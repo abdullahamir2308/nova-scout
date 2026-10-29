@@ -112,12 +112,21 @@
             }
           ]
         },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "NovaScoutBot/1.0 (+https://github.com/abdullahamir2308/nova-scout)"
+            }
+          ]
+        },
         "options": {
           "timeout": 30000,
           "batching": {
             "batch": {
               "batchSize": 1,
-              "batchInterval": 250
+              "batchInterval": 6000
             }
           }
         }

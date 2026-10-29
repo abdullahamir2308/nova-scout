@@ -27,6 +27,14 @@ import json
 import os
 import re
 
+# ClinicalTrials.gov (operator brief 2026-10-30): one request dispatched every 6 s -- n8n's HTTP batching
+# dispatches on the interval without waiting for the answer (HttpRequestV3), so this is the ceiling:
+# 10 a minute per workflow, 30 if Scoring, Drafting and Drafting - Research Sites all ran at once.
+# Measured before (2026-10-28/29, 250 ms): a 25-request burst in 6 s, 58 requests in the busiest minute.
+CTGOV_INTERVAL_MS = 6000
+CTGOV_USER_AGENT = "NovaScoutBot/1.0 (+https://github.com/abdullahamir2308/nova-scout)"
+assert CTGOV_INTERVAL_MS >= 6000, "ClinicalTrials.gov: keep requests well under 50 a minute"
+
 import template_spec  # this directory; shared with n8n/sendtrack/build_workflow.py
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -557,9 +565,11 @@ nodes = [
                     {"name": "fields", "value": "NCTId,LeadSponsorName,CollaboratorName"},
                 ]
             },
+            "sendHeaders": True,
+            "headerParameters": {"parameters": [{"name": "User-Agent", "value": CTGOV_USER_AGENT}]},
             "options": {
                 "timeout": 30000,
-                "batching": {"batch": {"batchSize": 1, "batchInterval": 250}},
+                "batching": {"batch": {"batchSize": 1, "batchInterval": CTGOV_INTERVAL_MS}},
             },
         },
         "name": "ClinicalTrials.gov Lookup",

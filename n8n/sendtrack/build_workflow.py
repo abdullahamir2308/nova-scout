@@ -800,7 +800,10 @@ cand AS (
      -- it (a replied lead's status, and outreach_log.replied), but "the cold
      -- path cannot see a reply" is the statement worth being able to make.
      AND coalesce(d.variant, '') NOT LIKE 'reply/%'
-   ORDER BY d.id
+   -- The oldest of EACH lane first (operator decision 2026-10-30: the CRO and
+   -- research-site lanes take turns, 1:1), so the limit can never fill with one
+   -- lane and leave Decide nothing of the other to alternate with.
+   ORDER BY row_number() OVER (PARTITION BY coalesce(__NICHE__, 'cro') ORDER BY d.id), d.id
    LIMIT 200
 )
 SELECT __ISO_CLOCK__ AS clock,
@@ -824,10 +827,22 @@ SELECT __ISO_CLOCK__ AS clock,
                                  ORDER BY sp.id), '[]'::json)
           FROM send_pauses sp WHERE sp.cleared_at IS NULL) AS pauses,
        (SELECT send_brake_stats(clk.now, $4::int) FROM clk) AS brake,
-       (SELECT value FROM settings WHERE key = 'operator_email') AS operator_email;"""
+       (SELECT value FROM settings WHERE key = 'operator_email') AS operator_email,
+       -- Whose turn it is: the lane of the last cold send (a claim counts -- it
+       -- may have gone out), NULL before the first one. Replies are not cold.
+       (SELECT coalesce(lead_niche(e.raw_extraction, l.source), 'cro')
+          FROM outreach_log o
+          JOIN drafts dd ON dd.id = o.draft_id
+          JOIN leads l ON l.id = o.lead_id
+          LEFT JOIN enrichments e ON e.lead_id = o.lead_id, clk
+         WHERE o.channel = 'email' AND coalesce(dd.variant, '') NOT LIKE 'reply/%'
+           AND o.sent_at <= clk.now
+         ORDER BY o.sent_at DESC, o.id DESC
+         LIMIT 1) AS last_cold_send_niche;"""
 
 LOAD_STATE_SQL = (
     LOAD_STATE_SQL
+    .replace("__NICHE__", dict((alias, expr) for expr, alias in CANDIDATE_COLUMNS)["niche"])
     .replace("__CANDIDATE_COLUMNS__", ",\n         ".join("%s AS %s" % c for c in CANDIDATE_COLUMNS))
     .replace("__ISO_CLOCK__", iso("SELECT now FROM clk"))
     .replace("__ISO_SYNC__", iso("last_synced_at"))

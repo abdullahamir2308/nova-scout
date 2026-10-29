@@ -1,0 +1,81 @@
+n (1-40 sites-ctgov; 41-80 sites-overture),lead_id,domain,identity,fit,note
+1,5182,applemedresearch.org,yes,yes,Miami research office; address 7270 NW 12th St Miami
+2,4903,eliteclinicalstudies.com,yes,yes,dedicated research facility Phoenix
+3,5295,ndwmc.com,yes,yes,medical centre running trials Houston
+4,4930,rhclinicalresearch.com,yes,yes,research site Katy TX
+5,5386,zi-mannheim.de,yes,no,psychiatric hospital and public research institute
+6,5094,havanaresearchinstitute.com,yes,yes,clinical trials centre Pasadena
+7,5000,nhmr-inc.com,yes,yes,research firm Booth Calloway Rd North Richland Hills
+8,4707,omclinicaltrials.com,yes,yes,research site / SMO Lancaster CA
+9,5114,nobleclinicalresearch.com,yes,yes,research site Tucson
+10,5309,oaklandclinical.com,yes,yes,memory research Oakland
+11,4784,lumiresearch.com,yes,yes,site network Houston
+12,4983,infinitystudy.com,yes,yes,research site Norco CA
+13,5256,healthstep.fi,yes,yes,trial site Kuopio
+14,4858,metabolic.la,yes,yes,research centre Los Angeles
+15,4979,garesearch.org,yes,yes,research centre Tampa
+16,5351,sdsclinicaltrials.com,yes,yes,research site Santa Ana
+17,5028,tropicalclinicaltrials.com,yes,yes,research site Palmetto Bay
+18,5200,cdecbrasil.com.br,yes,partial,research centre inside AFIP diagnostic lab Sao Paulo
+19,4754,austinclinicalresearch.com,yes,yes,research site Austin
+20,5248,globalhealthrcenter.com,yes,yes,site network Miami Lakes
+21,4769,biobehavioralhealth.com,yes,yes,psychiatry research site Toms River
+22,4829,anchormedicalresearch.com,yes,yes,research site Miami
+23,4725,hightowerclinical.com,yes,yes,research site Oklahoma City
+24,5365,themedicimedicalresearch.com,yes,yes,research site Hollywood FL
+25,5022,sternrp.com,yes,yes,research site Huntersville
+26,4890,ashevilleclinicaltrials.com,yes,yes,research site Asheville
+27,5162,unityclinical.com,yes,yes,research site Oklahoma City
+28,4984,irclinicaltrials.com,yes,yes,rheumatology trials Upland
+29,5045,amriresearch.com,yes,yes,research facility Miami
+30,4712,kgkscience.com,yes,no,a nutraceutical CRO (London ON)
+31,4694,encoredocs.com,yes,yes,ENCORE site network runs Jacksonville Center for Clinical Research
+32,4857,longbeachresearch.com,yes,yes,research site Long Beach
+33,4839,dtlaresearch.com,yes,yes,research centre Los Angeles
+34,5316,oscarclinicaltrials.com,yes,yes,research facility Jackson MS
+35,4835,phillyresearch.com,yes,yes,research site Philadelphia
+36,4897,curalta.com,no,partial,parent podiatry group's site; research arm not its subject; info@ is the podiatry inbox
+37,5100,infigoresearch.com,yes,yes,research site Sanford
+38,4775,clinicalresearchassociates.com,yes,yes,independent trial site Nashville
+39,5152,scrallc.com,yes,yes,womens health research Metairie
+40,5003,okclinicalresearch.org,yes,yes,research site Edmond
+41,5656,cife.com.mx,yes,partial,specialist clinic (infectious disease) Guadalajara; research not shown
+42,8156,msmedical.care,yes,no,hospital / diagnostic centre Mumbai
+43,8516,qhakazambokodoresearchclinic.co.za,yes,yes,research clinic Ladysmith
+44,5747,clintexresearch.com,yes,yes,research site Coral Gables
+45,5964,hhrinstitute.org,yes,partial,hospital-affiliated nonprofit research institute Minneapolis
+46,7394,skinhealthinstitute.org.au,yes,partial,dermatology nonprofit with a trials unit Carlton (Melbourne)
+47,5785,dtc-fw.com,yes,yes,practice running trials Fort Worth
+48,5736,clinicalresearchofcalifornia.com,yes,yes,research clinic Walnut Creek
+49,8095,livmedicalcenter.com,yes,yes,independent research site North Miami Beach
+50,6119,clinicacic.com,yes,partial,clinic (IPS) with a research centre Medellin
+51,8409,yogaforfitlife.com,yes,no,yoga and ayurveda wellness centre
+52,8258,mcrc.org.za,yes,yes,trial site Mdantsane
+53,6911,thyroidresearchcentre.com,yes,no,ENT clinic
+54,5571,bombaycityeye.com,yes,no,eye hospital
+55,8420,psfc.in,yes,no,fertility clinic
+56,7991,jeevandhara.institute,yes,no,disability rehabilitation and special education
+57,8487,professionalresearchcenter.com,yes,yes,research site Miami
+58,5972,honorhealth.com,no,no,9-hospital health system's site; recipient foundation@
+59,8306,nugindia.com,yes,no,acupressure training institute
+60,8631,specderm.pl,yes,yes,trial site Bialystok
+61,8593,respliceinstitute.com,yes,no,autism therapy / stool bank
+62,5628,centerstone.org,no,no,mental-health system's site; recipient customer.care@
+63,8455,pbks.com.pl,yes,yes,trial site Wroclaw
+64,6051,investigacionbiomedica.com.mx,yes,yes,research centre Zapopan
+65,7856,iicrm.org,yes,partial,clinical research college that also works as an SMO
+66,8542,rssssirrc.in,yes,no,sensory-integration rehabilitation centre
+67,6000,infinityclinicalstudies.com,yes,yes,research site San Diego
+68,8221,miamibeachclinicalresearch.com,yes,yes,research centre Miami Beach
+69,5388,3sync.com,yes,yes,site network Boca Raton
+70,5447,arsmke.com,yes,yes,research site Milwaukee
+71,5715,cityderma.com,yes,partial,dermatology practice; research not shown
+72,5597,incngen.org.pe,yes,no,unit of the national neurology institute (government)
+73,8266,themumbaiheartclinic.com,yes,no,cardiac clinic
+74,5807,dinamoresearch.net,yes,yes,research site Hialeah
+75,7681,genesisresearchservices.com,yes,yes,independent research site Newcastle
+76,6046,intouchcrc.com,yes,yes,SMO / site Houston
+77,5905,geneticsindia.com,yes,no,genetic counselling clinic and courses
+78,8465,precisiontrials.com,yes,yes,site network Phoenix
+79,5691,cbk.wroc.pl,yes,yes,trial site Wroclaw
+80,8554,rehabbuddycdc.com,yes,no,child development / autism therapy centre

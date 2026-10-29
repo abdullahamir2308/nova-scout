@@ -13,6 +13,9 @@ Contact Lookup, Drafting - Research Sites. The rules on the way in:
   * never an existing lead: ON CONFLICT (domain) DO NOTHING, so a CRO, a
     Trialsites lead or anything else already in `leads` is untouched;
   * never a blocklisted domain;
+  * never a source a niche holds (niches.held_sources, migration 026): the
+    operator stopped the Overture harvest on 2026-10-30 until its precision
+    audit passes, so its rows are counted as `held_source` and not written;
   * no contact of any kind: Contact Lookup reads the site's own published
     address later, the only place an address may come from.
 One statement, one transaction, idempotent: running it twice writes nothing the
@@ -31,6 +34,7 @@ rows AS (
          r
     FROM p, jsonb_array_elements(p.a) r
    WHERE NOT EXISTS (SELECT 1 FROM blocklist b WHERE lower(r->>'domain') = b.domain OR lower(r->>'domain') LIKE '%%.' || b.domain)
+     AND NOT EXISTS (SELECT 1 FROM niches n WHERE r->>'source' = ANY (n.held_sources))
 ),
 ins AS (
   INSERT INTO leads (domain, company_name, country, source, status)
@@ -53,7 +57,9 @@ src AS (
 )
 SELECT json_build_object(
   'offered', (SELECT count(*) FROM p, jsonb_array_elements(p.a)),
-  'not_blocklisted', (SELECT count(*) FROM rows),
+  'held_source', (SELECT count(*) FROM p, jsonb_array_elements(p.a) r
+                    WHERE EXISTS (SELECT 1 FROM niches n WHERE r->>'source' = ANY (n.held_sources))),
+  'not_blocklisted_or_held', (SELECT count(*) FROM rows),
   'new_leads', (SELECT count(*) FROM ins),
   'source_rows', (SELECT count(*) FROM src),
   'by_source', (SELECT coalesce(json_object_agg(source, n), '{}') FROM (SELECT source, count(*) n FROM ins GROUP BY 1) x),

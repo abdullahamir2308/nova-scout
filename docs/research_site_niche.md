@@ -19,7 +19,8 @@ lines in it that this niche makes out of date are listed in §8.
 
 To pause the niche: `UPDATE niches SET auto_approve = false WHERE code = 'research_site';` (every site email then
 waits for a person, held `auto-approve-off`) or `active = false` (nothing drafts it; the trigger refuses its
-auto-approvals).
+auto-approvals). To hold one source only: `niches.held_sources` (migration `026`) — its leads are still drafted and
+every draft is held `db-guard: source … is held`; `sites-overture` is held since 2026-10-30 (§7.5).
 
 ## 2. Sources
 
@@ -27,7 +28,7 @@ See `n8n/sites/open_sources/README.md` for the pipeline. Licences and terms:
 
 | Source | Terms | How it is respected |
 |---|---|---|
-| ClinicalTrials.gov API v2 | U.S. NLM public data; robots.txt `Disallow: /api/` for crawlers, `Crawl-delay: 1` | One documented-API request in flight, ≥ 1.2 s apart, ~15 requests per harvest — the same API Scoring and Drafting already call. **[A]** that robots.txt's `/api/` line is aimed at crawlers, not at the documented API (§7, decision D2). Location contacts are never requested. |
+| ClinicalTrials.gov API v2 | U.S. NLM public data; robots.txt `Disallow: /api/` for crawlers, `Crawl-delay: 1` | One documented-API request in flight, ≥ 6 s apart, ~15 requests per harvest — the same API Scoring and Drafting call, also one request every 6 s since 2026-10-30 (§7.6). **[A]** that robots.txt's `/api/` line is aimed at crawlers, not at the documented API (§7, decision D2). Location contacts are never requested. |
 | Overture Maps places | CDLA Permissive 2.0 (most providers), Apache 2.0 (Foursquare, with NOTICE), CC0 (AllThePlaces) | Commercial use permitted by all three; licences stored per lead; attribution in the README. Its email/phone columns are never used. |
 | Each site's own website | robots.txt | `verify.js` reads robots.txt before every request and never writes a lead whose homepage it disallows. |
 
@@ -141,11 +142,11 @@ replacement for the lookup on Trialsites' records; it is a source in its own rig
 | # | Decision | Status |
 |---|---|---|
 | D1 | Trialsites leads are in no niche until its "free for non-commercial use" licence is settled (§6). | Operator to decide |
-| D2 | ClinicalTrials.gov's robots.txt `Disallow: /api/` is read as aimed at crawlers, not at the documented API v2, which is harvested at one request in flight, ≥ 1.2 s apart, ~15 requests (§2). **[A]** If the operator reads it otherwise, the harvest stops; CTTI's AACT database (a public copy of ClinicalTrials.gov) is the bulk alternative. | **[A]** — operator to confirm |
+| D2 | ClinicalTrials.gov's robots.txt `Disallow: /api/` is read as aimed at crawlers, not at the documented API v2, which is harvested at one request in flight, ≥ 6 s apart, ~15 requests (§2, §7.6). **[A]** If the operator reads it otherwise, the harvest stops; CTTI's AACT database (a public copy of ClinicalTrials.gov) is the bulk alternative. | **[A]** — operator to confirm |
 | D3 | The Anthropic website lookup was not rewired to Ollama: a local model cannot search the web, and the free matcher finds the same site for 14 of 111 (§7.2). | Made |
 | D4 | Fit floor 50, equal to Contact Lookup's gate (§3). | Made |
-| D5 | Send is unchanged and takes the eligible approved drafts in `ORDER BY d.id`, so an older CRO draft whose recipient is inside their 09:00–17:00 goes before any site draft (45 CRO drafts left at 18:21 PKT); site emails take the ticks no CRO recipient is eligible for (§7.4). Interleaving the niches would change Send. | Operator to decide |
-| D6 | The Overture source is kept despite its yield (9 % of processed leads drafted, against 51 % from ClinicalTrials.gov); most of its disqualifications are places that are not research sites. | Operator to decide whether to keep harvesting it |
+| D5 | **Send interleaves the lanes 1:1 (operator, 2026-10-30).** Until then it took the eligible approved drafts in `ORDER BY d.id`, so an older CRO draft at work went before any site draft. Now the CRO lane and the research-site lane take turns: the oldest draft at work in the lane the last cold send was not from, else the oldest at work (Master Ref §9 Workflow 6, "Queue order"). Every other guard and the 10 % brake are unchanged. | Made, live in `send0001` since 2026-10-29 20:04 UTC |
+| D6 | **The Overture harvest is stopped and its drafts are held (operator, 2026-10-30)** until it measures at least 90 % precision (§7.5). `niches.research_site.held_sources = {sites-overture}` (migration `026`): its leads are still enriched, scored, looked up and drafted, and every draft waits in the exceptions queue; `ingest.py` writes no row from a held source. | Hold on; lifting it is the operator's call (§7.5) |
 
 ### 7.4 Fourteen-day send forecast **[A]**
 
@@ -154,12 +155,71 @@ research site 485), 77 follow-ups due in the window, no new site drafts assumed,
 day: 16 today (CRO 12, sites 4); 29–30 a day after that (p10–p90 about 25–34); site emails take most of the days
 from 2026-10-31 until the CRO follow-ups come due around 2026-11-07. **14-day median total: 409** (about 124 CRO,
 315 site). A projection, not a measurement: it assumes the host stays up through the window, and it ignores replies,
-bounces and opt-outs. The 2026-10-29 restart took the host down 07:10–14:46 PKT.
+bounces and opt-outs. The 2026-10-29 restart took the host down 07:10–14:46 PKT. Run before D5 and D6 changed
+the queue (the interleave, and 154 Overture drafts held): re-run it for today's picture.
+
+### 7.5 Precision audit of the two sources (2026-10-30) **[V]**
+
+The question asked: does the lead's domain really belong to that facility? A seeded random sample (`md5(draft id ||
+'precision-audit-2026-10-30')`) of 40 approved ClinicalTrials.gov drafts and 40 Overture drafts (the 154 approved
+when the brief arrived, held since). Each site was fetched again — robots.txt first, `NovaScoutBot/1.0`, the homepage
+and up to three about / contact / location pages — and read and judged by Claude (the 2026-10-30 session), not by the
+verifier that produced the lead; no person has checked the 80 verdicts. **Identity = yes** when the domain is the facility's own site, or that of the research organisation
+that runs it (a site network); **no** when it is a parent health system or practice group whose site is not about the
+research facility. A second question was recorded alongside, because it turned out to matter more: **fit** — is it an
+independent research site or SMO at all? Per-site verdicts: `docs/precision_audit_2026-10-30.csv`.
+
+| Source | Identity precision (95 % Wilson CI) | Fit: research site or SMO | Partial | Not a research site |
+|---|---:|---:|---:|---:|
+| sites-ctgov | **39/40 = 97.5 %** (87.1–99.6 %) | 36/40 = 90 % | 2 | 2 |
+| sites-overture | **38/40 = 95.0 %** (83.5–98.6 %) | 19/40 = 47.5 % (32.9–62.5 %) | 6 | 15 |
+
+- **Identity misses:** ClinicalTrials.gov — `curalta.com` (a podiatry group's site; its trials arm is not its subject;
+  `info@` is the podiatry inbox). Overture — `honorhealth.com` (a nine-hospital system; recipient `foundation@`) and
+  `centerstone.org` (a mental-health system; recipient `customer.care@`).
+- **Overture fit misses** (the domain IS theirs, but they are not research sites): a yoga and ayurveda centre, an
+  acupressure school, two autism / child-development therapy centres, a disability rehabilitation institute, a
+  sensory-integration therapy centre, an eye hospital, an ENT clinic, a cardiac clinic, a fertility clinic, a genetic
+  counselling clinic, a Mumbai hospital, a government neurology institute's unit, and the two health systems above.
+  All passed Enrichment's classification as `site`; the shared word is "Research Centre" in the name.
+- **ClinicalTrials.gov fit misses:** `zi-mannheim.de` (a psychiatric hospital and public research institute) and
+  `kgkscience.com` (a nutraceutical CRO).
+
+**Verdict.** On the question asked, Overture passes the 90 % bar as a point estimate (95 %), though 40 sites cannot
+put its lower bound above 83.5 %. On fit it fails badly: about half of its drafts would go to businesses that are
+not research sites. **The hold is left on** (D6): lifting it would send those emails, and that is not reversible.
+A screen measured on the same 40 sites **[A — in-sample]**: requiring the site's own pages to talk about clinical
+research (English "clinical trial / research study / principal investigator / phase II …", Spanish "ensayo / estudio
+clínico / investigación clínica", Polish "badania kliniczne", German "klinische Studie", Portuguese "pesquisa clínica")
+keeps all 19 real sites, 5 of the 6 partials, and 3 of the 15 non-sites, and drops both identity misses — about 70 %
+fit, 89 % with partials, against 47.5 % today. The word list was written after reading these 40, so it needs a fresh
+sample before it is trusted. Lifting the hold is one statement (migration `026`'s header).
+
+### 7.6 ClinicalTrials.gov — rate, User-Agent, registry contacts (2026-10-30) **[V]**
+
+- **The harvest** (`harvest_ctgov.py`; the 2026-10-28 run was its scratch twin `ctgov_facilities.py`, same fields and
+  pacing): one request in flight. Measured: 15 requests from 12:37:04.5 to 12:38:07.0 UTC — **14.4 a minute**, one
+  every 4.2 s, no retries. Its 1.2 s pause would have allowed 50 a minute had the API answered instantly, so it is
+  now 6 s: at most 10 a minute.
+- **The workflows** (Scoring, Drafting, Drafting - Research Sites): n8n's HTTP batching dispatches on the interval
+  without waiting for the answer, and the interval was 250 ms. Measured from every stored execution of the last 48
+  hours: 1,701 requests; **the busiest 60 seconds held 58** (2026-10-28 21:29 UTC, during the drain), and a 25-lead
+  Scoring run dispatched 25 requests in 6 s (240 a minute while it lasted). Dispatch times are each run's recorded
+  start plus 250 ms per request, the node's own rule — derived, not packet-timed. **Now 6 s** (`CTGOV_INTERVAL_MS`,
+  the builds refuse less): at most 10 a minute per workflow, 30 if all three ran at once. Live since 2026-10-29
+  20:09 UTC.
+- **User-Agent:** the harvest sent `NovaScoutBot/1.0 (+abdullah@amitrixlabs.com)` (scratch) / `NovaScoutBot/1.0
+  (+https://github.com/abdullahamir2308/nova-scout)` (repo). **The three workflows sent none of their own** (n8n's
+  default); they now send the repo one.
+- **No registry contact is used:** the harvest's `fields` names no contact, email or phone (an `assert` guards it);
+  the workflows ask for `NCTId`, sponsor, collaborator and location facility / city / country / status only; every
+  one of the 485 auto-approved site emails goes to a verified address on the site's own domain (§7.1).
 
 ## 8. Master Ref lines this niche makes out of date (not edited, per the brief)
 
 - §1 and §9 Workflow 1b / 4 / 13 "Sites and SMOs are not drafted" / "site and SMO leads wait at `contact_found`".
-- §8: migrations list ends at `024`; `025` and the `niches` / `site_lead_sources` tables are not in the schema block.
+- §8: migrations list ends at `024`; `025` and the `niches` / `site_lead_sources` tables are not in the schema block,
+  nor `026` (`niches.held_sources`, the held-source auto-approval problem).
 - §9 Workflow 5: the trigger's rule "its lead is a CRO" is now "its niche is active and auto-approves, and it signs
   with the niche's identity".
 - §12 "Second ICP": "Outreach (2026-10-19): none yet".

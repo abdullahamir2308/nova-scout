@@ -10,7 +10,8 @@ does not:
     status. Never a location's contact (name, email, phone): those are for
     patients enquiring about a trial, and the operator's rule is that a site's
     address comes only from the site's own website (Workflow 3b).
-  * the documented public API v2, one request in flight, >= 1.2 s apart --
+  * the documented public API v2, one request in flight, >= 6 s apart (at most
+    10 a minute; operator brief 2026-10-30) --
     ClinicalTrials.gov's robots.txt asks crawlers for Crawl-delay: 1. A full
     harvest is ~15 pages of 1,000 studies (measured 2026-10-28: 14,100 studies,
     248,276 locations, 15 requests).
@@ -30,7 +31,7 @@ FIELDS = ("NCTId,LeadSponsorName,LeadSponsorClass,Condition,Phase,"
           "LocationFacility,LocationCity,LocationState,LocationCountry,LocationStatus")
 # The fields above carry no contact: a guard, so nobody "just adds" one.
 assert "Contact" not in FIELDS and "Email" not in FIELDS and "Phone" not in FIELDS
-PACE_S = 1.2
+PACE_S = 6.0  # well under 50 a minute (operator brief 2026-10-30): at most 10 a minute, whatever the answer time
 
 
 def fetch(params):

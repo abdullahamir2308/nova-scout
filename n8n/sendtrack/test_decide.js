@@ -270,6 +270,40 @@ t.check("eligible but outside the recipient's hours -> wait, don't send",
 d = decide(st({ candidates: [cand({ draft_id: 33, country: 'India' }), cand({ draft_id: 35, country: 'Poland' }), cand({ draft_id: 31, country: 'Turkey' })] }), ALWAYS);
 t.check('the oldest draft whose recipient is at work, skipping older ones who are not', d.payload.draft_id, 35);
 
+// --- the lanes take turns, 1:1 (operator decision 2026-10-30) -----------------
+const SITE_BODY = BODY.replace(IDENTITY, SITE_IDENTITY);
+const cro = (id, over) => cand(Object.assign({ draft_id: id, niche: 'cro' }, over));
+const site = (id, over) => cand(Object.assign({ draft_id: id, niche: 'research_site', body: SITE_BODY }, over));
+const pick = (last, cands) => decide(st({ last_cold_send_niche: last, candidates: cands }), ALWAYS).payload.draft_id;
+t.check('last cold send was a CRO -> the oldest site draft at work goes, not the older CRO one',
+  pick('cro', [cro(31), cro(33), site(35), site(37)]), 35);
+t.check('last cold send was a site -> the oldest CRO draft at work goes',
+  pick('research_site', [cro(31), cro(33), site(35), site(37)]), 31);
+t.check("... the other lane's oldest, even when it is newer than this lane's",
+  pick('research_site', [site(31), site(33), cro(40)]), 40);
+t.check('no cold send yet -> the oldest draft at work, as before', pick(null, [site(35), cro(31)]), 31);
+t.check("the other lane has no recipient at work -> this lane's oldest goes (no lane holds up the other)",
+  pick('cro', [cro(31), site(35, { country: 'India' })]), 31);
+t.check('the other lane has nothing eligible -> this lane\'s oldest goes',
+  pick('cro', [cro(31), site(35, { verified: false })]), 31);
+t.check('a lead in no niche (a Trialsites lead) is in the CRO lane',
+  [pick('cro', [cand({ draft_id: 31, niche: null }), site(35)]), pick('research_site', [cand({ draft_id: 31, niche: null }), site(35)])],
+  [35, 31]);
+d = decide(st({ last_cold_send_niche: 'cro', candidates: [cro(31), site(35)] }), ALWAYS);
+t.check('each eligible draft names its lane in the execution', d.eligible.map((e) => e.lane), ['cro', 'research_site']);
+// Ten sends in a row from a full queue, each tick handed the lane it just sent.
+const queue = [cro(31), cro(32), cro(33), cro(34), cro(35), site(41), site(42), site(43), site(44), site(45)];
+let last = null; const order = [];
+for (let i = 0; i < 10; i++) {
+  const sent = decide(st({ last_cold_send_niche: last, candidates: queue.filter((c) => order.indexOf(c.draft_id) === -1) }), ALWAYS).payload.draft_id;
+  order.push(sent);
+  last = queue.filter((c) => c.draft_id === sent)[0].niche;
+}
+t.check('ten sends from a full queue alternate CRO, site, CRO, site ... each lane oldest first',
+  order, [31, 41, 32, 42, 33, 43, 34, 44, 35, 45]);
+d = decide(st({ last_cold_send_niche: 'cro', candidates: [cro(31), site(35)], pauses: [{ id: 1, reason: 'bounce-rate', detail: 'x', tripped_at: CLOCK }] }), ALWAYS);
+t.check('the brake still stops the tick before any turn is taken', [d.send, d.reason], [false, 'send-paused']);
+
 // --- one message per tick ----------------------------------------------------
 d = decide(st({ candidates: [cand({ draft_id: 37 }), cand({ draft_id: 31 }), cand({ draft_id: 35 })] }), ALWAYS);
 t.check('three sendable drafts -> exactly one payload, the oldest',

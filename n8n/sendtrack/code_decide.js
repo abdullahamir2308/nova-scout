@@ -270,6 +270,14 @@ function identityFor(c) {
   return Object.prototype.hasOwnProperty.call(NICHE_IDENTITIES, n) ? NICHE_IDENTITIES[n] : SENDER_IDENTITY;
 }
 
+// The send queue's lanes (operator decision 2026-10-30): a niche's drafts are
+// one lane, and a lead in no niche (a Trialsites lead) is on the CRO path, so it
+// is in the CRO lane. Load Send State names the last cold send's lane the same
+// way (coalesce(niche, 'cro')).
+function laneOf(niche) {
+  return str(niche) || 'cro';
+}
+
 // coldEmailProblem() (code_cold_email.js, shared with Decide Command) finds the
 // message by the sender's identity lines. A niche body is judged on the same
 // text with its own identity lines in that place -- the shape rule is the one
@@ -499,6 +507,7 @@ function decide(state, rng) {
       lead_id: c.lead_id,
       domain: c.domain,
       country: c.country,
+      lane: laneOf(c.niche),
       local_time: lc.local,
       in_window: lc.in_window,
     });
@@ -582,8 +591,13 @@ function decide(state, rng) {
     return stop('random-gate', 'Skipped this tick at random (p=' + probability + ') to keep intervals irregular.');
   }
 
-  // 5. Oldest approved draft first -- Section 7's queue rule.
-  const pick = now[0];
+  // 5. Oldest approved draft first -- Section 7's queue rule -- with the lanes
+  //    taking turns, 1:1 (operator decision 2026-10-30): the oldest draft at
+  //    work in a lane other than the last cold send's; when no other lane has
+  //    one, the oldest at work, so a lane out of hours never holds up the other.
+  const lastLane = str(state.last_cold_send_niche);
+  const turn = lastLane ? now.filter(function (e) { return e.lane !== lastLane; }) : [];
+  const pick = turn.length ? turn[0] : now[0];
   const c = candidates.filter(function (x) { return x.draft_id === pick.draft_id; })[0];
   out.send = true;
   out.reason = 'send';
