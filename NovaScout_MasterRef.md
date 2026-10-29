@@ -101,10 +101,12 @@ There is no 14B in the current Qwen generation (sizes: 0.8B / 2B / 4B / 9B / 27B
 **Ollama upgrades — never half-applied (2026-10-24).** The app's own updater downloads to `%LOCALAPPDATA%\Ollama\updates_v2` and runs the installer `/SILENT`; when `ollama.exe` is running elevated the installer cannot close it (RestartManager: Permission Denied), asks Abort/Retry/Ignore, and Ignore leaves a new `lib\ollama\` under the old executables — every model load then fails with `invalid argument: --no-mmap`. That happened on 2026-10-24 (0.30.10 executables over a 0.40.10 `lib`), and a silent re-run with Ollama up aborted and its rollback emptied `lib\` entirely. Since then: **auto-update is off** (`settings.auto_update_enabled = 0` in `%LOCALAPPDATA%\Ollama\db.sqlite`, the app's own setting), Ollama starts from the Startup-folder shortcut, which does not run as administrator — **never start it elevated**. To upgrade: quit Ollama (tray → Quit) and check `Get-Process ollama*` is empty; download the release's `OllamaSetup.exe` and check `Get-AuthenticodeSignature` is Valid, Ollama Inc.; run it; then `ollama --version` must equal the registry `DisplayVersion` (HKCU Uninstall `{44E83376-…}_is1`) and `/api/version`, and `ollama ps` must show one `qwen3.5:9b` row, `100% GPU`, context 16384 after an Enrichment run. Model weights under `~\.ollama\models` are not touched by an install.
 
 ```
-OLLAMA_KEEP_ALIVE=-1        # never unload the model
+OLLAMA_KEEP_ALIVE=5m        # unload after 5 idle minutes (operator decision 2026-10-30; was -1, never)
+OLLAMA_MAX_LOADED_MODELS=1  # one model copy at most (2026-10-30)
 OLLAMA_NUM_PARALLEL=1       # serial processing, avoid VRAM contention
 OLLAMA_HOST=0.0.0.0:11434   # reachable from Docker containers
 ```
+These are **user** environment variables (HKCU), not system ones. Every n8n call to Ollama (Enrichment's *Ollama Extract*, Scoring's *Ollama Rationale*) also sends `keep_alive: '5m'` with the same model tag and `num_ctx` (`OLLAMA_MODEL` / `OLLAMA_NUM_CTX` / `OLLAMA_KEEP_ALIVE` in both builds; `n8n/scoring/test_ollama_calls.py` refuses a pair that differ), because a request's `keep_alive` overrides the server's and a different tag or `num_ctx` loads another copy.
 
 **Structured output:** always use Ollama's `format: json` with an explicit schema for extraction and scoring nodes. Never parse free text. Run `ollama ps` after loading and confirm 100% GPU, not a CPU/GPU split.
 

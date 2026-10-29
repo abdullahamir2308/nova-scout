@@ -290,7 +290,7 @@
         "url": "http://host.docker.internal:11434/api/generate",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({\n  model: 'qwen3.5:9b',\n  system: $json.system_prompt,\n  prompt: $json.prompt,\n  stream: false,\n  think: false,\n  format: {\n    \"type\": \"object\",\n    \"properties\": {\n      \"rationale\": {\n        \"type\": \"string\"\n      }\n    },\n    \"required\": [\n      \"rationale\"\n    ]\n  },\n  options: { temperature: 0.2, presence_penalty: 0, num_ctx: 16384, num_predict: 400 }\n}) }}",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'qwen3.5:9b',\n  keep_alive: '5m',\n  system: $json.system_prompt,\n  prompt: $json.prompt,\n  stream: false,\n  think: false,\n  format: {\n    \"type\": \"object\",\n    \"properties\": {\n      \"rationale\": {\n        \"type\": \"string\"\n      }\n    },\n    \"required\": [\n      \"rationale\"\n    ]\n  },\n  options: { temperature: 0.2, presence_penalty: 0, num_ctx: 16384, num_predict: 400 }\n}) }}",
         "options": {
           "timeout": 300000,
           "batching": {

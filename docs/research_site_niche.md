@@ -195,6 +195,15 @@ keeps all 19 real sites, 5 of the 6 partials, and 3 of the 15 non-sites, and dro
 fit, 89 % with partials, against 47.5 % today. The word list was written after reading these 40, so it needs a fresh
 sample before it is trusted. Lifting the hold is one statement (migration `026`'s header).
 
+**Operator decisions, 2026-10-30 (later).** The Overture hold stays as it is, and the clinical-research screen
+is **not** built (those sites belong to later niches). Four drafts are held by hand, migration `027`
+(`operator hold 2026-10-30: …`, status `pending`): `zi-mannheim.de` (draft 758) and `kgkscience.com` (480, kept for a
+later CRO review), both approved until then, and `honorhealth.com` (858) and `centerstone.org` (791), already held
+by `026` — their reason no longer starts `db-guard: source sites-overture is held`, so `026`'s lift recipe leaves
+them held. Applied on 2026-10-29 (UTC), before 21:58: every other draft's status, approval, hold reason and text unchanged
+(compared row by row in the same session); approved queue 373 → 371. `curalta.com` (773, the ClinicalTrials.gov
+identity miss) was not in the brief and is still approved.
+
 ### 7.6 ClinicalTrials.gov — rate, User-Agent, registry contacts (2026-10-30) **[V]**
 
 - **The harvest** (`harvest_ctgov.py`; the 2026-10-28 run was its scratch twin `ctgov_facilities.py`, same fields and
@@ -219,7 +228,7 @@ sample before it is trusted. Lifting the hold is one statement (migration `026`'
 
 - §1 and §9 Workflow 1b / 4 / 13 "Sites and SMOs are not drafted" / "site and SMO leads wait at `contact_found`".
 - §8: migrations list ends at `024`; `025` and the `niches` / `site_lead_sources` tables are not in the schema block,
-  nor `026` (`niches.held_sources`, the held-source auto-approval problem).
+  nor `026` (`niches.held_sources`, the held-source auto-approval problem), nor `027` (four operator holds, data only).
 - §9 Workflow 5: the trigger's rule "its lead is a CRO" is now "its niche is active and auto-approves, and it signs
   with the niche's identity".
 - §12 "Second ICP": "Outreach (2026-10-19): none yet".

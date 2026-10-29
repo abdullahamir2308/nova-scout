@@ -362,15 +362,27 @@ RATIONALE_SCHEMA = {
 # its own line so `}}` never occurs.
 _schema_js = json.dumps(RATIONALE_SCHEMA, indent=2).replace("\n", "\n  ")
 
+# One model, one context size and one keep-alive for every Ollama call in the
+# pipeline (Enrichment and Scoring): a call that differs in model tag or num_ctx
+# makes Ollama load a second copy or reload the runner. keep_alive 5m (operator
+# decision 2026-10-30): the model unloads after 5 idle minutes instead of holding
+# its VRAM and host commit forever. A request's keep_alive overrides the server's
+# OLLAMA_KEEP_ALIVE. n8n/scoring/test_ollama_calls.py checks both shipped
+# workflows agree.
+OLLAMA_MODEL = "qwen3.5:9b"
+OLLAMA_NUM_CTX = 16384
+OLLAMA_KEEP_ALIVE = "5m"
+
 OLLAMA_BODY = (
     "={{ JSON.stringify({\n"
-    "  model: 'qwen3.5:9b',\n"
+    "  model: '" + OLLAMA_MODEL + "',\n"
+    "  keep_alive: '" + OLLAMA_KEEP_ALIVE + "',\n"
     "  system: $json.system_prompt,\n"
     "  prompt: $json.prompt,\n"
     "  stream: false,\n"
     "  think: false,\n"
     "  format: " + _schema_js + ",\n"
-    "  options: { temperature: 0.2, presence_penalty: 0, num_ctx: 16384, num_predict: 400 }\n"
+    "  options: { temperature: 0.2, presence_penalty: 0, num_ctx: " + str(OLLAMA_NUM_CTX) + ", num_predict: 400 }\n"
     "}) }}"
 )
 
