@@ -1839,10 +1839,12 @@ REMINDER_DUE_SQL = with_iso("""-- Find Due Reminders -- Section 9, Workflow 7: "
 -- operator could do with it, and the next digest or the next reply mints a
 -- fresh one.
 --
--- BOTH KINDS, because both are the operator holding the same kind of decision:
--- a `reply` drafted for a prospect who wrote to us, and an `email-hold` -- a
--- first touch or follow-up the claim check held after its repairs, which the
--- digest listed with a code of its own.
+-- REPLIES ONLY since 2026-10-30 (migration 028). Until then an `email-hold` code
+-- -- a held first touch or follow-up the digest listed -- was reminded about
+-- too, every 4 hours each: on 2026-10-30 that was 20+ "still waiting" emails in
+-- two minutes about Overture source holds and drafts with no address, none of
+-- them a decision about the words. A held email is now the Daily Digest's
+-- alone: counted by reason, and coded only when its hold needs a person.
 --
 -- The draft must still be pending: one rejected or approved in the NocoDB grid
 -- needs no nudge, even if its code is technically still open.
@@ -1872,7 +1874,8 @@ SELECT a.code                                 AS code,
   JOIN leads l  ON l.id = a.lead_id
   LEFT JOIN inbound_messages i ON i.message_id = a.inbound_message_id
   CROSS JOIN clk
- WHERE a.used_at IS NULL
+ WHERE a.kind = 'reply'
+   AND a.used_at IS NULL
    AND a.expires_at > clk.now
    AND d.status = 'pending'
    AND (a.reminded_at IS NULL OR a.reminded_at <= clk.now - make_interval(hours => $2::int))
@@ -2366,7 +2369,7 @@ SELECT up.healthy                AS healthy,
 DIGEST_LOAD_SQL = with_iso("""-- Load Digest: everything the operator's daily digest says, in one snapshot
 -- (migration 014). Read-only.
 --
--- $1 now_override ('' in the shipped workflow), $2 digest_hour
+-- $1 now_override ('' in the shipped workflow), $2 digest_hour, $3 held_cap
 --
 -- NOT QUITE READ-ONLY SINCE 2026-10-09, and this is the one thing to know about
 -- it: when a digest is actually due, every pending EMAIL draft it is about to
@@ -2384,6 +2387,16 @@ DIGEST_LOAD_SQL = with_iso("""-- Load Digest: everything the operator's daily di
 -- A low-context note and a no-send-clock note get no code: neither can ever be
 -- sent (Workflow 5), so approving one would mean nothing. A LinkedIn DM gets
 -- none either -- Section 6, a person sends those by hand.
+--
+-- ONLY A HOLD A PERSON CAN DECIDE GETS A CODE (migration 028, 2026-10-30): the
+-- hold's class (hold_reason_class) must be allowlisted in hold_reason_classes
+-- (hold_needs_person). A source hold, a missing address, an operator hold and
+-- any class never seen before are counted, not coded -- an APPROVE on a source
+-- hold would release what the hold exists to stop. At most $3 (held_cap) codes
+-- per digest, oldest first; the rest are "+N more" and wait for the next one.
+-- On the tick that sends, every open email-hold code whose draft no longer
+-- needs a person is withdrawn (reply_approval_withdraw_holds). Each row says
+-- whether its class is known, so the digest can flag a new hold type.
 --
 -- The window starts where the last digest that went out stopped (digest_log),
 -- so a day the host was off is folded into the next digest instead of lost;
@@ -2430,18 +2443,35 @@ SELECT win.day::text                                                     AS dige
              AND o.sent_at >= win.from_ts AND o.sent_at < win.to_ts) x)
                                                                          AS sent,
        (SELECT coalesce(json_agg(x ORDER BY x.created_at, x.draft_id), '[]'::json) FROM (
-          SELECT d.id AS draft_id, d.lead_id, l.company_name, l.domain, d.channel, d.variant, d.hold_reason,
-                 ISO(d.created_at) AS created_at, d.created_at >= win.from_ts AS new,
+          SELECT h.draft_id, h.lead_id, l.company_name, l.domain, h.channel, h.variant, h.hold_reason,
+                 h.hold_class, h.class_known, h.needs_person,
+                 ISO(h.created_at) AS created_at, h.created_at >= win.from_ts AS new,
                  lead_niche((SELECT e.raw_extraction FROM enrichments e WHERE e.lead_id = l.id), l.source) AS niche,
-                 CASE WHEN d.channel = 'email'
+                 CASE WHEN h.needs_person
+                       AND h.person_rank <= $3::int
                        AND NOT EXISTS (SELECT 1 FROM digest_log g WHERE g.digest_day = win.day)
                        AND win.hour >= $2::int
-                       AND coalesce(d.variant, '') NOT LIKE 'low-context%'
-                       AND coalesce(d.variant, '') NOT LIKE 'no-send-clock%'
-                      THEN reply_approval_issue('email-hold', d.id, d.lead_id) END AS code
-            FROM drafts d JOIN leads l ON l.id = d.lead_id
-           WHERE d.status = 'pending') x)
+                      THEN reply_approval_issue('email-hold', h.draft_id, h.lead_id) END AS code
+            FROM (SELECT k.*,
+                         row_number() OVER (PARTITION BY k.needs_person ORDER BY k.created_at, k.draft_id) AS person_rank
+                    FROM (SELECT d.id AS draft_id, d.lead_id, d.channel, d.variant, d.hold_reason, d.created_at,
+                                 hold_reason_class(d.hold_reason) AS hold_class,
+                                 EXISTS (SELECT 1 FROM hold_reason_classes c
+                                          WHERE c.class = hold_reason_class(d.hold_reason)) AS class_known,
+                                 (d.channel = 'email'
+                                  AND coalesce(d.variant, '') NOT LIKE 'low-context%'
+                                  AND coalesce(d.variant, '') NOT LIKE 'no-send-clock%'
+                                  AND hold_needs_person(d.hold_reason)) AS needs_person
+                            FROM drafts d
+                           WHERE d.status = 'pending') k) h
+            JOIN leads l ON l.id = h.lead_id) x)
                                                                          AS held,
+       -- Migration 028: on the tick that sends, the codes nobody should be asked
+       -- about go (an Overture source hold, a no-address draft, ...).
+       CASE WHEN NOT EXISTS (SELECT 1 FROM digest_log g WHERE g.digest_day = win.day)
+             AND win.hour >= $2::int
+            THEN reply_approval_withdraw_holds() ELSE 0 END             AS codes_withdrawn,
+       $3::int                                                           AS held_cap,
        -- Every template email sent so far, by niche and A/B arm (migration 025;
        -- the arm is in the variant: template/<A|B>/... or follow-up-N/template/<A|B>):
        -- what the operator reads the A/B test off.
@@ -2495,10 +2525,25 @@ told AS (
      AND jsonb_typeof(p.r->'accepted') = 'array'
      AND jsonb_array_length(p.r->'accepted') > 0
   RETURNING a.code
+),
+-- Migration 028: a hold class this digest flagged as never seen before is seen
+-- now -- recorded only once the operator was actually told, and never
+-- allowlisted here (the column's default, false: a new hold type is silent
+-- until a person allowlists it).
+seen AS (
+  INSERT INTO hold_reason_classes (class, note)
+  SELECT c, 'first flagged by the Daily Digest of ' || (p.d->>'digest_day')
+    FROM p, jsonb_array_elements_text(coalesce(p.d->'new_classes', '[]'::jsonb)) AS c
+   WHERE p.r->>'error' IS NULL
+     AND jsonb_typeof(p.r->'accepted') = 'array'
+     AND jsonb_array_length(p.r->'accepted') > 0
+  ON CONFLICT (class) DO NOTHING
+  RETURNING class
 )
 SELECT p.d->>'digest_day'             AS digest_day,
        (SELECT count(*) FROM ins)::int AS recorded,
        (SELECT count(*) FROM told)::int AS codes_told,
+       (SELECT count(*) FROM seen)::int AS classes_seen,
        p.r->>'error'                  AS error
   FROM p;"""
 
@@ -2813,6 +2858,20 @@ assert "INSERT INTO reply_approvals" not in REPLY_WRITE_SQL + DIGEST_LOAD_SQL, (
 assert "reply_approval_issue('email-hold'" in DIGEST_LOAD_SQL, (
     "the Daily Digest no longer issues a code for the email drafts it lists as held (Section 9, "
     "Workflow 7) -- the operator could not approve one by replying to the digest")
+# Migration 028 (2026-10-30): a code only for a hold a person can decide, at most
+# held_cap of them, and the rest withdrawn -- or the operator is flooded again.
+_issue_case = re.search(r"CASE WHEN (.*?)THEN reply_approval_issue\('email-hold'", DIGEST_LOAD_SQL, re.S)
+assert _issue_case and "h.needs_person" in _issue_case.group(1) and "$3::int" in _issue_case.group(1), (
+    "Load Digest issues an email-hold code without requiring hold_needs_person and the held_cap -- every "
+    "held email would get a code again (the 2026-10-30 flood, migration 028)")
+assert "hold_needs_person(d.hold_reason)" in DIGEST_LOAD_SQL and "reply_approval_withdraw_holds()" in DIGEST_LOAD_SQL, (
+    "Load Digest no longer decides needs_person by migration 028's allowlist, or no longer withdraws the "
+    "codes nobody should be asked about")
+assert re.search(r"WHERE a\.kind = 'reply'\s+AND a\.used_at IS NULL", REMINDER_DUE_SQL), (
+    "Find Due Reminders reminds about something other than a prospect reply -- a held cold email is the "
+    "Daily Digest's alone since 2026-10-30 (migration 028)")
+assert "INSERT INTO hold_reason_classes" in DIGEST_RECORD_SQL and "needs_person" not in DIGEST_RECORD_SQL, (
+    "Record Digest must record a newly flagged hold class as seen, and must never allowlist it")
 
 # Workflow 7, Send Reply: a separate lane, so the cold path is untouched. The
 # two must never be able to see each other's drafts.
@@ -3674,7 +3733,9 @@ health_connections = {
 # The first tick at or after this hour on the operator's clock: before any
 # recipient's business hours open (India, the earliest, opens 08:30 PKT), so
 # the operator can reject an overnight auto-approval before it goes out.
-DIGEST_CONFIG = {"now_override": "", "digest_hour": 8}
+# held_cap: at most this many held emails listed one by one with a code
+# (migration 028); the rest are counted, "+N more".
+DIGEST_CONFIG = {"now_override": "", "digest_hour": 8, "held_cap": 15}
 DIGEST_TRIGGER = "Every 30 Minutes"
 
 digest_nodes = [
@@ -3689,19 +3750,23 @@ digest_nodes = [
         "parameters": {"assignments": {"assignments": [
             {"id": "nowoverride", "name": "now_override", "value": DIGEST_CONFIG["now_override"], "type": "string"},
             {"id": "hour", "name": "digest_hour", "value": DIGEST_CONFIG["digest_hour"], "type": "number"},
+            {"id": "heldcap", "name": "held_cap", "value": DIGEST_CONFIG["held_cap"], "type": "number"},
         ]}, "options": {}},
         "name": "Config", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [-880, 130],
-        "notes": ("digest_hour: the operator's hour (%s) from which today's digest is due. now_override must stay "
-                  "empty (dry-run only)." % SENDER_ZONE),
+        "notes": ("digest_hour: the operator's hour (%s) from which today's digest is due. held_cap: at most this "
+                  "many held emails listed with a code. now_override must stay empty (dry-run only)." % SENDER_ZONE),
     },
-    pg_node("Load Digest", DIGEST_LOAD_SQL, "={{ [$json.now_override, $json.digest_hour] }}", [-660, 130],
+    pg_node("Load Digest", DIGEST_LOAD_SQL, "={{ [$json.now_override, $json.digest_hour, $json.held_cap] }}",
+            [-660, 130],
             "One snapshot: drafts auto-approved and emails sent since the last digest, and every pending draft "
-            "with its hold_reason -- the exceptions queue. Plus the operator's address and the flag. On the tick "
-            "that actually sends (hence digest_hour here too), each held EMAIL draft also gets a one-time "
-            "approval code, so the operator can approve, reject or edit it by replying (Workflow 7)."),
+            "with its hold_reason and its class -- the exceptions queue. Plus the operator's address and the flag. "
+            "On the tick that actually sends (hence digest_hour here too), a held EMAIL whose hold a person can "
+            "decide (hold_needs_person, migration 028) gets a one-time approval code, at most held_cap of them, "
+            "and every other open email-hold code is withdrawn (Workflow 7)."),
     code_node("Build Digest", DIGEST_JS, "runOnceForAllItems", [-440, 130],
               "Due once per operator day from digest_hour, if the settings table holds an operator address. The "
-              "plain-text digest: AUTO-APPROVED, SENT, HELD FOR A PERSON (with reasons)."),
+              "plain-text digest: AUTO-APPROVED, SENT, HELD (counts per reason; one line and a code only for a "
+              "hold a person can decide; a line for any hold reason never seen before)."),
     if_node("Send Digest?", "send", "={{ $json.send }}", [-220, 130],
             "False ends the tick; Build Digest's `reason` says why (already sent today, before the hour, no address)."),
     email_node("Send Digest", "={{ $json.notify_to }}", "={{ $json.subject }}", "={{ $json.text }}", [0, 40],

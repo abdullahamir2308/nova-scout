@@ -320,8 +320,18 @@ gets one email a day saying what happened (`code_digest.js`, migration 014's
   last digest, and what became of it. Each goes out in its recipient's
   business hours; rejecting it in the review queue stops it.
 - **SENT** -- every email SMTP accepted, and who approved it (`auto`/`human`).
-- **HELD FOR A PERSON** -- every pending draft, new ones marked, each with its
-  `hold_reason`: the exceptions queue.
+- **HELD** -- the exceptions queue, counted per hold class (`hold_reason_class()`,
+  migration 028), with a `[NEW]` line for a class never seen before. Only a held
+  email whose class is allowlisted (`hold_reason_classes.needs_person`:
+  `auto-approve-off`, `claim-check`) is listed one by one with an
+  `APPROVE / REJECT / EDIT <code>` line, at most `held_cap` (15), then "+N more".
+  A source hold, a missing address, an operator hold and every new class are
+  counted, never coded, and never reminded about (the reminder lane is for
+  prospect replies only). To make a class ask for a person:
+  `UPDATE hold_reason_classes SET needs_person = true WHERE class = '...';`.
+  `dryrun/hold_notice_preview.py` prints what the next reminder tick and digest
+  would send for the live held set (rolled back); `test_hold_notice_sql.py`
+  proves the path on a scratch schema.
 
 It runs every 30 minutes and sends at the first tick at or after 08:00 on the
 operator's clock (before India, the earliest recipient, opens at 08:30 PKT),

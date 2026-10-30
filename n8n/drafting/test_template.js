@@ -183,6 +183,22 @@ t.check('areas: case-insensitive against the locked taxonomy; free text and Othe
   F.canonicalAreas(['pharma', 'medtech', 'cardiology', 'other', 'INFECTIOUS DISEASE', 'rare diseases']),
   ['infectious disease', 'rare diseases']);
 t.check('areas: one area alone', F.canonicalAreas(['Dermatology']), ['dermatology']);
+// 2026-10-30: an areas fact only from a list a site could have written -- at
+// most six specific areas ('Other' and free text not counted). HIDRA (16),
+// Clinademi (9) and Apex (8) all came out "oncology and cardiovascular".
+const TAXONOMY_17 = ['Oncology', 'Cardiovascular', 'Central Nervous System', 'Immunology', 'Infectious Disease',
+  'Endocrinology', 'Metabolic Disorders', 'Respiratory', 'Rare Diseases', 'Internal Medicine', 'Anesthesiology',
+  'Dermatology', 'Rheumatology', 'Ophthalmology', 'Gastroenterology', 'Nephrology', 'Hematology'];
+t.check('areas: six specific areas still give a fact; Other and free text do not count toward the six',
+  F.canonicalAreas(TAXONOMY_17.slice(0, 6).concat(['Other', 'pharma'])), ['oncology', 'cardiovascular']);
+t.check('areas: seven specific areas give no fact', F.canonicalAreas(TAXONOMY_17.slice(0, 7)), []);
+t.check('areas: the whole taxonomy (the extraction reciting it) gives no fact',
+  F.canonicalAreas(TAXONOMY_17.concat(['Other'])), []);
+t.check('areas: a duplicate is one area, not two toward the six',
+  F.canonicalAreas(['Dermatology', 'dermatology', 'DERMATOLOGY', 'Oncology', 'Hematology', 'Nephrology', 'Respiratory',
+    'Immunology']), ['oncology', 'immunology']);
+t.check('areas: an implausible list falls through to the city',
+  F.pickSmykm({ trials: 0, areas: F.canonicalAreas(TAXONOMY_17), city: 'Madrid' }), 'city');
 t.check('areas joined with "and"', F.fill('{areas}', { areas: 'oncology and hematology' }), 'oncology and hematology');
 t.check('phases: a full run is a range', F.formatPhases(['Phase I', 'Phase II', 'Phase III']), 'Phase I to III');
 t.check('phases: I to IV', F.formatPhases(['Phase IV', 'Phase I', 'Phase III', 'Phase II', 'Bioequivalence']), 'Phase I to IV');

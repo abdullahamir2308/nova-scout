@@ -224,11 +224,64 @@ identity miss) was not in the brief and is still approved.
   the workflows ask for `NCTId`, sponsor, collaborator and location facility / city / country / status only; every
   one of the 485 auto-approved site emails goes to a verified address on the site's own domain (§7.1).
 
+### 7.7 Held-email notifications, the area-list holds, and the human APPROVE (2026-10-30, evening)
+
+**Notifications (migration `028`) [V].** 21:00–21:02 PKT the operator got 20+ "[Nova Scout] still waiting" emails:
+166 email-hold codes were open (153 Overture source holds, 9 no-address, 4 operator holds — none a decision about
+the words), and the reminder lane sent 20 per 30-minute tick. Contained at 21:41 PKT (16:41 UTC): all 166 expired and
+reaped, 167 rows deleted (one had already expired); the 17:00 UTC reminder tick found 0. Since then the Daily
+Digest counts holds by class and codes only allowlisted ones, and the reminder lane is replies-only — Master Ref §9
+Workflow 6 "Daily Digest" and Workflow 7.
+
+**Area-list holds (migration `029`) [V].** Applied with `postgres/apply_drafts_migration.py` (snapshot of every
+draft and lead, one transaction, committed only if exactly the expected drafts changed and only in status /
+hold_reason / approved_by / approved_at; a re-run changed 0). 55 drafts: curalta.com (773) and the four approved
+site drafts whose areas fact came from the full list (466 diex.ca, 526 ezytrials.com, 768 apexresearchgroup.net, 771
+titanclinicalresearch.com), approved → pending; and the 50 Overture drafts held by `026` whose areas fact came from
+more than six specific areas, re-reasoned so `026`'s lift recipe cannot release them (111 Overture drafts remain
+under the plain source hold). Approved email drafts after it: 361 **[V]** (five fewer than before it; sends
+since 2026-10-29 account for the rest of the drop from 371).
+
+**The threshold: six specific areas** (`MAX_LISTED_AREAS`, `Other` not counted; a longer list gives no areas fact
+and the SMYKM line falls to city, then the company). Measured on every enrichment on 2026-10-30 **[V]**: counts fall
+smoothly from 1 to 16 areas and jump at 17 (116 leads, the whole taxonomy); the share of lists naming the taxonomy's
+first four areas together is 0–3 % for 1–5 areas, 9 % at 6, 22 % at 7, 35 % at 8 and 9, then up to 100 % at 17.
+Because the template names the first two in taxonomy order, a long list always reads "oncology and cardiovascular"
+whatever the site does — HIDRA (16), Clinademi (9), Apex (8). Six is a judgment **[A]**: the knee is gradual, and
+the cost of a dropped fact (a city sentence, always true) is much smaller than a wrong one sent under the operator's
+name. It applies to both lanes (the function is shared): 15 sent CRO first touches would now render city / company
+instead of areas (`rerender_sent_cro.py`; nothing sent changes).
+
+**Not held, not decided — the operator's call [V]:** approved drafts whose areas fact comes from 7–16 areas:
+CRO 415, 418, 430 (CMAX, 13), 450 (Q-Trials, 9); ClinicalTrials.gov 485, 598 (Flourish, 10), 600 (GCP Research,
+12), 691 (IICS, 9). Holding them is the same shape as `029` part 1.
+
+**Draft 812 (Apex Medical Research Amr, apexmedicalresearch.com, Overture, USA) [V].** Held by `026`; the operator
+answered its email-hold code with APPROVE at 15:58:52 UTC (20:58 PKT), so it is `approved_by = 'human'`, not sent.
+So are 867 (Intouch Clinical Research Center, 15:58:22) and 933 (Liv Medical and Research Center, 15:50:24) —
+the only Overture drafts approved, and no Overture lead has ever been emailed. They are not "the next tick":
+Send takes the oldest approved draft per lane, and 279 / 290 / 291 older approved USA site drafts are ahead of them
+(weeks at today's 4–6 site sends a day **[A]**). 812's list has 8 specific areas and 933's 17 — both the pattern
+`029` holds; 867's has 6. Left exactly as the operator approved them. To put the three back under the source hold:
+`UPDATE drafts SET status = 'pending', hold_reason = 'db-guard: source sites-overture is held by niche research_site
+(precision audit, 2026-10-30)' WHERE id IN (812, 867, 933) AND status = 'approved';`
+
+**A human approval does bypass `held_sources` [V].** `drafts_approval_rules()` checks the held source only inside
+`IF NEW.approved_by = 'auto'`; a human approval (APPROVE by email, or the NocoDB grid) takes the `ELSE` branch, and
+Send never reads `held_sources`. That is a hole for a *source* hold: the hold means "nothing from this source sends
+until the audit says so", and the flood turned it into 153 one-click releases. `028` closes the email path (no
+email-hold code is minted for a source hold, the open ones were withdrawn). **To close it fully** (not done — the
+brief said not to touch the hold): in the trigger's human branch, refuse an approval whose lead's source is in its
+niche's `held_sources` (status back to `pending`, `db-guard: source … is held; a human approval does not lift a
+source hold`), and have Send's claim re-check the same, so a draft approved before the hold, or by hand in psql,
+cannot go either. An operator hold (`027`, `029`) stays releasable by a person on purpose.
+
 ## 8. Master Ref lines this niche makes out of date (not edited, per the brief)
 
 - §1 and §9 Workflow 1b / 4 / 13 "Sites and SMOs are not drafted" / "site and SMO leads wait at `contact_found`".
 - §8: migrations list ends at `024`; `025` and the `niches` / `site_lead_sources` tables are not in the schema block,
-  nor `026` (`niches.held_sources`, the held-source auto-approval problem), nor `027` (four operator holds, data only).
+  nor `026` (`niches.held_sources`, the held-source auto-approval problem), nor `027` (four operator holds, data only), nor `028` (`hold_reason_classes`, `hold_reason_class()`, `hold_needs_person()`,
+  `reply_approval_withdraw_holds()`) or `029` (55 operator holds, data only).
 - §9 Workflow 5: the trigger's rule "its lead is a CRO" is now "its niche is active and auto-approves, and it signs
   with the niche's identity".
 - §12 "Second ICP": "Outreach (2026-10-19): none yet".

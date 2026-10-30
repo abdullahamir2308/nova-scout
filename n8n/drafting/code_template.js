@@ -89,6 +89,17 @@ const SMYKM_ORDER = ['trials', 'areas', 'city', 'company'];
 // "at most two areas, lowercase, joined with 'and'".
 const MAX_AREAS = 2;
 
+// An areas fact only from a list a site could have written (2026-10-30): at most
+// this many specific areas (the taxonomy's 17, 'Other' not counted). A longer
+// list is the extraction reciting the taxonomy, not reading the site -- 116
+// leads hold all 17 -- and the sentence would name
+// the two the taxonomy ranks first ("oncology and cardiovascular") whatever the
+// site does. Measured on every enrichment that day: lists naming the taxonomy's
+// first four together are 0-3% of lists of 1-5 areas, 9% at 6, then 22, 35, 35,
+// 42 ... 83% at 16 and 100% at 17. A longer list gives no areas fact; the next
+// SMYKM fact (city, then the company) is used instead.
+const MAX_LISTED_AREAS = 6;
+
 // Section 9, Workflow 3, "Therapeutic area taxonomy" -- LOCKED. An area only
 // counts if it canonicalises against this list, case-insensitively: rows from
 // before the enum hold free text, some of it not a therapeutic area at all
@@ -278,6 +289,7 @@ function canonicalAreas(raw) {
     const canon = AREA_BY_KEY[String(v).trim().toLowerCase()];
     if (canon && UNSPECIFIC_AREAS.indexOf(canon) === -1 && kept.indexOf(canon) === -1) kept.push(canon);
   }
+  if (kept.length > MAX_LISTED_AREAS) return [];
   // Taxonomy order, whatever order the extraction listed them in, so a redraft
   // picks the same two areas as the draft it replaces. The locked taxonomy
   // starts with Oncology, so oncology comes first when present -- Section 12's

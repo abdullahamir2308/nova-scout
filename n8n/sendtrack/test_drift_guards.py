@@ -428,8 +428,26 @@ case("Record Digest writes a digest_log column Section 8 does not define -> refu
          "INSERT INTO digest_log (digest_day, covers_from, covers_to, summary, message_id)", 1)))
 case("the digest's clock override is left set in the shipped workflow -> refuses", "Daily Digest workflow has a clock override",
      mutate_file=("build_workflow.py", lambda s: s.replace(
-         'DIGEST_CONFIG = {"now_override": "", "digest_hour": 8}',
-         'DIGEST_CONFIG = {"now_override": "2026-10-05T03:00:00Z", "digest_hour": 8}', 1)))
+         'DIGEST_CONFIG = {"now_override": "", "digest_hour": 8, "held_cap": 15}',
+         'DIGEST_CONFIG = {"now_override": "2026-10-05T03:00:00Z", "digest_hour": 8, "held_cap": 15}', 1)))
+# Migration 028 (2026-10-30): no code for a hold nobody can decide, no reminder
+# for a held cold email, and a newly seen class is never allowlisted.
+case("the digest codes every held email again (no hold_needs_person) -> refuses", "Load Digest issues an email-hold code",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "                 CASE WHEN h.needs_person\n", "                 CASE WHEN h.channel = 'email'\n", 1)))
+case("the digest codes past held_cap -> refuses", "Load Digest issues an email-hold code",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "                       AND h.person_rank <= $3::int\n", "", 1)))
+case("the digest stops withdrawing codes nobody should be asked about -> refuses", "no longer withdraws",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "THEN reply_approval_withdraw_holds() ELSE 0 END", "THEN 0 ELSE 0 END", 1)))
+case("the reminder lane reminds about held cold emails again -> refuses", "Find Due Reminders reminds about something",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         " WHERE a.kind = 'reply'\n   AND a.used_at IS NULL", " WHERE a.used_at IS NULL", 1)))
+case("Record Digest allowlists a class it has just seen -> refuses", "must never allowlist it",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "  INSERT INTO hold_reason_classes (class, note)\n  SELECT c, ",
+         "  INSERT INTO hold_reason_classes (class, needs_person, note)\n  SELECT c, true, ", 1)))
 case("the digest goes back to a once-a-day schedule tick of 2 days -> refuses", "recurrenceCheck",
      mutate_file=("build_workflow.py", lambda s: s.replace(
          '{"parameters": {"rule": {"interval": [{"field": "minutes", "minutesInterval": 30}]}},\n     "name": DIGEST_TRIGGER',

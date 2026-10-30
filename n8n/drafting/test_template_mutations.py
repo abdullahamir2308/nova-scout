@@ -59,6 +59,8 @@ MUTATIONS = [
     # formatting
     ("singular trial", "return n === 1 ? one : many;", "return many;"),
     ("at most two areas", "const MAX_AREAS = 2;", "const MAX_AREAS = 3;"),
+    ("an areas fact only from at most six specific areas", "const MAX_LISTED_AREAS = 6;", "const MAX_LISTED_AREAS = 7;"),
+    ("an implausible areas list gives no fact", "  if (kept.length > MAX_LISTED_AREAS) return [];\n", ""),
     ("oncology first, then taxonomy order",
      "    return THERAPEUTIC_AREAS.indexOf(a) - THERAPEUTIC_AREAS.indexOf(b);",
      "    return THERAPEUTIC_AREAS.indexOf(b) - THERAPEUTIC_AREAS.indexOf(a);"),

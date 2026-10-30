@@ -88,6 +88,30 @@ function nicheArmLines(autoApproved, sent, held, totals) {
   return lines;
 }
 
+// At most this many held emails listed one by one when Config gives no cap.
+const DEFAULT_HELD_CAP = 15;
+// Classes CONTACT fixes (migration 023), so their count line says how.
+const ADDRESS_CLASSES = ['no-address', 'unverified-address'];
+
+function pad(n) {
+  const s = String(n);
+  return s.length >= 4 ? s : '    '.slice(s.length) + s;
+}
+
+// One line per hold class (Load Digest's hold_reason_class), most first: the
+// count, whether the class was ever seen before, and one sample reason.
+function heldCounts(held) {
+  const by = {};
+  held.forEach(function (r) {
+    const cls = dStr(r.hold_class) || 'none';
+    by[cls] = by[cls] || { cls: cls, n: 0, known: r.class_known !== false, sample: dStr(r.hold_reason) };
+    by[cls].n++;
+  });
+  return Object.keys(by).map(function (k) { return by[k]; }).sort(function (a, b) {
+    return b.n - a.n || (a.cls < b.cls ? -1 : a.cls > b.cls ? 1 : 0);
+  });
+}
+
 function zoneLabel() {
   return SENDER_ZONE === 'Asia/Karachi' ? 'PKT' : SENDER_ZONE;
 }
@@ -133,37 +157,54 @@ function buildDigest(row, cfg) {
     lines.push('  #' + r.draft_id + '  ' + company(r) + ' -> ' + dStr(r.to_addr) + '  ' + kindOf(r.variant) +
       '  [' + nicheOf(r) + ' ' + armOf(r.variant) + ']  ' + local(r.sent_at, z) + '  approved by ' + (dStr(r.approved_by) || 'unknown'));
   });
-  lines.push('', 'HELD FOR A PERSON (' + held.length + (newHeld ? ', ' + newHeld + ' new' : '') +
-    ') -- the exceptions queue: every pending draft, and why.');
+  // HELD, since 2026-10-30 (migration 028): counted by the class of its reason,
+  // and listed one by one only when a person can decide it. Until then every
+  // pending draft was listed with a code and re-sent every 4 hours -- 166 codes,
+  // not one of them a question about the words.
+  const counts = heldCounts(held);
+  const fresh = counts.filter(function (c) { return !c.known; });
+  const people = held.filter(function (r) { return r.needs_person === true; });
+  const cap = Number(row.held_cap) > 0 ? Number(row.held_cap) : DEFAULT_HELD_CAP;
+  lines.push('', 'HELD (' + held.length + (newHeld ? ', ' + newHeld + ' new' : '') +
+    ') -- the exceptions queue, by reason. Only a hold a person can decide is listed one by one.');
   if (!held.length) lines.push('  none');
-  held.forEach(function (r) {
+  counts.forEach(function (c) {
+    lines.push('  ' + pad(c.n) + '  ' + c.cls + (c.known ? '' : '  [NEW]') + (ADDRESS_CLASSES.indexOf(c.cls) !== -1
+      ? '   (CONTACT <lead domain> <email address> gives one an address)' : ''));
+  });
+  if (fresh.length) {
+    lines.push('', 'NEW HOLD REASON -- never seen before. Silent (no codes) until allowlisted in hold_reason_classes:');
+    fresh.forEach(function (c) {
+      lines.push('  ' + c.cls + '  (' + c.n + ')  e.g. ' + JSON.stringify(c.sample));
+    });
+  }
+  if (held.length) {
+    lines.push('', 'NEEDS YOU (' + people.length + ') -- held for a decision about the email itself.');
+    if (!people.length) lines.push('  none');
+  }
+  people.slice(0, cap).forEach(function (r) {
     lines.push('  #' + r.draft_id + '  ' + company(r) + '  ' + dStr(r.channel) + ' ' + kindOf(r.variant) +
       (r.new === true ? '  [new]' : '') + '  since ' + local(r.created_at, z));
     lines.push('        ' + (dStr(r.hold_reason) || 'no reason recorded (drafted before auto-approval existed)'));
     // One-time codes on held EMAIL drafts, 2026-10-09 (Section 9, Workflow 7):
-    // an email the claim check held after its repairs can be approved, rejected
-    // or edited by answering this digest, exactly as a drafted reply can. Load
-    // Digest issues the code only on the tick that sends, and reuses an open
-    // one, so the code here is the one the database holds. A LinkedIn DM, a
-    // low-context note and a no-send-clock note get none: the first is sent by
-    // hand (Section 6) and the other two can never be sent at all.
+    // a held email a person can decide can be approved, rejected or edited by
+    // answering this digest, exactly as a drafted reply can. Load Digest issues
+    // the code only on the tick that sends, and reuses an open one, so the code
+    // here is the one the database holds.
     if (dStr(r.code)) {
       lines.push('        reply with:  APPROVE ' + dStr(r.code) + '   |   REJECT ' + dStr(r.code) +
         '   |   EDIT ' + dStr(r.code) + ' <your text>');
-      // EDIT replaces the email's text; it cannot give it an address (draft
-      // 350, 2026-10-24). CONTACT does (migration 023).
-      if (/^(?:no-address|unverified-address)/.test(dStr(r.hold_reason))) {
-        lines.push('        to give it an address instead:  CONTACT ' + (dStr(r.domain) || '<lead domain>') +
-          ' <email address>');
-      }
     }
   });
+  if (people.length > cap) {
+    lines.push('  +' + (people.length - cap) + ' more (in the review queue; the next digest lists them)');
+  }
   const codes = held.filter(function (r) { return dStr(r.code); }).length;
   if (codes) {
     lines.push('');
     lines.push('Those ' + codes + ' code(s) work once each and expire 48 hours from now. Only this address');
     lines.push('can use them, and only with SPF and DKIM passing; anything else is logged and');
-    lines.push('ignored. I will remind you about any you have not answered in 4 hours.');
+    lines.push('ignored. No reminder is sent: a code still open tomorrow is in tomorrow\'s digest.');
   }
   lines.push('');
   byNiche.forEach(function (l) { lines.push(l); });
@@ -185,12 +226,17 @@ function buildDigest(row, cfg) {
       // reminder lane would read them as never mentioned and nudge about every
       // held draft half an hour later.
       coded: held.filter(function (r) { return dStr(r.code); }).map(function (r) { return dStr(r.code); }),
+      // Hold classes flagged as never seen before: Record Digest marks them seen
+      // (never allowlisted) once SMTP accepted this digest (migration 028).
+      new_classes: fresh.map(function (c) { return c.cls; }),
       summary: {
         auto_approved: autoApproved.map(function (r) { return r.draft_id; }),
         sent: sent.map(function (r) { return r.draft_id; }),
         held: held.length,
         held_new: newHeld,
         held_coded: codes,
+        held_needs_person: people.length,
+        held_by_class: counts.reduce(function (o, c) { o[c.cls] = c.n; return o; }, {}),
         auto_approve_email: row.auto_approve_email === true,
       },
     },

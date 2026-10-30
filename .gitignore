@@ -10,3 +10,4 @@ scrape_report.json
 
 # Full output of each run-all.ps1 prompt-queue task
 logs/
+.env.example

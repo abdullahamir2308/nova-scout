@@ -34,11 +34,13 @@ def js_rules(src):
     arm = re.search(r"^const ARM_BY_PARITY = \{ even: '([AB])', odd: '([AB])' \};$", src, re.M)
     order = re.search(r"^const SMYKM_ORDER = \[([^\]]*)\];$", src, re.M)
     areas = re.search(r"^const MAX_AREAS = (\d+);$", src, re.M)
-    if not (arm and order and areas):
-        raise AssertionError("code_template.js no longer declares ARM_BY_PARITY, SMYKM_ORDER and MAX_AREAS in the "
-                             "one shape the build reads")
+    listed = re.search(r"^const MAX_LISTED_AREAS = (\d+);$", src, re.M)
+    if not (arm and order and areas and listed):
+        raise AssertionError("code_template.js no longer declares ARM_BY_PARITY, SMYKM_ORDER, MAX_AREAS and "
+                             "MAX_LISTED_AREAS in the one shape the build reads")
     return {"even": arm.group(1), "odd": arm.group(2),
-            "order": re.findall(r"'([a-z]+)'", order.group(1)), "max_areas": int(areas.group(1))}
+            "order": re.findall(r"'([a-z]+)'", order.group(1)), "max_areas": int(areas.group(1)),
+            "max_listed_areas": int(listed.group(1))}
 
 
 REQUIRED = ["SUBJECT_WITH_FACT", "SUBJECT_NO_FACT", "SUBJECT_FACT_TRIALS", "SUBJECT_FACT_AREAS", "SUBJECT_FACT_CITY",
@@ -143,16 +145,21 @@ def doc_rules(doc, where):
     arm = re.search(r"Two arms, assigned by lead_id: even = ([AB]), odd = ([AB])\.", doc)
     order = re.search(r"\*\*SMYKM line[^\n]*?in this order: ((?:`[a-z]+`(?:, )?)+)", doc)
     areas = re.search(r"[Aa]t most (\w+) areas, lowercase, joined with \"and\"", doc)
-    if not (arm and order and areas):
+    listed = re.search(r"[Aa]n areas fact only from a list of at most (\w+) specific areas", doc)
+    if not (arm and order and areas and listed):
         raise AssertionError("Section 9 of %s no longer states the arm rule ('Two arms, assigned by lead_id: even = A, "
-                             "odd = B.'), the SMYKM order ('in this order: `trials`, ...') and the area cap ('at most "
-                             "two areas, lowercase, joined with \"and\"')" % where)
-    words = {"one": 1, "two": 2, "three": 3}
+                             "odd = B.'), the SMYKM order ('in this order: `trials`, ...'), the area cap ('at most "
+                             "two areas, lowercase, joined with \"and\"') and the listed-areas cap ('An areas fact "
+                             "only from a list of at most six specific areas')" % where)
+    words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+             "ten": 10}
     n = words.get(areas.group(1).lower(), None)
-    if n is None:
-        raise AssertionError("the area cap %r in %s is not a number" % (areas.group(1), where))
+    m = words.get(listed.group(1).lower(), None)
+    if n is None or m is None:
+        raise AssertionError("the area cap %r or the listed-areas cap %r in %s is not a number"
+                             % (areas.group(1), listed.group(1), where))
     return {"even": arm.group(1), "odd": arm.group(2), "order": re.findall(r"`([a-z]+)`", order.group(1)),
-            "max_areas": n}
+            "max_areas": n, "max_listed_areas": m}
 
 
 def assert_rules(doc, src, where, js_where):
