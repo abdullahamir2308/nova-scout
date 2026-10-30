@@ -252,36 +252,55 @@ the cost of a dropped fact (a city sentence, always true) is much smaller than a
 name. It applies to both lanes (the function is shared): 15 sent CRO first touches would now render city / company
 instead of areas (`rerender_sent_cro.py`; nothing sent changes).
 
-**Not held, not decided — the operator's call [V]:** approved drafts whose areas fact comes from 7–16 areas:
-CRO 415, 418, 430 (CMAX, 13), 450 (Q-Trials, 9); ClinicalTrials.gov 485, 598 (Flourish, 10), 600 (GCP Research,
-12), 691 (IICS, 9). Holding them is the same shape as `029` part 1.
+**Redrafted under the six-area rule (operator, 2026-10-30, later) [V].** The eight approved drafts that used 7–16
+areas (415, 418, 430, 450, 485, 598, 600, 691) and the four held full-list ones (466, 526, 768, 771): each lead
+was sent back to `contact_found` (never emailed, guarded in the statement) and redrafted by the shipped Drafting /
+Drafting - Research Sites, whose Write statement retired the old draft `rejected / bad draft`. New drafts, all
+auto-approved by the gate: CRO 1016 SMS Oncology and 1019 Q-Trials (company line: no city), 1017 Sofpromed (Palma
+de Mallorca) and 1018 CMAX (Adelaide) (city line); sites 1028 Diex Recherche Trois-Rivières (7 recruiting trials),
+1029 Equity Medical (8), 1030 Ezy Medical Research (3), 1031 Flourish Research - San Antonio (3), 1032 GCP
+Research (3), 1033 Apex Research Group (1), 1034 IICS (1), 1035 Titan Clinical Research (1).
 
-**Draft 812 (Apex Medical Research Amr, apexmedicalresearch.com, Overture, USA) [V].** Held by `026`; the operator
-answered its email-hold code with APPROVE at 15:58:52 UTC (20:58 PKT), so it is `approved_by = 'human'`, not sent.
-So are 867 (Intouch Clinical Research Center, 15:58:22) and 933 (Liv Medical and Research Center, 15:50:24) —
-the only Overture drafts approved, and no Overture lead has ever been emailed. They are not "the next tick":
-Send takes the oldest approved draft per lane, and 279 / 290 / 291 older approved USA site drafts are ahead of them
-(weeks at today's 4–6 site sends a day **[A]**). 812's list has 8 specific areas and 933's 17 — both the pattern
-`029` holds; 867's has 6. Left exactly as the operator approved them. To put the three back under the source hold:
-`UPDATE drafts SET status = 'pending', hold_reason = 'db-guard: source sites-overture is held by niche research_site
-(precision audit, 2026-10-30)' WHERE id IN (812, 867, 933) AND status = 'approved';`
+**The site city is the facility's (2026-10-30) [V].** The first redraft of the eight sites used Enrichment's city,
+which the site batch took before the harvest's, and named "Apex" for Flourish Research - San Antonio, "Las Vegas"
+for Titan (its ClinicalTrials.gov facility is in Mesa), "CDMX" for IICS (Durango). The same city drives the strict
+facility match behind "recruiting trials at this site", so a wrong one also counted zero trials. 328 of 2,282 site
+leads have a website city that differs from the facility's. `build_sites_workflows.py` now takes
+`site_lead_sources.city` first (a build assertion holds it); redrafted again, all eight carry a recruiting-trials
+count (1020–1027 retired the same way). Still in the approved queue, written before the fix, with the two cities
+different: 23 site drafts (16 trials, 5 areas, 2 city facts) — §7.8.
 
-**A human approval does bypass `held_sources` [V].** `drafts_approval_rules()` checks the held source only inside
-`IF NEW.approved_by = 'auto'`; a human approval (APPROVE by email, or the NocoDB grid) takes the `ELSE` branch, and
-Send never reads `held_sources`. That is a hole for a *source* hold: the hold means "nothing from this source sends
-until the audit says so", and the flood turned it into 153 one-click releases. `028` closes the email path (no
-email-hold code is minted for a source hold, the open ones were withdrawn). **To close it fully** (not done — the
-brief said not to touch the hold): in the trigger's human branch, refuse an approval whose lead's source is in its
-niche's `held_sources` (status back to `pending`, `db-guard: source … is held; a human approval does not lift a
-source hold`), and have Send's claim re-check the same, so a draft approved before the hold, or by hand in psql,
-cannot go either. An operator hold (`027`, `029`) stays releasable by a person on purpose.
+**Drafts 812, 867 and 933 [V]** (Overture; APPROVEd by the operator during the flood) are back under `026`'s hold
+with its exact reason — migration `030`, applied with `apply_drafts_migration.py --expect 812,867,933` (a re-run
+changed 0). 812 (8 specific areas) and 933 (17) carry the pattern `029` keeps out of the lift: if the Overture hold
+is ever lifted, re-reason them the way `029` part 2 did, or redraft them.
+
+**A held source is approvable by nobody (migration `031`) [V].** Until then `drafts_approval_rules()` checked the
+held source only for an automatic approval, and Send never read `held_sources`. Now `lead_held_source()` is the
+one definition, used by: the trigger (a human approval or edit of a held-source draft raises `Draft N cannot be
+approved: its source … is held by niche … (niches.held_sources). Nobody can approve a draft from a held source.`,
+with a hint naming the lift recipe); Apply Operator Command (APPROVE / EDIT refused with that reason in the
+acknowledgement, the code unspent, REJECT still works); code minting and the digest (no code, never "needs you");
+Send (Load Send State never lists one, so it cannot block its lane; Claim Send, the last check, refuses one). An
+automatic approval still becomes `026`'s exact hold, so `026`'s lift recipe still works. Proven by
+`n8n/sendtrack/test_held_source_sql.py` (19 checks: every route refused, then the lift, after which Claim Send
+claims the same draft and a human approval works). An operator hold (`027`, `029`) stays releasable by a person.
+
+### 7.8 Still open (2026-10-30, end of day)
+
+- 23 approved site drafts written with a website city that differs from the facility's (above). To redraft them
+  the same way: send each lead back to `contact_found` (never emailed) and let Drafting - Research Sites run.
+- The city rule writes "CDMX" as "Cdmx" (a city's ALL-CAPS words are never treated as acronyms, by design for
+  "SAO PAULO"); it no longer reaches a draft here.
+- D1 (Trialsites licence) and D2 (ClinicalTrials.gov robots.txt reading) in §7.3, and the Overture hold (D6).
 
 ## 8. Master Ref lines this niche makes out of date (not edited, per the brief)
 
 - §1 and §9 Workflow 1b / 4 / 13 "Sites and SMOs are not drafted" / "site and SMO leads wait at `contact_found`".
 - §8: migrations list ends at `024`; `025` and the `niches` / `site_lead_sources` tables are not in the schema block,
   nor `026` (`niches.held_sources`, the held-source auto-approval problem), nor `027` (four operator holds, data only), nor `028` (`hold_reason_classes`, `hold_reason_class()`, `hold_needs_person()`,
-  `reply_approval_withdraw_holds()`) or `029` (55 operator holds, data only).
+  `reply_approval_withdraw_holds()`) or `029` (55 operator holds, data only), `030` (three re-holds, data only) or `031`
+  (`lead_held_source()`, the trigger refusing a held source).
 - §9 Workflow 5: the trigger's rule "its lead is a CRO" is now "its niche is active and auto-approves, and it signs
   with the niche's identity".
 - §12 "Second ICP": "Outreach (2026-10-19): none yet".

@@ -259,8 +259,9 @@ positive(
 )
 case("Claim Send stops refusing while a pause is open -> refuses", "no longer refuses while the safety brake is on",
      mutate_file=("build_workflow.py", lambda s: s.replace(
-         "     AND NOT EXISTS (SELECT 1 FROM send_pauses sp WHERE sp.cleared_at IS NULL)\n  RETURNING d.id, d.lead_id",
-         "  RETURNING d.id, d.lead_id", 1)))
+         "     AND NOT EXISTS (SELECT 1 FROM send_pauses sp WHERE sp.cleared_at IS NULL)\n"
+         "     AND lead_held_source(d.lead_id) IS NULL\n  RETURNING d.id, d.lead_id",
+         "     AND lead_held_source(d.lead_id) IS NULL\n  RETURNING d.id, d.lead_id", 1)))
 case("Check Brake trips AT the share instead of over it -> refuses", "strictly over",
      mutate_file=("build_workflow.py", lambda s: s.replace(
          "     AND v.bounced * 100.0 > $3::numeric * v.sends", "     AND v.bounced * 100.0 >= $3::numeric * v.sends", 1)))
@@ -444,6 +445,22 @@ case("the digest stops withdrawing codes nobody should be asked about -> refuses
 case("the reminder lane reminds about held cold emails again -> refuses", "Find Due Reminders reminds about something",
      mutate_file=("build_workflow.py", lambda s: s.replace(
          " WHERE a.kind = 'reply'\n   AND a.used_at IS NULL", " WHERE a.used_at IS NULL", 1)))
+# Migration 031 (2026-10-30): a held source is approvable by nobody and sent by nothing.
+case("Load Send State lists held-source drafts again -> refuses", "Load Send State lists drafts from a held source",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "     AND lead_held_source(d.lead_id) IS NULL\n   -- The oldest of EACH lane first",
+         "   -- The oldest of EACH lane first", 1)))
+case("Claim Send stops refusing a held-source draft -> refuses", "Claim Send no longer refuses a draft from a held source",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "     AND lead_held_source(d.lead_id) IS NULL\n  RETURNING d.id, d.lead_id", "  RETURNING d.id, d.lead_id", 1)))
+case("APPROVE acts on a held-source draft again -> refuses", "Apply Operator Command lets APPROVE / EDIT act",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "          AND (j.held_source IS NULL OR j.outcome = 'rejected'))  AS may_act,",
+         "          )  AS may_act,", 1)))
+case("the digest calls a held-source draft 'needs you' -> refuses", "lists a held-source draft as needing a person",
+     mutate_file=("build_workflow.py", lambda s: s.replace(
+         "                                  AND lead_held_source(d.lead_id) IS NULL) AS needs_person",
+         "                                  ) AS needs_person", 1)))
 case("Record Digest allowlists a class it has just seen -> refuses", "must never allowlist it",
      mutate_file=("build_workflow.py", lambda s: s.replace(
          "  INSERT INTO hold_reason_classes (class, note)\n  SELECT c, ",

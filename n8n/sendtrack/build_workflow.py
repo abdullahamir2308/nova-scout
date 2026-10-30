@@ -800,6 +800,10 @@ cand AS (
      -- it (a replied lead's status, and outreach_log.replied), but "the cold
      -- path cannot see a reply" is the statement worth being able to make.
      AND coalesce(d.variant, '') NOT LIKE 'reply/%'
+     -- Migration 031: a draft from a held source (niches.held_sources) is never a candidate -- not even one
+     -- approved before its source was held. Left out here rather than refused later, so it can never be the
+     -- oldest of its lane and stop that lane; Claim Send refuses one as well.
+     AND lead_held_source(d.lead_id) IS NULL
    -- The oldest of EACH lane first (operator decision 2026-10-30: the CRO and
    -- research-site lanes take turns, 1:1), so the limit can never fill with one
    -- lane and leave Decide nothing of the other to alternate with.
@@ -865,6 +869,7 @@ CLAIM_SQL = """-- Claim Send: the last line of defence, in one statement under o
 --               no reply or bounce on this lead
 --   Section 5   today's external sends, re-counted, below the ceiling
 --   Section 9   the safety brake not on: no open send_pauses row (migration 021)
+--   Mig. 031    its lead's source not held by its niche (lead_held_source)
 --
 -- The advisory lock is its own statement on purpose. The Postgres node runs
 -- this text as one multi-statement query, i.e. one implicit transaction; under
@@ -915,6 +920,7 @@ d AS (
           OR NOT EXISTS (SELECT 1 FROM outreach_log o WHERE o.lead_id = d.lead_id AND o.channel = 'email'))
      AND (SELECT count(*) FROM counted) < (p.p->>'ceiling')::int
      AND NOT EXISTS (SELECT 1 FROM send_pauses sp WHERE sp.cleared_at IS NULL)
+     AND lead_held_source(d.lead_id) IS NULL
   RETURNING d.id, d.lead_id
 ),
 o AS (
@@ -932,7 +938,9 @@ SELECT (SELECT count(*) FROM d) = 1       AS claimed,
        p.p->>'body'                        AS body,
        p.p->>'clock'                       AS clock,
        (SELECT count(*) FROM counted)::int AS sent_today_before,
-       (p.p->>'ceiling')::int              AS ceiling
+       (p.p->>'ceiling')::int              AS ceiling,
+       -- Why a claim was refused, when it was this (migration 031); NULL otherwise.
+       lead_held_source((p.p->>'lead_id')::bigint) AS held_source
   FROM p;""".replace(
     "__LEAD_BLOCKED__", BLOCKED_DOMAIN.format(d="lower(l.domain)")
 ).replace(
@@ -1490,7 +1498,10 @@ j AS (
          (p.p->>'outcome')                                      AS outcome,
          p.p->>'code_kind'                                      AS code_kind,
          p.p->'contact_lines'                                   AS contact_lines,
-         (SELECT value FROM settings WHERE key = 'operator_email') AS operator_email
+         (SELECT value FROM settings WHERE key = 'operator_email') AS operator_email,
+         -- Migration 031: nobody approves a draft from a held source.
+         (SELECT lead_held_source(d.lead_id) FROM drafts d
+           WHERE d.id = (p.p->>'draft_id')::bigint)              AS held_source
     FROM p
 ),
 ok AS (
@@ -1500,7 +1511,14 @@ ok AS (
          (j.refused_reason IS NULL AND j.command IS NOT NULL AND j.code IS NOT NULL
           AND j.spf_pass AND j.dkim_pass AND j.operator_email IS NOT NULL
           AND lower(j.operator_email) = j.from_addr
-          AND reply_approval_usable(j.code))                    AS may_act,
+          AND reply_approval_usable(j.code)
+          AND (j.held_source IS NULL OR j.outcome = 'rejected'))  AS may_act,
+         -- What the operator reads when an APPROVE or EDIT meets a held source (migration 031).
+         CASE WHEN j.held_source IS NOT NULL AND j.code IS NOT NULL AND j.outcome IS DISTINCT FROM 'rejected'
+              THEN coalesce(j.command, 'the command') || ' refused: draft #' || j.draft_id
+                   || ' cannot be approved -- ' || j.held_source || '. Nobody can approve a draft from a held '
+                   || 'source; the hold is lifted for the whole source (migration 026''s recipe). The draft '
+                   || 'stays pending, and this code still works for REJECT.' END AS held_refusal,
          (j.refused_reason IS NULL AND j.command = 'CONTACT'
           AND j.spf_pass AND j.dkim_pass AND j.operator_email IS NOT NULL
           AND lower(j.operator_email) = j.from_addr
@@ -1615,7 +1633,7 @@ rec AS (
          res.accepted,
          CASE WHEN res.accepted THEN NULL
               WHEN ok.may_contact THEN 'no CONTACT line could be applied (each line says why)'
-              ELSE coalesce(ok.refused_reason,
+              ELSE coalesce(ok.refused_reason, ok.held_refusal,
                             'the code or the draft changed between the read and the write') END,
          CASE WHEN ok.command = 'EDIT' THEN ok.replacement END,
          ok.draft_id,
@@ -1646,7 +1664,7 @@ SELECT (SELECT count(*) FROM rec) = 1                     AS recorded,
        ok.sender_ok                                       AS sender_ok,
        CASE WHEN res.accepted THEN NULL
             WHEN ok.may_contact THEN 'no CONTACT line could be applied (each line says why)'
-            ELSE coalesce(ok.refused_reason,
+            ELSE coalesce(ok.refused_reason, ok.held_refusal,
                           'the code or the draft changed between the read and the write') END
                                                           AS refused_reason,
        ok.draft_id                                        AS draft_id,
@@ -2461,7 +2479,8 @@ SELECT win.day::text                                                     AS dige
                                  (d.channel = 'email'
                                   AND coalesce(d.variant, '') NOT LIKE 'low-context%'
                                   AND coalesce(d.variant, '') NOT LIKE 'no-send-clock%'
-                                  AND hold_needs_person(d.hold_reason)) AS needs_person
+                                  AND hold_needs_person(d.hold_reason)
+                                  AND lead_held_source(d.lead_id) IS NULL) AS needs_person
                             FROM drafts d
                            WHERE d.status = 'pending') k) h
             JOIN leads l ON l.id = h.lead_id) x)
@@ -2867,6 +2886,17 @@ assert _issue_case and "h.needs_person" in _issue_case.group(1) and "$3::int" in
 assert "hold_needs_person(d.hold_reason)" in DIGEST_LOAD_SQL and "reply_approval_withdraw_holds()" in DIGEST_LOAD_SQL, (
     "Load Digest no longer decides needs_person by migration 028's allowlist, or no longer withdraws the "
     "codes nobody should be asked about")
+# Migration 031 (2026-10-30): a held source is approvable by nobody and sent by nothing.
+assert "AND lead_held_source(d.lead_id) IS NULL" in LOAD_STATE_SQL, (
+    "Load Send State lists drafts from a held source again -- one could stop its lane (migration 031)")
+assert re.search(r"AND lead_held_source\(d\.lead_id\) IS NULL\s+RETURNING d\.id, d\.lead_id", CLAIM_SQL), (
+    "Claim Send no longer refuses a draft from a held source -- the last check before SMTP (migration 031)")
+assert "AND (j.held_source IS NULL OR j.outcome = 'rejected')" in COMMAND_APPLY_SQL and \
+    "ok.held_refusal" in COMMAND_APPLY_SQL, (
+    "Apply Operator Command lets APPROVE / EDIT act on a draft from a held source, or no longer says why "
+    "(migration 031)")
+assert "AND lead_held_source(d.lead_id) IS NULL) AS needs_person" in DIGEST_LOAD_SQL, (
+    "the Daily Digest lists a held-source draft as needing a person (migration 031)")
 assert re.search(r"WHERE a\.kind = 'reply'\s+AND a\.used_at IS NULL", REMINDER_DUE_SQL), (
     "Find Due Reminders reminds about something other than a prospect reply -- a held cold email is the "
     "Daily Digest's alone since 2026-10-30 (migration 028)")

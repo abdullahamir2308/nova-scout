@@ -116,8 +116,13 @@ d = copy.deepcopy(cro_draft)
 batch = node(d, "Get Draft Batch")
 q = batch["parameters"]["query"]
 what = "Get Draft Batch -> Get Site Draft Batch"
+# The city is the FACILITY's: the one ClinicalTrials.gov (or Overture) recorded for it at harvest, and only
+# without one the city Enrichment read off the website (2026-10-30). The website is often a network's or a
+# head office's -- 328 of 2,282 site leads had a different city there (Titan Clinical Research: Mesa on the
+# registry, Las Vegas on the site) -- and the city is both the city line's fact and the strict facility
+# match behind "recruiting trials at this site", which a wrong city turns into zero.
 q = sub_once(q, "       e.raw_extraction->>'city' AS city,\n",
-             "       coalesce(nullif(e.raw_extraction->>'city', ''), sls.city) AS city,\n"
+             "       coalesce(nullif(sls.city, ''), nullif(e.raw_extraction->>'city', '')) AS city,\n"
              "       sls.facility_name,\n"
              "       nc.niche,\n"
              "       n.auto_approve AS niche_auto_approve,\n", what)
@@ -134,6 +139,9 @@ q = "-- Get Site Draft Batch: Drafting's own batch query (drafting.json, Get Dra
     "-- CRO filter replaced by the research-site niche (migration 025: lead_niche(), niches.active,\n" \
     "-- niches.min_fit_score) and three columns added: the niche, its auto_approve switch, and the\n" \
     "-- site's ClinicalTrials.gov facility name for the strict facility match.\n" + q
+assert "coalesce(nullif(sls.city, ''), nullif(e.raw_extraction->>'city', '')) AS city" in q, (
+    "the site batch no longer takes the facility's own (harvest) city before the website's -- the city line "
+    "and the strict facility match would use a head office's city (2026-10-30)")
 batch["parameters"]["query"] = q
 batch["name"] = "Get Site Draft Batch"
 batch["notes"] = ("Drafting's batch query for the research-site niche (migration 025): leads at contact_found whose "
