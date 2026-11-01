@@ -1,0 +1,28 @@
+# The dashboard's only data source: the novascout database, as the read-only role
+# nova_dashboard (migration 033), which can read the `metrics` views and nothing
+# else. The password is interpolated by Grafana from the container's environment
+# (docker-compose passes NOVASCOUT_DASHBOARD_DB_PASSWORD from .env); it is never
+# written here. Not editable in the UI: change this file and restart grafana.
+apiVersion: 1
+
+prune: true
+
+datasources:
+  - name: Nova Scout metrics
+    uid: novascout-metrics
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: postgres:5432
+    user: nova_dashboard
+    isDefault: true
+    editable: false
+    jsonData:
+      database: novascout
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false
+      maxOpenConns: 2
+      maxIdleConns: 1
+      connMaxLifetime: 14400
+    secureJsonData:
+      password: $NOVASCOUT_DASHBOARD_DB_PASSWORD

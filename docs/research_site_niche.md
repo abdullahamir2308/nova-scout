@@ -297,7 +297,8 @@ claims the same draft and a human approval works). An operator hold (`027`, `029
 ## 8. Master Ref lines this niche makes out of date (not edited, per the brief)
 
 - §1 and §9 Workflow 1b / 4 / 13 "Sites and SMOs are not drafted" / "site and SMO leads wait at `contact_found`".
-- §8: migrations list ends at `024`; `025` and the `niches` / `site_lead_sources` tables are not in the schema block,
+- §8 (partly closed 2026-11-01: the migrations list now runs to `033` and points here for `025`–`031`; the
+  schema block still lacks the tables): `025` and the `niches` / `site_lead_sources` tables are not in the schema block,
   nor `026` (`niches.held_sources`, the held-source auto-approval problem), nor `027` (four operator holds, data only), nor `028` (`hold_reason_classes`, `hold_reason_class()`, `hold_needs_person()`,
   `reply_approval_withdraw_holds()`) or `029` (55 operator holds, data only), `030` (three re-holds, data only) or `031`
   (`lead_held_source()`, the trigger refusing a held source).

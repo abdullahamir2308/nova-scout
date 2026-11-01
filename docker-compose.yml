@@ -139,7 +139,54 @@ services:
     ports:
       - "8080:8080"
 
+  grafana:
+    # Dashboard v1 (Master Ref Section 9, "Dashboard"; dashboard/README.md): one
+    # read-only page for this PC. Reads the novascout database only as the role
+    # nova_dashboard (migration 033), which can read the `metrics` views and
+    # nothing else, so a panel cannot see or change anything those views do not
+    # show. The data source and the dashboard are provisioned read-only from
+    # ./dashboard/grafana; Grafana's own state (users, sessions) is in
+    # grafana_data.
+    #
+    # Published on 127.0.0.1 only: reachable from this PC, from nothing else on
+    # the network. No alerting, no sign-up, no anonymous access, no calls home
+    # (usage reporting, update checks, news, plugin preinstall all off).
+    # build_dashboard.py's drift guard refuses a port that is not 127.0.0.1.
+    image: grafana/grafana:13.2.5@sha256:9f7aa1e1e3246aade5792d35a738049f7f32f89cd51d1956cf426a4e86268a84
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 768m
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${NOVASCOUT_GRAFANA_ADMIN_PASSWORD}
+      NOVASCOUT_DASHBOARD_DB_PASSWORD: ${NOVASCOUT_DASHBOARD_DB_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_UNIFIED_ALERTING_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_ANALYTICS_FEEDBACK_LINKS_ENABLED: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_SNAPSHOTS_EXTERNAL_ENABLED: "false"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/nova-scout.json
+      GF_LOG_MODE: console
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./dashboard/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./dashboard/grafana/dashboards:/etc/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+
 volumes:
   postgres_data:
   n8n_data:
   nocodb_data:
+  grafana_data:

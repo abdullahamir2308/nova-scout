@@ -15,6 +15,9 @@ enrichment, scoring, or drafting logic yet.
 - **imap-health** — small Python container that runs the IMAP pre-flight for
   the IMAP Health workflow (Workflow 6); no published port, see
   `n8n/sendtrack/README.md`
+- **Grafana** — the read-only dashboard (dashboard v1), on `127.0.0.1` only,
+  reading the `metrics` views as the role `nova_dashboard`; see
+  `dashboard/README.md`
 - **Ollama** — native Windows install, NOT containerized (needs direct GPU
   access). Runs and is managed separately from the Docker stack.
 
@@ -34,6 +37,7 @@ calls it — start it from the system tray as usual. It is not part of
 |----------|-------------------------|
 | n8n      | http://localhost:5678   |
 | NocoDB   | http://localhost:8080   |
+| Dashboard | http://127.0.0.1:3000 (login `admin`, password `NOVASCOUT_GRAFANA_ADMIN_PASSWORD` in `.env`) |
 | Postgres | localhost:5432          |
 
 n8n reaches Ollama at `http://host.docker.internal:11434` — Docker Desktop's
