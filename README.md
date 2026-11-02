@@ -32,6 +32,7 @@ calls it — start it from the system tray as usual. It is not part of
 `docker compose up -d`.
 
 ## URLs
+http://127.0.0.1:3000
 
 | Service  | URL                     |
 |----------|-------------------------|

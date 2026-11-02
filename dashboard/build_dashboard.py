@@ -122,6 +122,12 @@ def check_compose(compose):
             raise AssertionError("grafana must set %s" % env)
     if "POSTGRES_PASSWORD" in svc or "POSTGRES_USER" in svc:
         raise AssertionError("grafana must not be given the superuser's credentials")
+    # Every service, not only this one (Master Ref Section 3, "Published ports"): nothing on the LAN.
+    for block in re.findall(r"^    ports:\n((?:      - .*\n?)+)", compose, re.M):
+        for port in re.findall(r"^      - \"?([^\"\n]+?)\"?\s*$", block, re.M):
+            if not port.startswith("127.0.0.1:"):
+                raise AssertionError("docker-compose.yml publishes %s beyond this PC; bind it as 127.0.0.1:<host>:<container>"
+                                     % port)
 
 
 def check_sources(doc, sql, compose, sendtrack):

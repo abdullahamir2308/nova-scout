@@ -141,7 +141,7 @@ replacement for the lookup on Trialsites' records; it is a source in its own rig
 
 | # | Decision | Status |
 |---|---|---|
-| D1 | Trialsites leads are in no niche until its "free for non-commercial use" licence is settled (§6). | Operator to decide |
+| D1 | Trialsites leads are in no niche until its "free for non-commercial use" licence is settled (§6). `trialsites0001` itself is unpublished since 2026-11-01 (Master Ref §13); publish it to resume. | Operator to decide |
 | D2 | ClinicalTrials.gov's robots.txt `Disallow: /api/` is read as aimed at crawlers, not at the documented API v2, which is harvested at one request in flight, ≥ 6 s apart, ~15 requests (§2, §7.6). **[A]** If the operator reads it otherwise, the harvest stops; CTTI's AACT database (a public copy of ClinicalTrials.gov) is the bulk alternative. | **[A]** — operator to confirm |
 | D3 | The Anthropic website lookup was not rewired to Ollama: a local model cannot search the web, and the free matcher finds the same site for 14 of 111 (§7.2). | Made |
 | D4 | Fit floor 50, equal to Contact Lookup's gate (§3). | Made |
@@ -268,7 +268,19 @@ facility match behind "recruiting trials at this site", so a wrong one also coun
 leads have a website city that differs from the facility's. `build_sites_workflows.py` now takes
 `site_lead_sources.city` first (a build assertion holds it); redrafted again, all eight carry a recruiting-trials
 count (1020–1027 retired the same way). Still in the approved queue, written before the fix, with the two cities
-different: 23 site drafts (16 trials, 5 areas, 2 city facts) — §7.8.
+different: 23 site drafts (16 trials, 5 areas, 2 city facts) — §7.8. *(Corrected 2026-11-01: that count had no date
+filter and included 1028–1035, the eight already redrafted after the fix; 15 were written before it — 8 trials,
+5 areas, 2 city facts.)*
+
+**The 15 redrafted (operator, 2026-11-01) [V].** Same path: each lead (never emailed, guarded in the statement) sent
+back to `contact_found`, then two runs of Drafting - Research Sites (batch 10), whose Write statement retired each
+old draft `rejected`. New drafts 1085–1099, all auto-approved, each lead's arm unchanged; sent drafts and
+`outreach_log` byte-identical before and after. With the facility's city the strict facility match found trials
+for most: 14 now open on recruiting trials, 1 on areas (1096 DM Clinical Research • Phoenix). The two city-fact
+drafts: 614 "Peters Medical Research + Greensboro" → 1088 "Peters Medical Research + 6 recruiting trials + sponsor
+inquiries"; 793 "Adams Clinical Dallas + Watertown" → 1086 "Adams Clinical Dallas + 12 recruiting trials + sponsor
+inquiries". Afterwards every one of the 325 approved site email drafts has a facility city, none written before the
+fix has a differing website city, and none whose two cities differ names the website city.
 
 **Drafts 812, 867 and 933 [V]** (Overture; APPROVEd by the operator during the flood) are back under `026`'s hold
 with its exact reason — migration `030`, applied with `apply_drafts_migration.py --expect 812,867,933` (a re-run
@@ -288,11 +300,10 @@ claims the same draft and a human approval works). An operator hold (`027`, `029
 
 ### 7.8 Still open (2026-10-30, end of day)
 
-- 23 approved site drafts written with a website city that differs from the facility's (above). To redraft them
-  the same way: send each lead back to `contact_found` (never emailed) and let Drafting - Research Sites run.
+- ~~23 approved site drafts written with a website city~~ — 15 (not 23) were; redrafted 2026-11-01 (above).
 - The city rule writes "CDMX" as "Cdmx" (a city's ALL-CAPS words are never treated as acronyms, by design for
   "SAO PAULO"); it no longer reaches a draft here.
-- D1 (Trialsites licence) and D2 (ClinicalTrials.gov robots.txt reading) in §7.3, and the Overture hold (D6).
+- D1 (Trialsites licence; `trialsites0001` unpublished 2026-11-01 until it is decided) and D2 (ClinicalTrials.gov robots.txt reading) in §7.3, and the Overture hold (D6).
 
 ## 8. Master Ref lines this niche makes out of date (not edited, per the brief)
 

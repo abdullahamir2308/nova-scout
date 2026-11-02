@@ -93,6 +93,15 @@ class Guards(unittest.TestCase):
     def test_grafana_published_beyond_localhost(self):
         self.refuses(compose=once(COMPOSE, '"127.0.0.1:3000:3000"', '"3000:3000"'))
 
+    def test_postgres_published_beyond_localhost(self):
+        self.refuses(compose=once(COMPOSE, '"127.0.0.1:5432:5432"', '"5432:5432"'))
+
+    def test_n8n_published_on_all_interfaces(self):
+        self.refuses(compose=once(COMPOSE, '"127.0.0.1:5678:5678"', '"0.0.0.0:5678:5678"'))
+
+    def test_nocodb_published_unquoted(self):
+        self.refuses(compose=once(COMPOSE, '"127.0.0.1:8080:8080"', '8080:8080'))
+
     def test_grafana_unpinned(self):
         self.refuses(compose=re.sub(r"grafana/grafana:13\.2\.5@sha256:[0-9a-f]{64}", "grafana/grafana:latest", COMPOSE))
 
