@@ -189,6 +189,42 @@ services:
     ports:
       - "127.0.0.1:3000:3000"
 
+  dashboard:
+    # The custom dashboard page (dashboard v1.1; Master Ref Section 9, "Dashboard";
+    # dashboard/README.md): the reference design with live numbers, at
+    # http://127.0.0.1:3001. Grafana stays as the detailed view.
+    #
+    # Reads the novascout database only as the role nova_dashboard (migration
+    # 033) -- the same role and the same `metrics` views as Grafana -- so it can
+    # show nothing those views do not, and write nothing. It is given that
+    # role's password and nothing else: not the superuser's, not the mailbox's.
+    # Same containment as the sidecars above: the pinned python image with
+    # nothing installed, code mounted read-only, read-only filesystem, no root.
+    # dashboard/web/server.py has no driver dependency (pgmini.py speaks the
+    # protocol itself) and the page makes no request beyond its own origin.
+    #
+    # Published on 127.0.0.1 only. build_dashboard.py's drift guard refuses any
+    # other binding, any other image, and any credential this service should not
+    # have.
+    image: python:3.12.15-alpine3.24@sha256:b658b05ce9c4eb97ec6fc19424818a1f31993659c2b505a532f470e83807815d
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 128m
+    environment:
+      NOVASCOUT_DASHBOARD_DB_PASSWORD: ${NOVASCOUT_DASHBOARD_DB_PASSWORD}
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./dashboard/web:/opt/novascout/dashboard:ro
+    ports:
+      - "127.0.0.1:3001:3001"
+    command: ["python", "-u", "/opt/novascout/dashboard/server.py"]
+
 volumes:
   postgres_data:
   n8n_data:

@@ -8,7 +8,11 @@ rebuild, commit both. Grafana re-reads the file within a minute; nothing to impo
 
 Refuses to build when:
   * a panel's SQL reads anything but a `metrics.` view that migration 033 creates (the dashboard's role can
-    read nothing else, so such a panel would only ever show an error);
+    read nothing else, so such a panel would only ever show an error) -- and the same for every statement of
+    the custom page's server (web/server.py), which must also be a plain SELECT and log in as nova_dashboard;
+  * the `dashboard` service (the custom page, dashboard/web/) in docker-compose.yml is not published on
+    127.0.0.1 at the server's own port, not the sidecars' pinned image, not read-only, or is given any
+    credential but the reader's password; or the Master Ref's "Published ports" sentence omits a published port;
   * the migration's constants disagree with the Master Ref: the safety brake's window and share (Section 9,
     Workflow 6's brake sentence -- the same parse as n8n/sendtrack/build_workflow.py's load_brake), the A/B
     sample per arm (Section 9, "Dashboard"), the warm-up table (Section 5), the sender's zone
@@ -27,6 +31,7 @@ MASTER_REF = os.path.join(ROOT, "NovaScout_MasterRef.md")
 MIGRATION = os.path.join(ROOT, "postgres", "migrations", "033_dashboard_metrics.sql")
 COMPOSE = os.path.join(ROOT, "docker-compose.yml")
 SENDTRACK_BUILD = os.path.join(ROOT, "n8n", "sendtrack", "build_workflow.py")
+PAGE_SERVER = os.path.join(HERE, "web", "server.py")
 OUT = os.path.join(HERE, "grafana", "dashboards", "nova-scout.json")
 
 DS = {"type": "grafana-postgresql-datasource", "uid": "novascout-metrics"}
@@ -128,6 +133,62 @@ def check_compose(compose):
             if not port.startswith("127.0.0.1:"):
                 raise AssertionError("docker-compose.yml publishes %s beyond this PC; bind it as 127.0.0.1:<host>:<container>"
                                      % port)
+    check_page_service(compose)
+
+
+def page_service(compose):
+    m = re.search(r"^  dashboard:\n(.*?)(?=^  \S|^\S)", compose, re.S | re.M)
+    if not m:
+        raise AssertionError("no dashboard service in docker-compose.yml")
+    return m.group(1)
+
+
+PAGE_ENV = {"NOVASCOUT_DASHBOARD_DB_PASSWORD", "PYTHONDONTWRITEBYTECODE"}
+
+
+def check_page_service(compose):
+    """The custom page's service: this PC only, the sidecars' pinned image, read-only, and only the reader's password."""
+    svc = page_service(compose)
+    server = read(PAGE_SERVER)
+    port = re.search(r"^PORT = (\d+)$", server, re.M)
+    if not port:
+        raise AssertionError("PORT not found in %s" % PAGE_SERVER)
+    port = port.group(1)
+    if not re.search(r'^DB_USER = "nova_dashboard"$', server, re.M):
+        raise AssertionError("web/server.py must log in as the read-only role nova_dashboard")
+    image = re.search(r"^    image: (\S+)\s*$", svc, re.M)
+    if not image or not re.fullmatch(r"python:\d+\.\d+\.\d+-alpine[\d.]+@sha256:[0-9a-f]{64}", image.group(1)):
+        raise AssertionError("the dashboard service's image is not pinned to version@sha256:<digest> (Master Ref Section 3)")
+    sidecars = set(re.findall(r"^    image: (python:\S+)\s*$", compose, re.M))
+    if sidecars != {image.group(1)}:
+        raise AssertionError("the dashboard service must use the same pinned python image as the sidecars, not %r"
+                             % sorted(sidecars))
+    ports = re.findall(r"^\s+- \"([^\"]+)\"\s*$", svc.split("ports:", 1)[1], re.M) if "ports:" in svc else []
+    if ports != ["127.0.0.1:%s:%s" % (port, port)]:
+        raise AssertionError("the dashboard service must publish exactly 127.0.0.1:%s:%s (this PC only, and the "
+                             "server's own port, which its Host check is built on), not %r" % (port, port, ports))
+    for needed in ("read_only: true", 'user: "65534:65534"', "mem_limit:",
+                   "./dashboard/web:/opt/novascout/dashboard:ro",
+                   "NOVASCOUT_DASHBOARD_DB_PASSWORD: ${NOVASCOUT_DASHBOARD_DB_PASSWORD}"):
+        if needed not in svc:
+            raise AssertionError("the dashboard service must carry %s" % needed)
+    env = re.search(r"^    environment:\n((?:      \S.*\n)+)", svc, re.M)
+    names = set(re.findall(r"^      (\w+):", env.group(1), re.M)) if env else set()
+    if names != PAGE_ENV:
+        raise AssertionError("the dashboard service may be given %s and nothing else, not %s (it holds the reader's "
+                             "password only: no superuser, mailbox or n8n credential)"
+                             % (sorted(PAGE_ENV), sorted(names)))
+
+
+def check_doc_ports(doc, compose):
+    """Every port the compose file publishes is named in the Master Ref's "Published ports" sentence."""
+    m = re.search(r"\*\*Published ports \([\d-]+\)\.\*\*[^\n]*", doc)
+    if not m:
+        raise AssertionError("the 'Published ports' sentence not found in Section 3 of the Master Ref")
+    for p in sorted(set(re.findall(r"^\s+- \"127\.0\.0\.1:(\d+):\d+\"\s*$", compose, re.M))):
+        if "127.0.0.1:%s" % p not in m.group(0):
+            raise AssertionError("docker-compose.yml publishes 127.0.0.1:%s but the Master Ref's 'Published ports' "
+                                 "sentence (Section 3) does not name it" % p)
 
 
 def check_sources(doc, sql, compose, sendtrack):
@@ -155,6 +216,7 @@ def check_sources(doc, sql, compose, sendtrack):
         if found != ARM_EXPR:
             raise AssertionError("033 reads the arm as %s, the Daily Digest as %s" % (found, ARM_EXPR))
     check_compose(compose)
+    check_doc_ports(doc, compose)
     # The brake's numbers come from send_brake_stats() itself, not a copy of it.
     if "send_brake_stats(now(), c.brake_days)" not in sql:
         raise AssertionError("033's brake_now() no longer calls send_brake_stats() -- the dashboard's bounce rate "
@@ -424,9 +486,11 @@ def all_sql(dash):
     return out
 
 
-def check_reads(dash, views):
-    """Every relation a panel reads is a metrics view the migration creates."""
-    for sql in all_sql(dash):
+def check_sql_reads(sqls, views):
+    """Every statement is a SELECT, and every relation it reads is a metrics view the migration creates."""
+    for sql in sqls:
+        if not re.match(r"\s*SELECT\b", sql):
+            raise AssertionError("a dashboard query is not a plain SELECT: %r" % sql[:80])
         rels = re.findall(r"\b(?:FROM|JOIN)\s+([A-Za-z_][\w.]*)", sql)
         if not rels:
             raise AssertionError("a panel query reads no relation: %r" % sql)
@@ -437,11 +501,29 @@ def check_reads(dash, views):
                                      "(%s)" % (rel, ", ".join(sorted(views))))
 
 
+def check_reads(dash, views):
+    """Every relation a Grafana panel reads is a metrics view the migration creates."""
+    check_sql_reads(all_sql(dash), views)
+
+
+def page_sql():
+    """Every statement the custom page's server (web/server.py) can send."""
+    web = os.path.dirname(PAGE_SERVER)
+    if web not in sys.path:
+        sys.path.insert(0, web)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("nova_dashboard_server", PAGE_SERVER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.all_sql()
+
+
 def build():
     doc, sql = read(MASTER_REF), read(MIGRATION)
     consts = check_sources(doc, sql, read(COMPOSE), read(SENDTRACK_BUILD))
     dash = dashboard(consts)
     check_reads(dash, migration_views(sql))
+    check_sql_reads(page_sql(), migration_views(sql))
     return dash, consts
 
 
