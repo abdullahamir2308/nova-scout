@@ -13,7 +13,9 @@ run is that test.
 Run: python scraper/test_shards.py
 """
 
+import contextlib
 import csv
+import io
 import json
 import os
 import sys
@@ -93,17 +95,22 @@ class Resp:
 class FakeSession:
     """Serves the fake directory and records every URL asked for."""
 
-    def __init__(self, profile_status=None, index_ok=True):
+    def __init__(self, profile_status=None, index_ok=True, index_script=None):
         self.requested = []
         self.profile_status = profile_status or {}   # profile slug -> status code
         self.block_all_profiles = False
         self.index_ok = index_ok
+        self.index_script = list(index_script or [])  # status of the 1st, 2nd... /cro-list request; then normal
         self.headers = {}
 
     def get(self, url, timeout=None):
         self.requested.append(url)
         path = url.replace("https://ichgcp.net", "")
         if path == "/cro-list":
+            if self.index_script:
+                code = self.index_script.pop(0)
+                if code != 200:
+                    return Resp(code)
             return Resp(200, index_html()) if self.index_ok else Resp(200, "<html><body>moved</body></html>")
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["cro-list", "country"]:
@@ -163,7 +170,23 @@ def run(session, tmp, seed, env):
     return code, rows, report
 
 
-time.sleep = lambda *_a, **_k: None  # the real delay is 0 anyway; never really sleep in tests
+SLEEPS = []
+time.sleep = lambda secs=0, *_a, **_k: SLEEPS.append(secs)  # never really sleep in tests; remember what was asked
+
+
+def run_loud(session, tmp, seed, env):
+    """run(), also returning what the scraper printed (the ::error annotation) and the step summary."""
+    SLEEPS.clear()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code, rows, rep = run(session, tmp, seed, env)
+    summary = os.path.join(tmp, "summary.md")
+    md = open(summary, encoding="utf-8").read() if os.path.exists(summary) else ""
+    return code, rows, rep, buf.getvalue(), md
+
+
+def retry_sleeps():
+    return [x for x in SLEEPS if x]   # the per-request delay is 0 in tests; what is left are the index waits
 
 # Rows already in the CSV from earlier runs (other shards, plus stale Poland data).
 SEED = [
@@ -334,6 +357,128 @@ with tempfile.TemporaryDirectory() as tmp:
     finally:
         LISTINGS.clear(); LISTINGS.update(saved[0])
         PROFILES.clear(); PROFILES.update(saved[1])
+
+    INDEX = "https://ichgcp.net/cro-list"
+
+    # --- J. the first request is retried, spaced; a recovery is an ordinary run --------
+    # Refused twice, then answered. ICHGCP_BREAKER=2 would trip on those two refusals
+    # if they counted toward the circuit breaker, which guards the profile stage only.
+    sess = FakeSession(index_script=[403, 403])
+    code, rows, rep, text, md = run_loud(sess, tmp, SEED, {"ICHGCP_SHARD": "europe", "ICHGCP_BREAKER": "2",
+                                                          "ICHGCP_INDEX_RETRY_WAITS": "7,11,13"})
+    check("J: refused twice then answered: the run completes, exit 0", code == 0)
+    check("J: it asked for the index three times", sess.requested.count(INDEX) == 3)
+    check("J: it waited the configured time between asks, in order, and no more", retry_sleeps() == [7, 11])
+    check("J: the refusals on the index do not count toward the circuit breaker",
+          rep["totals"]["blocked_answers"] == 0)
+    check("J: a recovered run reports no failure and prints no error annotation",
+          rep["failure"] is None and "::error" not in text)
+    check("J: the shard was scraped as normal", any(r["domain"] == "polcro.pl" for r in rows))
+
+    # --- K. a block that outlasts the retries ends the run, politely --------------------
+    out = os.path.join(tmp, "leads.csv")
+    write_seed(out, SEED)
+    before = open(out, "rb").read()
+    sess = FakeSession(index_script=[403] * 10)
+    code, rows, rep, text, md = run_loud(sess, tmp, SEED, {"ICHGCP_SHARD": "europe",
+                                                          "ICHGCP_INDEX_RETRY_WAITS": "7,11,13"})
+    check("K: an index that stays refused exits 2", code == 2)
+    check("K: exactly 4 requests (1 + 3 retries), all to the index and nothing else",
+          sess.requested == [INDEX] * 4)
+    check("K: the waits were the configured ones, in order, never shorter", retry_sleeps() == [7, 11, 13])
+    check("K: the CSV is byte-identical", open(out, "rb").read() == before)
+    check("K: the report says blocked", rep["failure"]["reason"] == "blocked" and rep["exit_code"] == 2)
+    check("K: the red annotation leads with the reason (this is what the failure e-mail quotes)",
+          "::error title=ICH GCP scrape failed - blocked::blocked: " in text and "403" in text)
+    check("K: the step summary says blocked", "Failed: `blocked`" in md)
+
+    code, rows, rep, text, md = run_loud(s_ := FakeSession(index_script=[403] * 10), tmp, SEED,
+                                         {"ICHGCP_SHARD": "europe", "ICHGCP_INDEX_RETRY_WAITS": ""})
+    check("K: with retries switched off it asks once", s_.requested == [INDEX] and code == 2 and retry_sleeps() == [])
+    code, rows, rep, text, md = run_loud(s_ := FakeSession(index_script=[403] * 10), tmp, SEED, {"ICHGCP_SHARD": "europe"})
+    check("K: the default is 4 attempts spaced 5, 15 and 30 minutes apart",
+          s_.requested == [INDEX] * 4 and retry_sleeps() == [300, 900, 1800])
+    code, rows, rep, text, md = run_loud(s_ := FakeSession(index_script=[403] * 10), tmp, SEED,
+                                         {"ICHGCP_SHARD": "europe", "ICHGCP_INDEX_RETRY_WAITS": "7,11,13",
+                                          "ICHGCP_MAX_RUNTIME_SECONDS": "10"})
+    check("K: it will not start a wait that would run past the runtime budget",
+          s_.requested == [INDEX, INDEX] and retry_sleeps() == [7] and code == 2)
+
+    # --- L. a failed fetch that is not a refusal is named differently ------------------
+    code, rows, rep, text, md = run_loud(s_ := FakeSession(index_script=[503] * 10), tmp, SEED,
+                                         {"ICHGCP_SHARD": "europe", "ICHGCP_INDEX_RETRY_WAITS": ""})
+    check("L: a 503 index is fetch-failed, not blocked", code == 2 and rep["failure"]["reason"] == "fetch-failed"
+          and "::error title=ICH GCP scrape failed - fetch-failed::" in text)
+    check("L: ...after the fetch's own three quick tries", s_.requested == [INDEX] * 3)
+    code, rows, rep, text, md = run_loud(s_ := FakeSession(index_script=[503] * 10), tmp, SEED,
+                                         {"ICHGCP_SHARD": "europe", "ICHGCP_INDEX_RETRY_WAITS": "5"})
+    check("L: a 5xx index is retried after the long wait too", s_.requested == [INDEX] * 6 and 5 in SLEEPS)
+    code, rows, rep, text, md = run_loud(s_ := FakeSession(index_script=[404] * 10), tmp, SEED,
+                                         {"ICHGCP_SHARD": "europe", "ICHGCP_INDEX_RETRY_WAITS": "5,5"})
+    check("L: a 404 index is not retried (the page is gone, not busy)",
+          s_.requested == [INDEX] and rep["failure"]["reason"] == "fetch-failed" and retry_sleeps() == [])
+
+    # --- M. a changed layout is named, and not retried ---------------------------------
+    out = os.path.join(tmp, "leads.csv")
+    write_seed(out, SEED)
+    before = open(out, "rb").read()
+    code, rows, rep, text, md = run_loud(s_ := FakeSession(index_ok=False), tmp, SEED,
+                                         {"ICHGCP_SHARD": "europe", "ICHGCP_INDEX_RETRY_WAITS": "7,11,13"})
+    check("M: a 200 index with too few country links is page-changed, exit 2",
+          code == 2 and rep["failure"]["reason"] == "page-changed")
+    check("M: it is not retried (a different page would not fix itself)", s_.requested == [INDEX] and retry_sleeps() == [])
+    check("M: annotation and step summary name it",
+          "::error title=ICH GCP scrape failed - page-changed::page-changed: " in text and "Failed: `page-changed`" in md)
+    check("M: the CSV is byte-identical", open(out, "rb").read() == before)
+
+    # --- N. the circuit breaker is a block too -------------------------------------------
+    sess = FakeSession()
+    sess.block_all_profiles = True
+    code, rows, rep, text, md = run_loud(sess, tmp, SEED, {"ICHGCP_SHARD": "europe", "ICHGCP_BREAKER": "3"})
+    check("N: a breaker abort exits 3 and says blocked", code == 3 and rep["failure"]["reason"] == "blocked")
+    check("N: annotation and step summary say blocked, and the country table is still there",
+          "::error title=ICH GCP scrape failed - blocked::blocked: " in text and "Failed: `blocked`" in md
+          and "| Country | Tier |" in md)
+
+    # --- O. a shard that yields nothing ----------------------------------------------------
+    saved = dict(LISTINGS)
+    try:
+        for k in ("poland", "germany", "ukraine"):
+            LISTINGS[k] = []
+        code, rows, rep, text, md = run_loud(FakeSession(), tmp, SEED, {"ICHGCP_SHARD": "europe"})
+    finally:
+        LISTINGS.clear(); LISTINGS.update(saved)
+    check("O: a shard with no leads exits 1 and says no-leads", code == 1 and rep["failure"]["reason"] == "no-leads")
+    check("O: annotation and step summary say no-leads",
+          "::error title=ICH GCP scrape failed - no-leads::no-leads: " in text and "Failed: `no-leads`" in md)
+
+    # --- P. a bad shard name is named, and asks for nothing --------------------------------------
+    code, rows, rep, text, md = run_loud(s_ := FakeSession(), tmp, SEED, {"ICHGCP_SHARD": "mars"})
+    check("P: an unknown shard is config, and made no request",
+          code == 2 and rep["failure"]["reason"] == "config" and s_.requested == [])
+
+    # --- Q. a crash names itself (Python's own exit code for it is 1, the same as no-leads) ---------
+    real_main = s.main
+    buf, err = io.StringIO(), io.StringIO()
+    os.environ["GITHUB_STEP_SUMMARY"] = os.path.join(tmp, "crash_summary.md")
+    s.main = lambda: 1 // 0
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            code = s.run()
+    finally:
+        s.main = real_main
+        del os.environ["GITHUB_STEP_SUMMARY"]
+    check("Q: an uncaught exception exits 1 and is announced as crashed",
+          code == 1 and "::error title=ICH GCP scrape failed - crashed::crashed: ZeroDivisionError" in buf.getvalue())
+    check("Q: the traceback still goes to the log", "ZeroDivisionError" in err.getvalue())
+    check("Q: and the step summary says crashed",
+          "Failed: `crashed`" in open(os.path.join(tmp, "crash_summary.md"), encoding="utf-8").read())
+
+    # --- R. workflow-command escaping and the reason list ---------------------------------------------
+    check("R: a message's %, CR and LF are escaped", s._gh_escape("a%b\r\nc") == "a%25b%0D%0Ac")
+    check("R: a property also escapes ':' and ','", s._gh_escape("a: b, c", True) == "a%3A b%2C c")
+    check("R: every reason the script can give is one of FAILURE_REASONS",
+          set(s.FAILURE_REASONS) == {"blocked", "page-changed", "no-leads", "fetch-failed", "config", "crashed"})
 
 print("\n" + ("ALL CHECKS PASSED" if not _failed else "FAILED: %d check(s)" % len(_failed)))
 sys.exit(0 if not _failed else 1)

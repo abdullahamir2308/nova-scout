@@ -158,6 +158,32 @@ check("workflow: the scraper's runtime budget leaves room under the job timeout"
 check("workflow: the push is retried after a rebase", "git pull --rebase" in wf and "attempt" in wf)
 check("workflow: tests gate the scrape", wf.index("scraper/test_geography.py") < wf.index("python scraper/scrape_ichgcp.py"))
 
+# --- 3c. the runner, the actions and the failure reasons are pinned, and the Master Ref says so
+import scrape_ichgcp as sc   # the workflow installs requirements before it runs these tests
+
+runner = re.search(r"^\s+runs-on:\s*(\S+)", wf, re.M).group(1)
+check("workflow: the runner is a pinned image (ubuntu-NN.NN), not a -latest label",
+      re.fullmatch(r"ubuntu-\d\d\.\d\d", runner) is not None)
+# Node 24 majors (checked 2026-11-19: each major's action.yml says `using: node24`).
+# The previous majors (checkout 4, setup-python 5, upload-artifact 4) run on Node 20,
+# which GitHub forces onto Node 24 with a deprecation warning. Raising a major is a
+# change to this table, to the workflow and to the Master Ref together.
+NODE24_ACTIONS = {"actions/checkout": "v7", "actions/setup-python": "v7", "actions/upload-artifact": "v7"}
+uses = re.findall(r"^\s+uses:\s*(\S+)", wf, re.M)
+check("workflow: exactly the three actions, each on its Node 24 major",
+      sorted(uses) == sorted("%s@%s" % kv for kv in NODE24_ACTIONS.items()))
+mref = doc_text()
+check("doc: the Master Ref states the pinned runner as `runs-on: %s`" % runner, "`runs-on: %s`" % runner in mref)
+check("doc: the Master Ref names each pinned action",
+      all(("`%s`" % u) in mref for u in uses))
+mins = [str(int(w) // 60) for w in sc.DEFAULT_INDEX_RETRY_WAITS]
+check("doc: the Master Ref gives the index retry waits (%s min) and the env var that sets them" % "/".join(mins),
+      "ICHGCP_INDEX_RETRY_WAITS" in mref and (", ".join(mins[:-1]) + " and " + mins[-1] + " minutes") in mref)
+check("doc: every failure reason the scraper can name is listed in the Master Ref",
+      all(("`%s`" % r) in mref for r in sc.FAILURE_REASONS))
+check("doc: the workflow comment lists the same failure reasons",
+      all(r in wf for r in sc.FAILURE_REASONS))
+
 # --- 4. drift against the Master Ref (Section 12) ----------------------------
 doc_core = doc_list(r"\*\*Geographies:\*\*")
 check("doc: '**Geographies:**' line present", doc_core is not None)

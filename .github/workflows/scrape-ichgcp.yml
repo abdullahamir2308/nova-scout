@@ -43,17 +43,23 @@ concurrency:
 
 jobs:
   scrape:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest, so an image migration is a change we make and not
+    # one that happens to us. ubuntu-latest was already 26.04 by 2026-11-03 (the
+    # 2 Nov run was still 24.04); the scraper ran to completion on 26.04 (four
+    # shards, 3-6 Nov, 0 blocked answers), so there was no reason to step back to
+    # 24.04. test_geography.py holds this label, the three action versions below
+    # (all Node 24 majors) and the Master Ref to one another.
+    runs-on: ubuntu-26.04
     # Hard backstop under GitHub's 6 h limit. The scraper stops starting new work
     # at ICHGCP_MAX_RUNTIME_SECONDS (4.5 h) so it can still merge and commit; a
     # job killed at the limit commits nothing.
     timeout-minutes: 345
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -94,6 +100,11 @@ jobs:
           echo "plan=$plan" >> "$GITHUB_OUTPUT"
           echo "Shard: $shard (plan only: $plan)"
 
+      # A failed run says why: the scraper prints a red ::error annotation that
+      # starts with the reason (blocked, page-changed, no-leads, fetch-failed,
+      # config, crashed) and repeats it in this run's summary. The country index
+      # is asked for up to four times, 5, 15 and 30 minutes apart, before a
+      # refusal ends the run.
       - name: Run scraper
         id: scrape
         env:
@@ -106,7 +117,7 @@ jobs:
 
       - name: Upload report
         if: always() && steps.scrape.outcome != 'skipped'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: scrape-report-${{ steps.shard.outputs.shard }}${{ steps.shard.outputs.plan == 'true' && '-plan' || '' }}
           path: scrape_report.json

@@ -26,11 +26,19 @@ Environment:
                                16200 = 4.5 h; the job limit is 6 h)
   ICHGCP_BREAKER               consecutive 403/exhausted-429 answers that abort
                                the run (default 8)
+  ICHGCP_INDEX_RETRY_WAITS     seconds to wait before each retry of the country
+                               index, comma-separated (default 300,900,1800:
+                               four attempts over ~50 min; empty = no retry)
   ICHGCP_REPORT_PATH           where the JSON report goes (default
                                scrape_report.json, never committed)
 
 Exit codes: 0 ok · 1 no rows scraped · 2 country index unusable · 3 aborted by
 the circuit breaker (completed countries are still merged and written).
+
+Every failure also names its reason (FAILURE_REASONS) in a red `::error`
+annotation, in the step summary and in the report, so the failure e-mail says
+why and not only "exit code N": blocked (403/429, or the breaker) · page-changed
+· no-leads · fetch-failed (not a refusal: timeout, 5xx, 404) · config · crashed.
 """
 
 from __future__ import annotations
@@ -76,6 +84,16 @@ RETRY_BACKOFF_SECONDS = 3
 RATE_LIMIT_MAX_RETRIES = 5
 RATE_LIMIT_BACKOFF_SECONDS = 15
 RATE_LIMIT_BACKOFF_CAP_SECONDS = 60
+
+# The country index is the run's first request and its single point of failure:
+# refused or unreachable, nothing at all is scraped. So it alone is retried, a
+# few times and far apart (the repo is public, so waiting costs no Actions
+# minutes). Only the waiting changes: same session, same self-identifying UA,
+# one request at a time. A block that outlasts this ends the run.
+DEFAULT_INDEX_RETRY_WAITS = (300, 900, 1800)
+
+# Why a run failed; one of these is on every failing path (see announce_failure).
+FAILURE_REASONS = ("blocked", "page-changed", "no-leads", "fetch-failed", "config", "crashed")
 
 # Politeness at directory scale. A WAF block (403) or a rate limit that outlasts
 # the whole retry budget means "stop", not "try the next of 2,000 profiles": the
@@ -207,11 +225,32 @@ def _retry_after_seconds(resp: requests.Response) -> float | None:
         return None
 
 
-def fetch(session: requests.Session, url: str) -> requests.Response | None:
+@dataclass
+class FetchFailure:
+    kind: str          # "blocked" (403 / exhausted 429) or "fetch-failed" (anything else)
+    detail: str
+    retryable: bool    # worth a later retry of the country index (not a 404)
+
+
+LAST_FAILURE: FetchFailure | None = None   # why the most recent fetch() returned None
+
+
+def _failed(kind: str, detail: str, retryable: bool) -> None:
+    global LAST_FAILURE
+    LAST_FAILURE = FetchFailure(kind, detail, retryable)
+    return None
+
+
+def fetch(session: requests.Session, url: str, count_health: bool = True) -> requests.Response | None:
     """Sequential fetch with a small retry budget for transient failures.
     A 403 is treated as terminal (retrying won't help and would be rude).
     A 429 draws from its own longer, Retry-After-aware budget (see
-    RATE_LIMIT_MAX_RETRIES) instead of the generic one."""
+    RATE_LIMIT_MAX_RETRIES) instead of the generic one. On None, LAST_FAILURE
+    says why. `count_health=False` keeps the answer out of the circuit breaker:
+    the country index is retried by fetch_index() and a refusal there ends the
+    run anyway, so it must not use up the profile stage's budget."""
+    global LAST_FAILURE
+    LAST_FAILURE = None
     last_exc = None
     rate_limit_attempt = 0
     attempt = 0
@@ -227,16 +266,18 @@ def fetch(session: requests.Session, url: str) -> requests.Response | None:
 
         if resp.status_code == 403:
             print(f"    [error] 403 Forbidden for {url} — not retrying")
-            HEALTH.blocked("403")
-            return None
+            if count_health:
+                HEALTH.blocked("403")
+            return _failed("blocked", "HTTP 403 Forbidden", True)
         if resp.status_code == 429:
             attempt -= 1  # doesn't draw from the generic retry budget
             rate_limit_attempt += 1
             if rate_limit_attempt > RATE_LIMIT_MAX_RETRIES:
                 print(f"    [error] 429 for {url} — exhausted "
                       f"{RATE_LIMIT_MAX_RETRIES} rate-limit retries")
-                HEALTH.blocked("429")
-                return None
+                if count_health:
+                    HEALTH.blocked("429")
+                return _failed("blocked", "HTTP 429 Too Many Requests (rate-limit retries exhausted)", True)
             wait = _retry_after_seconds(resp)
             if wait is None:
                 wait = min(
@@ -253,7 +294,7 @@ def fetch(session: requests.Session, url: str) -> requests.Response | None:
             continue
         if resp.status_code >= 400:
             print(f"    [error] HTTP {resp.status_code} for {url}")
-            return None
+            return _failed("fetch-failed", f"HTTP {resp.status_code}", resp.status_code >= 500)
         # Only a profile page resets the streak. A country page loading proves
         # nothing about profile pages, and with 4-9 profiles a country a
         # profile-blocking WAF would otherwise be reset before it ever tripped.
@@ -262,7 +303,40 @@ def fetch(session: requests.Session, url: str) -> requests.Response | None:
         return resp
 
     print(f"    [error] giving up on {url} after {MAX_RETRIES} attempts: {last_exc}")
-    return None
+    return _failed("fetch-failed", f"no response after {MAX_RETRIES} attempts ({last_exc})", True)
+
+
+def parse_retry_waits(raw: str | None) -> list[float]:
+    """ICHGCP_INDEX_RETRY_WAITS: comma-separated seconds, one per retry. Unset =
+    the default; set but empty = no retry."""
+    if raw is None:
+        return [float(w) for w in DEFAULT_INDEX_RETRY_WAITS]
+    return [max(float(x), 0.0) for x in raw.split(",") if x.strip()]
+
+
+def fetch_index(session: requests.Session, waits: list[float],
+                deadline: float) -> tuple[requests.Response | None, int, FetchFailure | None]:
+    """The run's first request, retried after each wait in `waits` while the
+    answer is a refusal or a failed fetch (not a 404: that page is gone, not
+    busy). Returns (response, attempts made, why it failed). It never retries
+    faster, and gives up early when the next wait would pass the runtime budget."""
+    url = f"{BASE_URL}/cro-list"
+    attempts = 0
+    while True:
+        attempts += 1
+        resp = fetch(session, url, count_health=False)
+        if resp is not None:
+            return resp, attempts, None
+        failure = LAST_FAILURE
+        if failure is None or not failure.retryable or attempts > len(waits):
+            return None, attempts, failure
+        wait = waits[attempts - 1]
+        if time.monotonic() + wait >= deadline:
+            print("[index] the next wait would pass the runtime budget — giving up")
+            return None, attempts, failure
+        print(f"[index] attempt {attempts} of {len(waits) + 1} failed ({failure.detail}); "
+              f"waiting {wait:.0f}s before the next")
+        time.sleep(wait)
 
 
 def extract_local_section_links(html: str, slug: str) -> list[ProfileLink]:
@@ -755,6 +829,12 @@ def write_step_summary(report: dict) -> None:
     lines = [f"## ICH GCP scrape — shard `{report['shard']}`" + (" (plan only)" if report["plan_only"] else ""), ""]
     lines.append(f"Runtime {report['runtime_seconds']} s · exit {report['exit_code']}")
     lines.append("")
+    failure = report.get("failure")
+    if failure:
+        lines += [f"### ❌ Failed: `{failure['reason']}`", "", failure["detail"], ""]
+    if "countries" not in report:      # failed before any country was planned or scraped
+        _append_summary(path, lines)
+        return
     if report["plan_only"]:
         lines.append(_md_table(
             ["Shard", "Countries", "Listings", "Est. runtime (min)"],
@@ -773,6 +853,10 @@ def write_step_summary(report: dict) -> None:
                       f"duplicate domains merged {t['duplicates_merged']}"]
         if report["not_attempted"]:
             lines += ["", f"Not attempted (runtime budget / abort): {', '.join(report['not_attempted'])}"]
+    _append_summary(path, lines)
+
+
+def _append_summary(path: str, lines: list[str]) -> None:
     try:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
@@ -844,6 +928,33 @@ def _write_report(path: str, report: dict) -> None:
         print(f"[warn] could not write report {path}: {exc}")
 
 
+def _gh_escape(text: str, prop: bool = False) -> str:
+    """Escape a workflow-command message (and, for `prop`, a property value)."""
+    text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return text.replace(":", "%3A").replace(",", "%2C") if prop else text
+
+
+def announce_failure(reason: str, detail: str) -> None:
+    """A red annotation that leads with the reason. It lands on the run page and
+    in the failure e-mail next to the bare "Process completed with exit code N"."""
+    assert reason in FAILURE_REASONS, reason
+    print(f"::error title={_gh_escape('ICH GCP scrape failed - ' + reason, True)}"
+          f"::{_gh_escape(reason + ': ' + detail)}")
+
+
+def fail_run(reason: str, detail: str, exit_code: int, *, shard: str, plan_only: bool,
+             started: float, report_path: str) -> int:
+    """End the run before a normal report exists (index blocked, page changed,
+    bad config): annotation, a minimal report for the artifact, the step summary."""
+    announce_failure(reason, detail)
+    report = {"plan_only": plan_only, "shard": shard, "exit_code": exit_code,
+              "runtime_seconds": round(time.monotonic() - started),
+              "failure": {"reason": reason, "detail": detail}}
+    _write_report(report_path, report)
+    write_step_summary(report)
+    return exit_code
+
+
 def main() -> int:
     delay = float(os.environ.get("ICHGCP_DELAY_SECONDS", "2"))
     output_path = os.environ.get("OUTPUT_CSV_PATH", os.path.join("data", "ichgcp_leads.csv"))
@@ -852,32 +963,41 @@ def main() -> int:
     plan_only = os.environ.get("ICHGCP_PLAN_ONLY", "").strip().lower() in ("1", "true", "yes")
     max_runtime = float(os.environ.get("ICHGCP_MAX_RUNTIME_SECONDS", str(DEFAULT_MAX_RUNTIME_SECONDS)))
 
+    started = time.monotonic()
+    deadline = started + max_runtime
+    stop = dict(shard=shard, plan_only=plan_only, started=started, report_path=report_path)
+
     if shard != "all" and shard not in geography.SHARDS:
         print(f"[fatal] unknown shard {shard!r}; expected one of {geography.SHARDS + ['all']}")
-        return 2
+        return fail_run("config", f"unknown shard {shard!r}; expected one of "
+                        f"{', '.join(geography.SHARDS + ['all'])}", 2, **stop)
 
     HEALTH.limit = int(os.environ.get("ICHGCP_BREAKER", str(DEFAULT_BREAKER)))
     HEALTH.streak = 0
-    started = time.monotonic()
-    deadline = started + max_runtime
+    HEALTH.total_blocked = 0
     session = make_session()
 
-    # Stage 0: the country index.
+    # Stage 0: the country index. Retried (spaced, see fetch_index) because a
+    # refusal here costs the whole run.
+    waits = parse_retry_waits(os.environ.get("ICHGCP_INDEX_RETRY_WAITS"))
     print(f"[index] fetching {BASE_URL}/cro-list")
-    try:
-        index_resp = fetch(session, f"{BASE_URL}/cro-list")
-    except AbortRun as exc:
-        print(f"[fatal] country index blocked: {exc}")
-        return 2
+    index_resp, attempts, failure = fetch_index(session, waits, deadline)
     if index_resp is None:
         print("[fatal] country index fetch failed — nothing scraped, nothing written")
-        return 2
+        kind = failure.kind if failure else "fetch-failed"
+        why = failure.detail if failure else "no response"
+        minutes = round((time.monotonic() - started) / 60)
+        verb = "refused" if kind == "blocked" else "could not be fetched"
+        return fail_run(kind, f"the country index ({BASE_URL}/cro-list) {verb}: {why}, on {attempts} "
+                        f"attempt(s) over {minutes} min. Nothing scraped, nothing written.", 2, **stop)
     slugs = parse_country_index(index_resp.text)
     print(f"[index] {len(slugs)} country link(s) found")
     if len(slugs) < MIN_INDEX_COUNTRIES:
         print(f"[fatal] only {len(slugs)} country links on the index (expected at least "
               f"{MIN_INDEX_COUNTRIES}) — the page layout has changed; nothing scraped, nothing written")
-        return 2
+        return fail_run("page-changed", f"the country index loaded but has {len(slugs)} country link(s), "
+                        f"expected at least {MIN_INDEX_COUNTRIES}: its layout has changed. "
+                        "Nothing scraped, nothing written.", 2, **stop)
     cls = classify_index(slugs)
 
     if plan_only:
@@ -934,8 +1054,20 @@ def main() -> int:
 
     exit_code = 3 if aborted else (1 if (not deduped_rows and not aborted) else 0)
     entry_by_name = {e.name: e for e in targets}
+    failure_info = None
+    if aborted:
+        failure_info = {"reason": "blocked", "detail": (
+            f"the circuit breaker stopped the run after {HEALTH.total_blocked} blocked answer(s) "
+            f"(403, or a 429 that outlasted its retries); completed countries were merged, "
+            f"{len(not_attempted)} country(ies) not attempted.")}
+    elif exit_code == 1:
+        failure_info = {"reason": "no-leads", "detail": (
+            f"zero leads scraped in shard {shard}: {len(all_stats)} countries attempted, "
+            f"{sum(s.country_page_failed for s in all_stats)} country pages failed, "
+            f"{sum(s.fetch_failures for s in all_stats)} profile fetch failures, "
+            f"{sum(s.skipped_no_website for s in all_stats)} profiles without a website.")}
     report = {
-        "plan_only": False, "shard": shard, "exit_code": exit_code,
+        "plan_only": False, "shard": shard, "exit_code": exit_code, "failure": failure_info,
         "runtime_seconds": round(time.monotonic() - started),
         "countries": [{
             "country": s.country,
@@ -993,12 +1125,30 @@ def main() -> int:
     if aborted:
         print("\n[fatal] run aborted by the circuit breaker (the site is blocking or rate-limiting). "
               "Completed countries were merged; the rest will be retried on this shard's next run.")
+        announce_failure(failure_info["reason"], failure_info["detail"])
         return 3
     if exit_code == 1:
         print("\n[fatal] zero leads scraped in this shard — failing the run.")
+        announce_failure(failure_info["reason"], failure_info["detail"])
         return 1
     return 0
 
 
+def run() -> int:
+    """main(), but an uncaught exception also names itself, so a crash (Python
+    exits 1, the same code as "no leads") is not mistaken for one."""
+    try:
+        return main()
+    except Exception as exc:  # noqa: BLE001 - the point is to report anything
+        import traceback
+        traceback.print_exc()
+        detail = f"{type(exc).__name__}: {exc}"
+        announce_failure("crashed", detail)
+        path = os.environ.get("GITHUB_STEP_SUMMARY")
+        if path:
+            _append_summary(path, ["### ❌ Failed: `crashed`", "", detail])
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())
