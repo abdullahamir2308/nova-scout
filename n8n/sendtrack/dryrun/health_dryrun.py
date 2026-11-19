@@ -199,6 +199,15 @@ def health_row():
 
 # ---------------------------------------------------------------------------------
 
+# Scenario B removes a message the check can call missed: past the 15-minute
+# grace and inside the checker's 48 hours. On a quiet mailbox the newest is often
+# only minutes old, so pick by age -- and refuse up front, before anything is
+# imported, when no such message exists yet.
+HELD_SQL = ("SELECT message_id, subject FROM inbound_messages WHERE processed_at <= now() - interval '16 minutes' "
+            "AND processed_at >= now() - interval '47 hours' ORDER BY processed_at DESC LIMIT 1")
+if not psql_json(REAL, HELD_SQL):
+    raise SystemExit("scenario B needs an INBOX message 16 min - 47 h old in inbound_messages; none now -- rerun later")
+
 print("IMAP Health dry run -- scratch dir %s\n" % SCRATCH)
 real_before = fingerprint(REAL)
 print("  real novascout BEFORE: %s" % json.dumps(real_before, sort_keys=True))
@@ -235,7 +244,7 @@ expect("no email", sink_log() == [])
 # --- B. Mailbox Watch misses an INBOX message --------------------------------------------
 print("\n-- B. an INBOX message Mailbox Watch did not record (its row removed from the copy) --")
 fresh()
-held = psql_json(DRY, "SELECT message_id, subject FROM inbound_messages ORDER BY processed_at DESC LIMIT 1")[0]
+held = psql_json(DRY, HELD_SQL)[0]
 psql(DRY, "CREATE TABLE held AS SELECT * FROM inbound_messages WHERE message_id = '%s';\n"
           "DELETE FROM inbound_messages WHERE message_id = '%s';" % ((held["message_id"].replace("'", "''"),) * 2))
 run = execute("imaphealth0001dry")
@@ -274,19 +283,35 @@ expect("B4: still missing on the next check -> no second email", out1(run, "Asse
        and len(sink_log()) == 1)
 
 psql(DRY, "INSERT INTO inbound_messages SELECT * FROM held;")
+# 2026-11-18: the real all-clear met an SMTP outage ("Connection closed
+# unexpectedly") and was never sent again. It must be retried like an alert.
+stop_sink()
+run = execute("imaphealth0001dry")
+a, sent, rec = out1(run, "Assess Health"), out1(run, "Send Alert"), out1(run, "Record Health")
+row = health_row()
+expect("B5a: recorded again -> all-clear attempted ... while SMTP is DOWN",
+       a["alert_kind"] == "recovered" and sent is not None and "error" in sent, json.dumps(sent)[:200])
+expect("B5a: healthy, but the alert's stamp is KEPT (so the next check sends the all-clear again)",
+       row["healthy"] and row["alerted"] and row["alerted_problems"] == ["inbox-missed"] and rec["clear_unsent"] is True,
+       json.dumps(row))
+
+start_sink()   # empties the sink's log
 run = execute("imaphealth0001dry")
 a = out1(run, "Assess Health")
 log = sink_log()
-subject, body = sink_message(log[-1]) if len(log) == 2 else ("", "")
-expect("B5: recorded again -> one all-clear email", a["alert_kind"] == "recovered" and len(log) == 2
+subject, body = sink_message(log[-1]) if len(log) == 1 else ("", "")
+expect("B5: SMTP back -> one all-clear email", a["alert_kind"] == "recovered" and len(log) == 1
        and subject == "[Nova Scout] IMAP health: OK again", subject)
+expect("B5: it names what was alerted and says it is late",
+       "Mailbox Watch has missed INBOX mail -- last alerted" in body and "not accepted by SMTP" in body, body[:400])
 expect("B5: mailbox_health closes the episode", health_row() == {
     "healthy": True, "problems": [], "consecutive_failures": 0, "failing": False, "alerted": False,
     "alerted_problems": None}, json.dumps(health_row()))
 
 # --- C. the Sent mirror misses a message ---------------------------------------------------
 print("\n-- C. a Sent message missing from the mirror --")
-fresh("DELETE FROM mailbox_sent WHERE message_id = (SELECT message_id FROM mailbox_sent ORDER BY sent_at DESC LIMIT 1);")
+fresh("DELETE FROM mailbox_sent WHERE message_id = (SELECT message_id FROM mailbox_sent "
+      "WHERE sent_at <= now() - interval '20 minutes' ORDER BY sent_at DESC LIMIT 1);")
 before = len(sink_log())
 execute("imaphealth0001dry")
 run = execute("imaphealth0001dry")
@@ -295,7 +320,7 @@ log = sink_log()
 subject, body = sink_message(log[-1]) if len(log) == before + 1 else ("", "")
 expect("C: two checks -> sent-missed alert, saying the warm-up ceiling does not count it",
        a["problems"] == ["sent-missed"] and subject == "[Nova Scout] IMAP health: Mailbox Watch has missed Sent mail"
-       and "warm-up ceiling does not count them" in body, subject)
+       and "warm-up ceiling may not count them" in body, subject)
 
 # --- D. IMAP itself fails -- the real pre-flight, pointed at a host that cannot resolve --------
 print("\n-- D. IMAP unreachable: a throwaway checker whose IMAP host cannot resolve --")

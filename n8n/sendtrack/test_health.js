@@ -119,6 +119,39 @@ t.check('... the episode is closed for Record Health', [a.state.consecutive_fail
 a = assess(OK, failingRow(1), CFG);
 t.check('healthy after a failure nobody was told about -> no all-clear either', a.alert_kind, null);
 
+// --- 2026-11-18: an all-clear SMTP refused is sent again ----------------------------------
+// Record Health keeps the alert's stamp when the all-clear was not accepted, so the
+// next check arrives healthy-after-healthy with the stamp still there.
+const pendingClear = (over) => row(Object.assign({
+  prev_healthy: true, prev_problems: [], prev_consecutive_failures: 0, prev_failing_since: null,
+  prev_last_alerted_at: '2026-09-16T14:40:00.000Z', prev_alerted_problems: ['imap-failed'],
+}, over));
+a = assess(OK, pendingClear(), CFG);
+t.check('healthy again, the last all-clear was not accepted -> the all-clear is sent again',
+  [a.healthy, a.alert_kind, a.notify, a.subject], [true, 'recovered', true, '[Nova Scout] IMAP health: OK again']);
+t.check('... names what was alerted, when, and that this one is late',
+  [a.text.includes('It was: the mailbox is not reachable over IMAP -- last alerted 2026-09-16T14:40:00.000Z'),
+    a.text.includes('an earlier attempt to send it was not accepted by SMTP'), a.text.includes('?')],
+  [true, true, false]);
+t.check('... Sent read after the alert -> still says Mailbox Watch reconnected',
+  assess(OK, pendingClear({ sent_synced_at: '2026-09-16T14:45:00.000Z' }), CFG).text
+    .includes('so it was connected again at that point'), true);
+t.check('... Sent last read before the alert -> makes no such claim',
+  a.text.includes('connected again'), false);
+a = assess(OK, pendingClear({ prev_problems: null }), CFG);
+t.check('... prev_problems NULL (a fresh row) reads the same as empty', a.text.includes('last alerted'), true);
+a = assess(OK, alerted({ prev_problems: ['imap-failed'] }), CFG);
+t.check('a first all-clear is not called late', a.text.includes('is late'), false);
+
+a = assess(FAILED, pendingClear({ prev_healthy: false, prev_problems: ['imap-failed'], prev_consecutive_failures: 1,
+  prev_failing_since: '2026-09-16T14:50:00.000Z' }), CFG);
+t.check('a NEW episode while the old all-clear is still pending -> alerted at confirmation, not treated as already alerted',
+  [a.confirmed, a.alert_kind, a.notify], [true, 'problem', true]);
+a = assess(FAILED, pendingClear({ prev_healthy: true, prev_problems: [] }), CFG);
+t.check('... its first failing check stays quiet as usual', [a.confirmed, a.alert_kind], [false, null]);
+a = assess(FAILED, alerted(), CFG);
+t.check('an alert stamped inside the same episode still suppresses a repeat', a.alert_kind, null);
+
 // --- nobody to tell --------------------------------------------------------------------
 a = assess(FAILED, failingRow(1, { operator_email: null }), CFG);
 t.check('no operator address in settings -> the alert is still judged, but nothing is sent',

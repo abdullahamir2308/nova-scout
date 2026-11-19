@@ -38,7 +38,7 @@ http://127.0.0.1:3000
 |----------|-------------------------|
 | n8n      | http://localhost:5678   |
 | NocoDB   | http://localhost:8080   |
-| Dashboard | http://127.0.0.1:3000 (login `admin`, password `NOVASCOUT_GRAFANA_ADMIN_PASSWORD` in `.env`) |
+| Dashboard | http://127.0.0.1:3001 (login `admin`, password `NOVASCOUT_GRAFANA_ADMIN_PASSWORD` in `.env`) |
 | Postgres | localhost:5432          |
 
 n8n reaches Ollama at `http://host.docker.internal:11434` — Docker Desktop's

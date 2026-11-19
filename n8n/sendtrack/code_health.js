@@ -168,11 +168,18 @@ function assess(check, db, cfg) {
   const failingSince = healthy ? null : str(db.prev_failing_since) || str(db.now);
   const confirmed = !healthy && (consecutive >= cfg.confirm_after ||
     problems.some((p) => IMMEDIATE.indexOf(p) !== -1));
+  // An all-clear SMTP did not accept keeps the alert's stamp (Record Health), so
+  // the next healthy check sends it again (2026-11-18: the 23:21 UTC all-clear
+  // failed "Connection closed unexpectedly", the stamp was cleared anyway, and
+  // the operator was left believing the mailbox was still down). A stamp older
+  // than this episode belongs to the earlier one: it must not count as "already
+  // alerted" for a new problem.
+  const ownAlert = prevAlertedAt !== null && !(failingSince !== null && ms(prevAlertedAt) < ms(failingSince));
   const sameProblems = problems.slice().sort().join(',') === prevAlerted.slice().sort().join(',');
-  const reminderDue = prevAlertedAt !== null && now - ms(prevAlertedAt) >= cfg.remind_hours * 3600 * 1000;
+  const reminderDue = ownAlert && now - ms(prevAlertedAt) >= cfg.remind_hours * 3600 * 1000;
 
   let alertKind = null;
-  if (confirmed && (prevAlertedAt === null || !sameProblems || reminderDue)) alertKind = 'problem';
+  if (confirmed && (!ownAlert || !sameProblems || reminderDue)) alertKind = 'problem';
   else if (healthy && prevAlertedAt !== null) alertKind = 'recovered';
 
   const ctx = { check: check || {}, db, cfg, why: found && found.why };
@@ -189,14 +196,24 @@ function assess(check, db, cfg) {
     lines.push('A reminder follows every ' + cfg.remind_hours + ' hours while this lasts, and one email when it clears.');
   } else if (alertKind === 'recovered') {
     subject = '[Nova Scout] IMAP health: OK again';
-    const was = arr(db.prev_problems);
+    // A retried all-clear: the previous check was already healthy, so the
+    // episode's own record is gone -- what was alerted, and when, is what is left.
+    const retry = !arr(db.prev_problems).length && !str(db.prev_failing_since);
+    const was = retry ? prevAlerted : arr(db.prev_problems);
     lines.push('IMAP health is OK again: the mailbox answers, and every INBOX and Sent message from the last ' +
       (Number(ctx.check.hours) || '?') + ' hours is in Mailbox Watch\'s records.');
-    lines.push('It was: ' + (was.length ? was.map((p) => PROBLEMS[p] || p).join('; ') : '?') + ' -- from ' +
-      (str(db.prev_failing_since) || '?') + ' until ' + str(db.now) + '.');
+    if (retry) {
+      lines.push('It was: ' + (was.length ? was.map((p) => PROBLEMS[p] || p).join('; ') : '?') + ' -- last alerted ' +
+        prevAlertedAt + '. This all-clear is late: an earlier attempt to send it was not accepted by SMTP.');
+    } else {
+      lines.push('It was: ' + (was.length ? was.map((p) => PROBLEMS[p] || p).join('; ') : '?') + ' -- from ' +
+        (str(db.prev_failing_since) || '?') + ' until ' + str(db.now) + '.');
+    }
     if (was.some((p) => p !== 'checker-unreachable')) {
       const synced = ms(db.sent_synced_at);
-      const since = ms(db.prev_failing_since);
+      // On a retry the episode's start is gone; the alert came after it, so a
+      // read after the alert is also a read after the problem began.
+      const since = ms(db.prev_failing_since) !== null ? ms(db.prev_failing_since) : ms(prevAlertedAt);
       lines.push('');
       if (synced !== null && since !== null && synced > since) {
         lines.push('Mailbox Watch read the Sent folder at ' + str(db.sent_synced_at) + ', after the problem began, ' +

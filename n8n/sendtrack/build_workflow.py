@@ -2329,7 +2329,9 @@ SELECT ISO(clk.now) AS now,
 
 HEALTH_RECORD_SQL = with_iso("""-- Record Health: this check into mailbox_health (migration 009). It runs AFTER
 -- the alert, so an alert counts as sent only when SMTP accepted it -- one that
--- failed is tried again on the next check.
+-- failed is tried again on the next check. The all-clear too (2026-11-18): until
+-- SMTP accepts it the alert's stamp is kept, so the next healthy check sends it
+-- again -- clearing it regardless left the operator with only the outage alert.
 --
 -- $1 the state Assess Health emitted
 -- $2 Send Alert's output when an alert was attempted; otherwise Assess Health's
@@ -2337,18 +2339,22 @@ HEALTH_RECORD_SQL = with_iso("""-- Record Health: this check into mailbox_health
 WITH p AS (
   SELECT $1::jsonb AS s, $2::jsonb AS r
 ),
+a AS (
+  SELECT coalesce(p.r->>'error' IS NULL
+                  AND jsonb_typeof(p.r->'accepted') = 'array'
+                  AND jsonb_array_length(p.r->'accepted') > 0, false) AS accepted
+    FROM p
+),
 v AS (
   SELECT (p.s->>'healthy')::boolean AS healthy,
-         coalesce(p.s->>'alert_kind' = 'problem'
-                  AND p.r->>'error' IS NULL
-                  AND jsonb_typeof(p.r->'accepted') = 'array'
-                  AND jsonb_array_length(p.r->'accepted') > 0, false) AS alert_sent,
+         coalesce(p.s->>'alert_kind' = 'problem' AND a.accepted, false) AS alert_sent,
+         coalesce(p.s->>'alert_kind' = 'recovered' AND NOT a.accepted, false) AS clear_unsent,
          ARRAY(SELECT jsonb_array_elements_text(
            CASE WHEN jsonb_typeof(p.s->'problems') = 'array' THEN p.s->'problems' ELSE '[]'::jsonb END)) AS problems,
          ARRAY(SELECT jsonb_array_elements_text(
            CASE WHEN jsonb_typeof(p.s->'prev_alerted_problems') = 'array' THEN p.s->'prev_alerted_problems'
                 ELSE '[]'::jsonb END)) AS prev_alerted_problems
-    FROM p
+    FROM p, a
 ),
 up AS (
   INSERT INTO mailbox_health AS h (check_name, healthy, problems, detail, consecutive_failures, failing_since,
@@ -2356,11 +2362,12 @@ up AS (
   SELECT 'imap', v.healthy, v.problems, p.s->>'detail', (p.s->>'consecutive_failures')::int,
          (p.s->>'failing_since')::timestamptz, now(),
          CASE WHEN v.healthy THEN now() END,
-         -- Cleared when healthy (the episode is over); stamped only on an alert
-         -- SMTP accepted; otherwise carried forward.
-         CASE WHEN v.healthy THEN NULL WHEN v.alert_sent THEN now()
+         -- Cleared when healthy and the all-clear went out (the episode is over);
+         -- stamped only on an alert SMTP accepted; otherwise carried forward.
+         CASE WHEN v.healthy AND NOT v.clear_unsent THEN NULL WHEN v.alert_sent THEN now()
               ELSE (p.s->>'prev_last_alerted_at')::timestamptz END,
-         CASE WHEN v.healthy THEN NULL WHEN v.alert_sent THEN v.problems ELSE v.prev_alerted_problems END
+         CASE WHEN v.healthy AND NOT v.clear_unsent THEN NULL WHEN v.alert_sent THEN v.problems
+              ELSE v.prev_alerted_problems END
     FROM p, v
   ON CONFLICT (check_name) DO UPDATE
      SET healthy              = EXCLUDED.healthy,
@@ -2380,7 +2387,8 @@ SELECT up.healthy                AS healthy,
        ISO(up.failing_since)     AS failing_since,
        ISO(up.last_alerted_at)   AS last_alerted_at,
        p.s->>'alert_kind'        AS alert_kind,
-       v.alert_sent              AS alert_sent
+       v.alert_sent              AS alert_sent,
+       v.clear_unsent            AS clear_unsent
   FROM up, p, v;""")
 
 
